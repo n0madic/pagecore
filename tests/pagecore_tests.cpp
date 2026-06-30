@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -509,7 +510,13 @@ void test_inline_script_mutates_lexbor_dom()
 
 void test_timers_and_events()
 {
-    pagecore::Page page;
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
     page.load_html(R"HTML(
 <html><body>
   <button id="b"></button>
@@ -525,6 +532,36 @@ void test_timers_and_events()
 
     auto button = page.outer_html("#b[data-hit='ok']");
     require(button.has_value(), "setTimeout and CustomEvent should mutate DOM even when another listener throws");
+    require(console_logs.size() == 2, "throwing event handlers should be reported through the console log callback");
+    require(console_logs[0].first == "error", "listener exception should be reported as console error");
+    require(!console_logs[0].second.empty(), "listener exception log should include stack details");
+    require(console_logs[1].first == "error", "event handler exception should be reported as console error");
+    require(!console_logs[1].second.empty(), "event handler exception log should include stack details");
+}
+
+void test_js_console_log_callback()
+{
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    console.info('hello', 42);
+    console.warn();
+  </script>
+</body></html>
+)HTML");
+
+    require(console_logs.size() == 2, "console calls should be routed to the configured log callback");
+    require(console_logs[0].first == "info", "console.info should preserve severity");
+    require(console_logs[0].second == "hello 42", "console callback should join multiple arguments");
+    require(console_logs[1].first == "warn", "console.warn should preserve severity");
+    require(console_logs[1].second.empty(), "console callback should allow empty messages");
 }
 
 void test_inner_html_fragment_parsing()
@@ -1885,7 +1922,10 @@ void test_xhr_event_handler_exceptions_are_reported()
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
     loader->add("https://api.test/data.txt", "ok", "text/plain");
 
-    pagecore::Page page;
+    pagecore::LoadOptions options;
+    options.console_log = [](std::string_view, std::string_view) {};
+
+    pagecore::Page page(options);
     page.set_resource_loader(loader);
 
     page.load_html(R"HTML(
@@ -3704,6 +3744,7 @@ int main()
     try {
         test_inline_script_mutates_lexbor_dom();
         test_timers_and_events();
+        test_js_console_log_callback();
         test_inner_html_fragment_parsing();
         test_tree_operations_and_clone();
         test_dataset_attributes_and_cached_facades();

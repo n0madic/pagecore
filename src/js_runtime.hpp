@@ -33,6 +33,7 @@ public:
 
     DomDocument& document();
     ResourceResponse load_resource(std::string_view url, std::string_view kind);
+    void log_console(std::string_view severity, std::string_view message);
     bool is_timed_out() const;
 
 private:

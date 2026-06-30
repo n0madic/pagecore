@@ -609,12 +609,15 @@ JSValue bridge_get_element_by_id(JSContext* ctx, JSValue, int argc, JSValue* arg
 
 JSValue host_log(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
         std::string severity = argc > 0 ? to_string(ctx, argv[0]) : "log";
-        std::cerr << "[js:" << severity << "]";
+        std::string message;
         for (int i = 1; i < argc; ++i) {
             const char* value = JS_ToCString(ctx, argv[i]);
-            std::cerr << ' ' << (value == nullptr ? "<unprintable>" : value);
+            if (!message.empty()) {
+                message.push_back(' ');
+            }
+            message += value == nullptr ? "<unprintable>" : value;
             if (value != nullptr) {
                 JS_FreeCString(ctx, value);
             } else {
@@ -623,7 +626,7 @@ JSValue host_log(JSContext* ctx, JSValue, int argc, JSValue* argv)
                 JS_FreeValue(ctx, JS_GetException(ctx));
             }
         }
-        std::cerr << '\n';
+        js.log_console(severity, message);
         return JS_UNDEFINED;
     });
 }
@@ -962,6 +965,20 @@ ResourceResponse JsRuntime::load_resource(std::string_view url, std::string_view
         base,
         base,
     });
+}
+
+void JsRuntime::log_console(std::string_view severity, std::string_view message)
+{
+    if (options_.console_log) {
+        options_.console_log(severity, message);
+        return;
+    }
+
+    std::cerr << "[js:" << severity << "]";
+    if (!message.empty()) {
+        std::cerr << ' ' << message;
+    }
+    std::cerr << '\n';
 }
 
 void JsRuntime::start_deadline()

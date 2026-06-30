@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -19,6 +20,7 @@ struct LoadOptions {
     std::size_t js_memory_limit_bytes = 256 * 1024 * 1024;
     std::string user_agent = "PageCore/0.1";
     std::string base_url;
+    std::function<void(std::string_view severity, std::string_view message)> console_log;
 };
 
 class ResourceLoader;
