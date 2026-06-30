@@ -249,13 +249,15 @@ NodeId DomDocument::Impl::id_for(lxb_dom_node_t* node) const
         return kInvalidNodeId;
     }
 
-    auto existing = node_to_id.find(node);
-    if (existing != node_to_id.end()) {
-        return existing->second;
+    // The forward map is the node's own user slot: calloc'd to nullptr on
+    // creation, and since ids start at 1 (kInvalidNodeId == 0) a null slot
+    // unambiguously means "no id yet".
+    if (node->user != nullptr) {
+        return static_cast<NodeId>(reinterpret_cast<uintptr_t>(node->user));
     }
 
     const NodeId id = next_id++;
-    node_to_id[node] = id;
+    node->user = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
     id_to_node[id] = node;
     return id;
 }
@@ -267,18 +269,42 @@ bool DomDocument::Impl::has_node(NodeId id) const
 
 void DomDocument::Impl::forget_node(lxb_dom_node_t* node)
 {
-    auto it = node_to_id.find(node);
-    if (it != node_to_id.end()) {
-        id_to_node.erase(it->second);
-        node_to_id.erase(it);
-        // A previously tracked id just became invalid; signal the wrapper layer.
-        ++forget_version;
+    if (node == nullptr || node->user == nullptr) {
+        return;
     }
+
+    const auto id = static_cast<NodeId>(reinterpret_cast<uintptr_t>(node->user));
+    id_to_node.erase(id);
+    node->user = nullptr;
+    // A previously tracked id just became invalid; signal the wrapper layer.
+    ++forget_version;
 }
 
 void DomDocument::Impl::mark_mutated()
 {
     ++mutation_version;
+}
+
+void DomDocument::Impl::clear_user_data_subtree(lxb_dom_node_t* node)
+{
+    // Iterative pre-order walk (matching the other traversals here) so a deep
+    // cloned subtree cannot overflow the native stack. lxb_dom_node_clone copies
+    // the user slot for the node and every descendant, so each must be reset to
+    // nullptr before id_for assigns fresh ids.
+    if (node == nullptr) {
+        return;
+    }
+
+    std::vector<lxb_dom_node_t*> stack;
+    stack.push_back(node);
+    while (!stack.empty()) {
+        auto* current = stack.back();
+        stack.pop_back();
+        current->user = nullptr;
+        for (auto* child = current->first_child; child != nullptr; child = child->next) {
+            stack.push_back(child);
+        }
+    }
 }
 
 DomDocument::DomDocument()
@@ -750,6 +776,11 @@ NodeId DomDocument::clone_node(NodeId id, bool deep)
     if (cloned == nullptr) {
         throw std::runtime_error("failed to clone DOM node");
     }
+
+    // lxb_dom_node_clone copies the user slot (id) from the source onto the
+    // clone and, for a deep clone, every descendant. Reset the whole subtree so
+    // the clones get fresh ids instead of aliasing the originals'.
+    Impl::clear_user_data_subtree(cloned);
 
     return impl_->id_for(cloned);
 }

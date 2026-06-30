@@ -2805,6 +2805,35 @@ void test_deep_dom_traversal_is_iterative()
             "set_inner_html over a deep subtree must not overflow the native stack");
 }
 
+void test_deep_clone_assigns_fresh_subtree_ids()
+{
+    // Ids are stored in each node's lxb_dom_node_t.user slot, which
+    // lxb_dom_node_clone copies onto the clone and every descendant. clone_node
+    // must reset the cloned subtree so clones get fresh ids instead of aliasing
+    // the originals' — otherwise mutating a clone would corrupt the source.
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='a'><span>x</span></div></body></html>");
+
+    const pagecore::NodeId original = doc.get_element_by_id("a");
+    require(original != pagecore::kInvalidNodeId, "fixture #a must resolve");
+    const pagecore::NodeId original_span = doc.query_selector(original, "span");
+    require(original_span != pagecore::kInvalidNodeId, "fixture span must resolve");
+
+    const pagecore::NodeId clone = doc.clone_node(original, /*deep=*/true);
+    require(clone != original, "deep clone must get a fresh id, not the source's");
+
+    const pagecore::NodeId clone_span = doc.query_selector(clone, "span");
+    require(clone_span != pagecore::kInvalidNodeId, "cloned span must resolve");
+    require(clone_span != original_span,
+            "cloned descendant must get a fresh id; aliasing means the user slot was not reset");
+
+    // Independence: mutating the clone's span must not touch the original's.
+    doc.set_text_content(clone_span, "y");
+    require(doc.text_content(original_span) == "x",
+            "mutating the cloned span must leave the original span unchanged");
+    require(doc.text_content(clone_span) == "y", "cloned span mutation must apply");
+}
+
 void test_query_selector_cache_returns_all_and_first()
 {
     pagecore::DomDocument doc;
@@ -3442,12 +3471,19 @@ public:
         return out;
     }
 
+    bool was_requested(const std::string& url) const
+    {
+        return std::find(all_requested.begin(), all_requested.end(), url) != all_requested.end();
+    }
+
     std::vector<std::string> load_calls;
     std::vector<std::size_t> batch_sizes;
+    std::vector<std::string> all_requested;
 
 private:
     pagecore::ResourceResponse fetch(const pagecore::ResourceRequest& request)
     {
+        all_requested.push_back(request.url);
         auto found = resources_.find(request.url);
         if (found == resources_.end()) {
             throw pagecore::ResourceError(pagecore::ResourceErrorCode::NotFound, request.url, "missing test resource");
@@ -3485,6 +3521,53 @@ void test_render_prefetches_subresources_into_cache()
     // ...so litehtml's synchronous layout-time requests all hit the warm cache.
     require(loader->load_calls.empty(),
             "layout-time sub-resource requests are served from the prefetch cache, not re-fetched");
+}
+
+void test_render_prefetches_css_background_images()
+{
+    auto loader = std::make_shared<BatchRecordingLoader>();
+    // External stylesheet referencing a background image relative to ITS OWN URL
+    // (must resolve against /assets/, not the document) plus a @font-face the
+    // engine never downloads (Pango uses system fonts).
+    loader->add("https://example.test/assets/style.css",
+                ".ext { width: 12px; height: 12px; background-image: url(css-bg.png); }\n"
+                "@font-face { font-family: x; src: url(font.woff2); }",
+                "text/css");
+    loader->add("https://example.test/assets/css-bg.png", "img", "image/png");
+    loader->add("https://example.test/style-bg.png", "img", "image/png");
+    loader->add("https://example.test/inline-bg.png", "img", "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head>
+  <link rel="stylesheet" href="/assets/style.css">
+  <style>#a { width: 12px; height: 12px; background-image: url(/style-bg.png); }</style>
+</head>
+<body>
+  <div id="a"></div>
+  <div id="i" style="width:12px;height:12px;background-image:url(/inline-bg.png)"></div>
+  <div class="ext"></div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{200, 100, 1.0f};
+    (void) page.display_list(options);
+
+    // Wave 1 (DOM): the stylesheet, the <style> background, and the inline-style
+    // background. Wave 2: the background referenced inside the external stylesheet,
+    // resolved against the stylesheet URL — and NOT the @font-face source.
+    require(loader->batch_sizes.size() == 2, "CSS backgrounds trigger a second prefetch wave");
+    require(loader->batch_sizes[0] == 3, "wave 1 prefetches the stylesheet and DOM-level CSS backgrounds");
+    require(loader->batch_sizes[1] == 1, "wave 2 prefetches only the external stylesheet's image, skipping the font");
+
+    require(loader->load_calls.empty(),
+            "every CSS background image is served from the prefetch cache, including the external one");
+    require(loader->was_requested("https://example.test/assets/css-bg.png"),
+            "external-stylesheet background resolves against the stylesheet URL");
+    require(!loader->was_requested("https://example.test/assets/font.woff2"),
+            "@font-face sources are never fetched (text is rendered with system fonts)");
 }
 
 void test_page_render_uses_cairo_raster_backend()
@@ -3998,6 +4081,7 @@ int main()
         test_cairo_raster_and_io_error_paths();
 #endif
         test_deep_dom_traversal_is_iterative();
+        test_deep_clone_assigns_fresh_subtree_ids();
         test_query_selector_cache_returns_all_and_first();
         test_described_traversal_wraps_children_correctly();
         test_child_node_list_cache_reflects_mutations();
@@ -4016,6 +4100,7 @@ int main()
         test_page_display_list_resolves_relative_base_element_against_document_url();
         test_page_display_list_resolves_protocol_relative_and_host_like_css_urls();
         test_render_prefetches_subresources_into_cache();
+        test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();
         test_page_render_decodes_and_draws_png_images();
         test_page_render_decodes_and_draws_jpeg_images();

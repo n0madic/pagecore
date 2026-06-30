@@ -173,6 +173,148 @@ struct DisplayListCacheKey {
     bool operator==(const DisplayListCacheKey&) const = default;
 };
 
+struct CssUrlRef {
+    std::string url;
+    ResourceKind kind = ResourceKind::Image;
+};
+
+// Extracts url(...) targets from a CSS source so they can be prefetched. Handles
+// comments, quoted/unquoted targets, and multi-value declarations. `@import`
+// targets are returned as stylesheets; `src:` declarations (web fonts) are
+// skipped because the engine renders text with system fonts and never downloads
+// font files. Callers still resolve and filter (data:/blob:) the raw targets.
+std::vector<CssUrlRef> extract_css_urls(std::string_view css)
+{
+    std::vector<CssUrlRef> out;
+    const std::size_t n = css.size();
+    std::size_t segment_start = 0;
+
+    const auto classify = [&](std::size_t url_pos) -> int {
+        // 0 = image, 1 = skip (font src), 2 = stylesheet (@import).
+        std::string_view seg = css.substr(segment_start, url_pos - segment_start);
+        const auto first = seg.find_first_not_of(" \t\r\n");
+        if (first == std::string_view::npos) {
+            return 0;
+        }
+        seg = seg.substr(first);
+        if (seg.size() >= 7) {
+            std::string head;
+            for (char ch : seg.substr(0, 7)) {
+                head.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+            }
+            if (head == "@import") {
+                return 2;
+            }
+        }
+        const auto colon = seg.find(':');
+        if (colon != std::string_view::npos) {
+            std::string prop;
+            for (std::size_t i = 0; i < colon; ++i) {
+                const unsigned char ch = static_cast<unsigned char>(seg[i]);
+                if (!std::isspace(ch)) {
+                    prop.push_back(static_cast<char>(std::tolower(ch)));
+                }
+            }
+            if (prop == "src") {
+                return 1;
+            }
+        }
+        return 0;
+    };
+
+    std::size_t i = 0;
+    while (i < n) {
+        const char ch = css[i];
+        if (ch == '/' && i + 1 < n && css[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(css[i] == '*' && css[i + 1] == '/')) {
+                ++i;
+            }
+            i = std::min(n, i + 2);
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            const char quote = ch;
+            ++i;
+            while (i < n && css[i] != quote) {
+                if (css[i] == '\\' && i + 1 < n) {
+                    ++i;
+                }
+                ++i;
+            }
+            if (i < n) {
+                ++i;
+            }
+            continue;
+        }
+        if (ch == ';' || ch == '{' || ch == '}') {
+            segment_start = i + 1;
+            ++i;
+            continue;
+        }
+        if ((ch == 'u' || ch == 'U') && i + 3 < n) {
+            const bool prev_ident = i > 0
+                && (std::isalnum(static_cast<unsigned char>(css[i - 1])) || css[i - 1] == '-' || css[i - 1] == '_');
+            const char c1 = css[i + 1];
+            const char c2 = css[i + 2];
+            if (!prev_ident && (c1 == 'r' || c1 == 'R') && (c2 == 'l' || c2 == 'L')) {
+                std::size_t j = i + 3;
+                while (j < n && std::isspace(static_cast<unsigned char>(css[j]))) {
+                    ++j;
+                }
+                if (j < n && css[j] == '(') {
+                    const int cls = classify(i);
+                    ++j;
+                    while (j < n && std::isspace(static_cast<unsigned char>(css[j]))) {
+                        ++j;
+                    }
+                    std::string target;
+                    if (j < n && (css[j] == '"' || css[j] == '\'')) {
+                        const char quote = css[j];
+                        ++j;
+                        while (j < n && css[j] != quote) {
+                            if (css[j] == '\\' && j + 1 < n) {
+                                target.push_back(css[j + 1]);
+                                j += 2;
+                            } else {
+                                target.push_back(css[j]);
+                                ++j;
+                            }
+                        }
+                        if (j < n) {
+                            ++j;
+                        }
+                        while (j < n && css[j] != ')') {
+                            ++j;
+                        }
+                    } else {
+                        while (j < n && css[j] != ')') {
+                            target.push_back(css[j]);
+                            ++j;
+                        }
+                        while (!target.empty() && std::isspace(static_cast<unsigned char>(target.back()))) {
+                            target.pop_back();
+                        }
+                    }
+                    if (j < n) {
+                        ++j;
+                    }
+                    if (cls != 1 && !target.empty()) {
+                        out.push_back(CssUrlRef{
+                            std::move(target),
+                            cls == 2 ? ResourceKind::Stylesheet : ResourceKind::Image,
+                        });
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        ++i;
+    }
+    return out;
+}
+
 } // namespace
 
 struct Page::Impl {
@@ -341,53 +483,80 @@ struct Page::Impl {
         return render_document.serialize_html();
     }
 
-    // Enumerates the external sub-resources litehtml will need for a render
-    // (<img src> and <link rel=stylesheet href>) so they can be fetched up front
-    // and concurrently, instead of one blocking request at a time during layout.
-    // URLs are resolved exactly as the litehtml container will (honouring a
-    // <base href>), so the warmed cache keys match its on-demand requests.
-    std::vector<ResourceRequest> collect_subresource_requests(const std::string& render_base)
+    // The document's effective base URL for resolving sub-resources, honouring a
+    // <base href> exactly as the litehtml container does, so warmed cache keys
+    // match its on-demand requests (the container uses this base as the referrer).
+    std::string effective_base_url(const RenderOptions& render_options)
     {
-        const NodeId root = document.document_node();
-
-        std::string effective_base = render_base;
-        const NodeId base_node = document.query_selector(root, "base[href]");
+        const std::string render_base = render_base_url(render_options);
+        const NodeId base_node = document.query_selector(document.document_node(), "base[href]");
         if (base_node != kInvalidNodeId) {
             const auto base_href = document.get_attribute(base_node, "href");
             if (base_href && !base_href->empty()) {
-                effective_base = resolve_url(render_base, *base_href);
+                return resolve_url(render_base, *base_href);
             }
         }
+        return render_base;
+    }
 
-        std::vector<ResourceRequest> requests;
-        std::unordered_set<std::string> seen;
+    // Resolves a raw sub-resource reference against `resolve_base`, drops
+    // non-fetchable targets (data:/blob:/fragment), de-duplicates by kind+URL, and
+    // appends a request whose referrer matches the litehtml container's.
+    void add_subresource(
+        std::vector<ResourceRequest>& requests,
+        std::unordered_set<std::string>& seen,
+        const std::string& resolve_base,
+        const std::string& referrer,
+        std::string_view raw,
+        ResourceKind kind)
+    {
+        if (raw.empty()) {
+            return;
+        }
+        const std::string url = resolve_url(resolve_base, raw);
+        if (url.empty() || url.front() == '#'
+            || url.rfind("data:", 0) == 0 || url.rfind("blob:", 0) == 0) {
+            return;
+        }
+        const std::string key = resource_kind_name(kind) + "\n" + url;
+        if (!seen.insert(key).second) {
+            return;
+        }
+        requests.push_back(ResourceRequest{url, kind, referrer, resolve_base});
+    }
 
-        const auto starts_with = [](const std::string& value, std::string_view prefix) {
-            return value.compare(0, prefix.size(), prefix) == 0;
-        };
-        const auto add = [&](const std::optional<std::string>& raw, ResourceKind kind) {
-            if (!raw || raw->empty()) {
-                return;
-            }
-            const std::string url = resolve_url(effective_base, *raw);
-            if (url.empty() || url.front() == '#' || starts_with(url, "data:") || starts_with(url, "blob:")) {
-                return;
-            }
-            const std::string key = resource_kind_name(kind) + "\n" + url;
-            if (!seen.insert(key).second) {
-                return;
-            }
-            requests.push_back(ResourceRequest{url, kind, effective_base, effective_base});
-        };
+    // Sub-resources discoverable directly from the DOM: <img src>, <link
+    // rel=stylesheet href>, and url(...) targets in inline style="" attributes and
+    // <style> blocks. All resolve against the document's effective base.
+    void collect_dom_subresources(
+        const std::string& effective_base,
+        std::vector<ResourceRequest>& requests,
+        std::unordered_set<std::string>& seen)
+    {
+        const NodeId root = document.document_node();
 
         for (NodeId img : document.query_selector_all(root, "img[src]")) {
-            add(document.get_attribute(img, "src"), ResourceKind::Image);
+            if (const auto src = document.get_attribute(img, "src")) {
+                add_subresource(requests, seen, effective_base, effective_base, *src, ResourceKind::Image);
+            }
         }
         for (NodeId link : document.query_selector_all(root, "link[rel='stylesheet'][href]")) {
-            add(document.get_attribute(link, "href"), ResourceKind::Stylesheet);
+            if (const auto href = document.get_attribute(link, "href")) {
+                add_subresource(requests, seen, effective_base, effective_base, *href, ResourceKind::Stylesheet);
+            }
         }
-
-        return requests;
+        for (NodeId styled : document.query_selector_all(root, "[style]")) {
+            if (const auto style = document.get_attribute(styled, "style")) {
+                for (const auto& ref : extract_css_urls(*style)) {
+                    add_subresource(requests, seen, effective_base, effective_base, ref.url, ref.kind);
+                }
+            }
+        }
+        for (NodeId style : document.query_selector_all(root, "style")) {
+            for (const auto& ref : extract_css_urls(document.text_content(style))) {
+                add_subresource(requests, seen, effective_base, effective_base, ref.url, ref.kind);
+            }
+        }
     }
 
     // Returns the loader litehtml should use for a render. When external loading
@@ -399,20 +568,53 @@ struct Page::Impl {
             return nullptr;
         }
 
-        auto requests = collect_subresource_requests(render_base_url(render_options));
-        if (requests.empty()) {
+        const std::string effective_base = effective_base_url(render_options);
+
+        std::vector<ResourceRequest> wave1;
+        std::unordered_set<std::string> seen;
+        collect_dom_subresources(effective_base, wave1, seen);
+        if (wave1.empty()) {
             return loader;
         }
 
-        auto cache = std::make_shared<CachingResourceLoader>(loader, requests.size() + 16);
+        auto cache = std::make_shared<CachingResourceLoader>(loader, wave1.size() + 64);
+
+        std::vector<ResourceResponse> fetched;
         try {
             // Lenient: a failed sub-resource must not abort the render; litehtml
             // will fall back to its placeholder for it.
-            cache->load_all(requests, BatchErrorMode::Lenient);
+            fetched = cache->load_all(wave1, BatchErrorMode::Lenient);
         } catch (...) {
             // Prefetch is purely an optimization; on any failure fall back to the
             // cache delegating each request to the inner loader on demand.
+            return cache;
         }
+
+        // Second wave: background images referenced by url() inside the external
+        // stylesheets just fetched. Their url()s resolve against each stylesheet's
+        // own URL, exactly as the litehtml container resolves them.
+        std::vector<ResourceRequest> wave2;
+        for (std::size_t i = 0; i < fetched.size() && i < wave1.size(); ++i) {
+            if (wave1[i].kind != ResourceKind::Stylesheet) {
+                continue;
+            }
+            const ResourceResponse& sheet = fetched[i];
+            if (sheet.status < 200 || sheet.status >= 400 || sheet.body.empty()) {
+                continue;
+            }
+            const std::string sheet_base = sheet.url.empty() ? wave1[i].url : sheet.url;
+            for (const auto& ref : extract_css_urls(sheet.body)) {
+                add_subresource(wave2, seen, sheet_base, effective_base, ref.url, ref.kind);
+            }
+        }
+
+        if (!wave2.empty()) {
+            try {
+                cache->load_all(wave2, BatchErrorMode::Lenient);
+            } catch (...) {
+            }
+        }
+
         return cache;
     }
 

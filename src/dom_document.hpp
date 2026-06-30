@@ -15,7 +15,10 @@ namespace pagecore {
 
 struct DomDocument::Impl {
     lxb_html_document_t* document = nullptr;
-    mutable std::unordered_map<lxb_dom_node_t*, NodeId> node_to_id;
+    // Reverse map only: NodeId -> node. The forward direction (node -> id) lives
+    // in each node's own lxb_dom_node_t.user slot (see id_for). The reverse map
+    // stays because it is the validation boundary for JS-supplied ids and there
+    // is no per-node structure for the reverse lookup.
     mutable std::unordered_map<NodeId, lxb_dom_node_t*> id_to_node;
     mutable NodeId next_id = 1;
     std::uint64_t mutation_version = 1;
@@ -38,6 +41,10 @@ struct DomDocument::Impl {
     lxb_dom_node_t* require_node(NodeId id) const;
     lxb_dom_element_t* require_element(NodeId id) const;
     NodeId id_for(lxb_dom_node_t* node) const;
+    // Resets the user slot over a cloned subtree so each cloned node gets a fresh
+    // id. lxb_dom_node_clone copies the user slot (node.c), which would otherwise
+    // alias the source nodes' ids onto the clones.
+    static void clear_user_data_subtree(lxb_dom_node_t* node);
     bool has_node(NodeId id) const;
     void forget_node(lxb_dom_node_t* node);
     void mark_mutated();
