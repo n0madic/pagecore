@@ -495,7 +495,17 @@ if(PAGECORE_BUILD_TESTS)
             COMMAND
                 $<TARGET_FILE:pagecore_cli>
                 --html "<html><body><div style='font-size:24px;color:#000;background:#fff'>Hello</div></body></html>"
-                --screenshot "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_test.png"
+                --format png
+                --output "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_test.png"
+                --viewport 64x48
+        )
+        add_test(
+            NAME pagecore_cli_pdf_output
+            COMMAND
+                $<TARGET_FILE:pagecore_cli>
+                --html "<html><body><div style='font-size:24px;color:#000;background:#fff'>Hello</div></body></html>"
+                --format pdf
+                --output "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_test.pdf"
                 --viewport 64x48
         )
         add_test(
@@ -524,11 +534,16 @@ if(PAGECORE_BUILD_TESTS)
             NAME pagecore_cli_rejects_missing_value
             COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --viewport
         )
+        add_test(
+            NAME pagecore_cli_rejects_missing_output
+            COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --format pdf
+        )
         set_tests_properties(
             pagecore_cli_rejects_viewport_overflow
             pagecore_cli_rejects_viewport_over_max
             pagecore_cli_rejects_bad_scale
             pagecore_cli_rejects_missing_value
+            pagecore_cli_rejects_missing_output
             PROPERTIES WILL_FAIL TRUE
         )
     endif()

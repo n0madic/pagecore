@@ -13,6 +13,12 @@
 
 namespace {
 
+enum class OutputFormat {
+    Html,
+    Png,
+    Pdf,
+};
+
 std::string read_stdin()
 {
     std::ostringstream out;
@@ -35,18 +41,20 @@ void usage(const char* argv0)
 {
     std::cerr
         << "usage:\n"
-        << "  " << argv0 << " --url URL [--eval JS] [--screenshot PATH.png] [--dump-display-list PATH|-]\n"
-        << "  " << argv0 << " --file PATH [--eval JS] [--screenshot PATH.png] [--dump-display-list PATH|-]\n"
-        << "  " << argv0 << " --html HTML [--eval JS] [--screenshot PATH.png] [--dump-display-list PATH|-]\n"
-        << "  echo HTML | " << argv0 << " --stdin [--eval JS] [--screenshot PATH.png] [--dump-display-list PATH|-]\n"
+        << "  " << argv0 << " --url URL [--eval JS] [--format html|png|pdf] [--output PATH] [--dump-display-list PATH|-]\n"
+        << "  " << argv0 << " --file PATH [--eval JS] [--format html|png|pdf] [--output PATH] [--dump-display-list PATH|-]\n"
+        << "  " << argv0 << " --html HTML [--eval JS] [--format html|png|pdf] [--output PATH] [--dump-display-list PATH|-]\n"
+        << "  echo HTML | " << argv0 << " --stdin [--eval JS] [--format html|png|pdf] [--output PATH] [--dump-display-list PATH|-]\n"
         << "options:\n"
-        << "  --viewport WIDTHxHEIGHT  screenshot viewport, default 1280x720\n"
-        << "  --scale NUMBER           screenshot device scale factor, default 1\n"
+        << "  --format FORMAT          output format: html, png, or pdf; default html\n"
+        << "  --output PATH            output path; required for png/pdf, optional for html\n"
+        << "  --viewport WIDTHxHEIGHT  render viewport, default 1280x720\n"
+        << "  --scale NUMBER           render scale factor, default 1\n"
         << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 5000\n"
         << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n";
 }
 
-// Largest screenshot dimension we accept; well above any real viewport but
+// Largest render dimension we accept; well above any real viewport but
 // small enough that width*height*4 cannot exhaust memory by accident.
 constexpr int kMaxViewportDimension = 16384;
 constexpr float kMaxScale = 8.0f;
@@ -109,6 +117,33 @@ float parse_positive_float(const std::string& value, const std::string& name)
     return result;
 }
 
+OutputFormat parse_output_format(const std::string& value)
+{
+    if (value == "html") {
+        return OutputFormat::Html;
+    }
+    if (value == "png") {
+        return OutputFormat::Png;
+    }
+    if (value == "pdf") {
+        return OutputFormat::Pdf;
+    }
+    throw std::runtime_error("format must be one of: html, png, pdf");
+}
+
+const char* output_format_name(OutputFormat format)
+{
+    switch (format) {
+    case OutputFormat::Html:
+        return "html";
+    case OutputFormat::Png:
+        return "png";
+    case OutputFormat::Pdf:
+        return "pdf";
+    }
+    return "unknown";
+}
+
 void write_text_file(const std::string& path, const std::string& text)
 {
     std::ofstream out(path, std::ios::binary);
@@ -116,6 +151,9 @@ void write_text_file(const std::string& path, const std::string& text)
         throw std::runtime_error("failed to open output file: " + path);
     }
     out << text;
+    if (!out) {
+        throw std::runtime_error("failed to write output file: " + path);
+    }
 }
 
 } // namespace
@@ -127,8 +165,9 @@ int main(int argc, char** argv)
         std::string html;
         std::string file;
         std::string eval;
-        std::string screenshot;
+        std::string output;
         std::string display_list_dump;
+        OutputFormat output_format = OutputFormat::Html;
         pagecore::RenderOptions render_options;
         pagecore::LoadOptions load_options;
         bool stdin_input = false;
@@ -146,7 +185,12 @@ int main(int argc, char** argv)
             else if (arg == "--html") html = next();
             else if (arg == "--file") file = next();
             else if (arg == "--eval") eval = next();
-            else if (arg == "--screenshot") screenshot = next();
+            else if (arg == "--format") output_format = parse_output_format(next());
+            else if (arg == "--output") output = next();
+            else if (arg == "--screenshot") {
+                output_format = OutputFormat::Png;
+                output = next();
+            }
             else if (arg == "--dump-display-list") display_list_dump = next();
             else if (arg == "--viewport") {
                 const float scale = render_options.viewport.device_scale_factor;
@@ -182,15 +226,33 @@ int main(int argc, char** argv)
         }
 
         // Run --eval before rendering so eval-driven DOM mutations are reflected
-        // in the screenshot and display-list dump.
+        // in image/PDF output and display-list dumps.
         std::string eval_result;
         const bool has_eval = !eval.empty();
         if (has_eval) {
             eval_result = page.eval(eval);
         }
 
-        if (!screenshot.empty()) {
-            pagecore::write_png_rgba(page.render(render_options), screenshot);
+        if (output_format == OutputFormat::Html) {
+            if (!output.empty()) {
+                if (output == "-") {
+                    throw std::runtime_error("omit --output to write html output to stdout");
+                }
+                write_text_file(output, page.serialize_html());
+            }
+        } else {
+            if (output.empty()) {
+                throw std::runtime_error(std::string("--output is required for ") + output_format_name(output_format) + " output");
+            }
+            if (output == "-") {
+                throw std::runtime_error(std::string("--output - is not supported for ") + output_format_name(output_format) + " output");
+            }
+
+            if (output_format == OutputFormat::Png) {
+                pagecore::write_png_rgba(page.render(render_options), output);
+            } else if (output_format == OutputFormat::Pdf) {
+                pagecore::write_pdf(page.display_list(render_options), output);
+            }
         }
 
         if (!display_list_dump.empty()) {
@@ -204,8 +266,10 @@ int main(int argc, char** argv)
 
         if (has_eval) {
             std::cout << eval_result << "\n";
-        } else if (!screenshot.empty()) {
-            std::cout << screenshot << "\n";
+        } else if (!output.empty()) {
+            if (output != "-") {
+                std::cout << output << "\n";
+            }
         } else if (!display_list_dump.empty()) {
             if (display_list_dump != "-") {
                 std::cout << display_list_dump << "\n";

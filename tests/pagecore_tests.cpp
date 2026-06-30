@@ -2408,6 +2408,37 @@ void test_cairo_raster_rounded_border_supports_uneven_widths()
     require(pixel_is_dark(image, 8, 24), "uneven rounded border should still draw the wide left side");
     require(pixel_is_dark(image, 28, 39), "uneven rounded border should still draw the wide bottom side");
 }
+
+void test_cairo_pdf_writer_emits_pdf_file()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{120, 80, 1.0f};
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{0, 0, 120, 80},
+        pagecore::Color{255, 255, 255, 255},
+        true,
+    });
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{10, 10, 40, 24},
+        pagecore::Color{30, 90, 180, 255},
+        false,
+    });
+    display_list.commands.emplace_back(pagecore::TextCommand{
+        "PDF",
+        pagecore::Rect{12, 40, 90, 24},
+        pagecore::Color{0, 0, 0, 255},
+        pagecore::Font{"sans-serif", 18.0f, 400, false},
+    });
+
+    const std::filesystem::path output = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_pdf_writer_test.pdf";
+    pagecore::write_pdf(display_list, output.string());
+
+    std::ifstream in(output, std::ios::binary);
+    require(static_cast<bool>(in), "PDF writer should create an output file");
+    char header[4] = {};
+    in.read(header, sizeof(header));
+    require(in.gcount() == 4 && std::string(header, sizeof(header)) == "%PDF", "PDF writer should emit a PDF header");
+}
 #endif
 
 void test_display_list_json_dump()
@@ -3729,6 +3760,7 @@ int main()
         test_cairo_raster_backend();
         test_cairo_raster_rounded_border_uses_inner_curve();
         test_cairo_raster_rounded_border_supports_uneven_widths();
+        test_cairo_pdf_writer_emits_pdf_file();
 #endif
         test_display_list_json_dump();
         test_png_encoder_rgba();

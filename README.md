@@ -22,7 +22,7 @@ Small modular web engine for headless automation, embedding, offscreen rendering
 - CSS linear gradients are carried as backend-neutral `LinearGradientCommand`s and rasterized by Cairo.
 - CSS `border-radius` is carried as backend-neutral corner radii on background fill/image/border/clip commands. Cairo uses it for rounded clipping of solid backgrounds, background images, and pushed clip regions.
 - `display_list_to_json` and `pagecore_cli --dump-display-list` expose the backend-neutral render boundary for debugging layout/raster issues.
-- `include/pagecore/image_io.hpp` provides dependency-free PNG encoding for `RenderedImage`, so screenshots can be written without coupling image output to a specific layout or raster backend.
+- `include/pagecore/image_io.hpp` provides dependency-free PNG encoding for `RenderedImage`, and `write_pdf` exports the same display-list commands to a Cairo PDF surface for vector output.
 - Top-level CLI builds enable rendering by default through the current litehtml-backed `LayoutEngineFactory`; future Blitz/Servo-like adapters should provide another factory that produces the same `DisplayList` instead of leaking their own types into the public API. Use `-DPAGECORE_ENABLE_RENDERING=OFF` for a DOM/JS-only or test-only build.
 
 ## Build
@@ -103,12 +103,20 @@ build/pagecore_cli --url https://example.com
 build/pagecore_cli --file ./page.html --eval 'document.body.textContent'
 ```
 
-Screenshot output is available in the default top-level build:
+PNG and vector PDF output are available in the default top-level build:
 
 ```sh
 build/pagecore_cli \
   --html '<html><body><div style="width:80px;height:40px;background:#ff0000"></div></body></html>' \
-  --screenshot /tmp/pagecore-shot.png \
+  --format png \
+  --output /tmp/pagecore-shot.png \
+  --viewport 320x240 \
+  --scale 1
+
+build/pagecore_cli \
+  --file ./page.html \
+  --format pdf \
+  --output /tmp/pagecore-page.pdf \
   --viewport 320x240 \
   --scale 1
 ```

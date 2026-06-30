@@ -33,6 +33,11 @@ std::unique_ptr<RasterBackend> create_default_raster_backend(Color background)
     return create_cairo_raster_backend(background);
 }
 
+void write_pdf(const DisplayList&, const std::string&, Color)
+{
+    throw_rendering_unavailable();
+}
+
 std::shared_ptr<const DecodedImage> decode_image_rgba(std::string_view)
 {
     throw_rendering_unavailable();

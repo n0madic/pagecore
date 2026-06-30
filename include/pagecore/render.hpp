@@ -196,6 +196,7 @@ public:
 
 std::unique_ptr<RasterBackend> create_default_raster_backend(Color background = {255, 255, 255, 255});
 std::unique_ptr<RasterBackend> create_cairo_raster_backend(Color background = {255, 255, 255, 255});
+void write_pdf(const DisplayList& display_list, const std::string& path, Color background = {255, 255, 255, 255});
 std::string display_list_to_json(const DisplayList& display_list);
 
 #if defined(PAGECORE_ENABLE_RENDERING)

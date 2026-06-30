@@ -7,7 +7,8 @@ Render it with a rendering-enabled build:
 ```sh
 build/pagecore_cli \
   --file examples/visual-regression/index.html \
-  --screenshot examples/visual-regression/pagecore-visual.png \
+  --format png \
+  --output examples/visual-regression/pagecore-visual.png \
   --dump-display-list examples/visual-regression/display-list.json \
   --viewport 1280x1000
 ```

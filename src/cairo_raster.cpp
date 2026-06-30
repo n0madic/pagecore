@@ -1,6 +1,7 @@
 #include "pagecore/render.hpp"
 
 #include <cairo.h>
+#include <cairo-pdf.h>
 #include <pango/pangocairo.h>
 
 #include <algorithm>
@@ -491,18 +492,20 @@ void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale)
     const bool repeat_y = command.repeat == ImageRepeat::Repeat || command.repeat == ImageRepeat::RepeatY;
     IntRect area = empty(clip) ? bounds : clip;
 
-    // Clamp the tiling area to the actual surface so a huge element box with a
-    // tiny tile size cannot generate millions of off-screen tiles (DoS/OOM).
-    if (cairo_surface_t* target = cairo_get_target(cr)) {
-        const int surface_w = cairo_image_surface_get_width(target);
-        const int surface_h = cairo_image_surface_get_height(target);
-        if (surface_w > 0 && surface_h > 0) {
-            const int ax0 = std::max(area.x, 0);
-            const int ay0 = std::max(area.y, 0);
-            const int ax1 = std::min(area.x + area.width, surface_w);
-            const int ay1 = std::min(area.y + area.height, surface_h);
-            area = IntRect{ax0, ay0, std::max(0, ax1 - ax0), std::max(0, ay1 - ay0)};
-        }
+    // Clamp the tiling area to the current target/clip extents so a huge
+    // element box with a tiny tile cannot generate millions of off-page tiles.
+    double ext_x0 = 0.0;
+    double ext_y0 = 0.0;
+    double ext_x1 = 0.0;
+    double ext_y1 = 0.0;
+    cairo_clip_extents(cr, &ext_x0, &ext_y0, &ext_x1, &ext_y1);
+    if (std::isfinite(ext_x0) && std::isfinite(ext_y0) && std::isfinite(ext_x1) && std::isfinite(ext_y1)
+        && ext_x1 > ext_x0 && ext_y1 > ext_y0) {
+        const int ax0 = std::max(area.x, to_pixel_floor(ext_x0));
+        const int ay0 = std::max(area.y, to_pixel_floor(ext_y0));
+        const int ax1 = std::min(area.x + area.width, to_pixel_ceil(ext_x1));
+        const int ay1 = std::min(area.y + area.height, to_pixel_ceil(ext_y1));
+        area = IntRect{ax0, ay0, std::max(0, ax1 - ax0), std::max(0, ay1 - ay0)};
     }
 
     int start_x = tile.x;
@@ -609,6 +612,67 @@ void draw_linear_gradient(cairo_t* cr, const LinearGradientCommand& command, flo
     cairo_restore(cr);
 }
 
+void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color background, float scale);
+
+void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&)
+{
+    fill_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, command.color, scale);
+}
+
+void draw_command(cairo_t* cr, const BorderCommand& command, float scale, int&)
+{
+    draw_border(cr, command, scale);
+}
+
+void draw_command(cairo_t* cr, const TextCommand& command, float scale, int&)
+{
+    draw_text(cr, command, scale);
+}
+
+void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&)
+{
+    draw_decoded_image(cr, command, scale);
+}
+
+void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&)
+{
+    draw_linear_gradient(cr, command, scale);
+}
+
+void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth)
+{
+    if (command.push) {
+        cairo_save(cr);
+        const IntRect rect = scale_rect(command.rect, scale);
+        clip_rounded_rect(cr, rect, command.radii, scale);
+        ++clip_depth;
+    } else if (clip_depth > 0) {
+        cairo_restore(cr);
+        --clip_depth;
+    }
+}
+
+void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color background, float scale)
+{
+    set_source(cr, background);
+    cairo_paint(cr);
+
+    int clip_depth = 0;
+    for (const auto& command : display_list.commands) {
+        std::visit(
+            [&](const auto& typed) {
+                draw_command(cr, typed, scale, clip_depth);
+            },
+            command);
+        check_status(cairo_status(cr), "draw display command");
+    }
+
+    while (clip_depth > 0) {
+        cairo_restore(cr);
+        --clip_depth;
+    }
+}
+
 class CairoRasterBackend final : public RasterBackend {
 public:
     explicit CairoRasterBackend(Color background)
@@ -630,67 +694,13 @@ public:
         check_status(cairo_status(raw_cr), "create Cairo context");
         std::unique_ptr<cairo_t, decltype(&cairo_destroy)> cr(raw_cr, cairo_destroy);
 
-        set_source(cr.get(), background_);
-        cairo_paint(cr.get());
-
-        int clip_depth = 0;
-        for (const auto& command : display_list.commands) {
-            std::visit(
-                [&](const auto& typed) {
-                    draw_command(cr.get(), typed, scale, clip_depth);
-                },
-                command);
-            check_status(cairo_status(cr.get()), "draw display command");
-        }
-
-        while (clip_depth > 0) {
-            cairo_restore(cr.get());
-            --clip_depth;
-        }
+        draw_display_list(cr.get(), display_list, background_, scale);
 
         return surface_to_rgba(surface.get());
     }
 
 private:
     Color background_;
-
-    static void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&)
-    {
-        fill_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, command.color, scale);
-    }
-
-    static void draw_command(cairo_t* cr, const BorderCommand& command, float scale, int&)
-    {
-        draw_border(cr, command, scale);
-    }
-
-    static void draw_command(cairo_t* cr, const TextCommand& command, float scale, int&)
-    {
-        draw_text(cr, command, scale);
-    }
-
-    static void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&)
-    {
-        draw_decoded_image(cr, command, scale);
-    }
-
-    static void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&)
-    {
-        draw_linear_gradient(cr, command, scale);
-    }
-
-    static void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth)
-    {
-        if (command.push) {
-            cairo_save(cr);
-            const IntRect rect = scale_rect(command.rect, scale);
-            clip_rounded_rect(cr, rect, command.radii, scale);
-            ++clip_depth;
-        } else if (clip_depth > 0) {
-            cairo_restore(cr);
-            --clip_depth;
-        }
-    }
 };
 
 } // namespace
@@ -703,6 +713,28 @@ std::unique_ptr<RasterBackend> create_cairo_raster_backend(Color background)
 std::unique_ptr<RasterBackend> create_default_raster_backend(Color background)
 {
     return create_cairo_raster_backend(background);
+}
+
+void write_pdf(const DisplayList& display_list, const std::string& path, Color background)
+{
+    const float scale = std::max(0.01f, display_list.viewport.device_scale_factor);
+    const double width = std::max(1.0, static_cast<double>(display_list.viewport.width) * scale);
+    const double height = std::max(1.0, static_cast<double>(display_list.viewport.height) * scale);
+
+    cairo_surface_t* raw_surface = cairo_pdf_surface_create(path.c_str(), width, height);
+    check_status(cairo_surface_status(raw_surface), "create Cairo PDF surface");
+    std::unique_ptr<cairo_surface_t, decltype(&cairo_surface_destroy)> surface(raw_surface, cairo_surface_destroy);
+
+    cairo_t* raw_cr = cairo_create(surface.get());
+    check_status(cairo_status(raw_cr), "create Cairo PDF context");
+    std::unique_ptr<cairo_t, decltype(&cairo_destroy)> cr(raw_cr, cairo_destroy);
+
+    draw_display_list(cr.get(), display_list, background, scale);
+    cairo_show_page(cr.get());
+    check_status(cairo_status(cr.get()), "finish Cairo PDF page");
+
+    cairo_surface_finish(surface.get());
+    check_status(cairo_surface_status(surface.get()), "write Cairo PDF file");
 }
 
 } // namespace pagecore
