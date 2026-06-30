@@ -1,0 +1,477 @@
+(function(root, factory) {
+  const definition = factory();
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = definition;
+  } else if (root && typeof root.__pagecore_dom_shim_define === 'function') {
+    root.__pagecore_dom_shim_define(definition);
+  } else if (root) {
+    root.PageCoreDomShimModules = root.PageCoreDomShimModules || {};
+    root.PageCoreDomShimModules[definition.name] = definition;
+  }
+})(globalThis, function() {
+  'use strict';
+
+  return {
+    name: 'install',
+    deps: ['core', 'events', 'dom', 'web'],
+    install(ctx, api) {
+      const { global, host } = ctx;
+      const { defineValue, setDocumentReadyState } = api.core;
+      const {
+        DOMException,
+        Window,
+        EventTarget,
+        Event,
+        CustomEvent,
+        MessageEvent,
+        MessagePort,
+        MessageChannel,
+        UIEvent,
+        MouseEvent,
+        KeyboardEvent,
+        PointerEvent,
+        AbortSignal,
+        AbortController,
+        MutationObserver,
+        installWindowIdentity
+      } = api.events;
+      const {
+        document,
+        Node,
+        Text,
+        Comment,
+        Attr,
+        Element,
+        HTMLElement,
+        HTMLAnchorElement,
+        HTMLAreaElement,
+        HTMLAudioElement,
+        HTMLBaseElement,
+        HTMLBodyElement,
+        HTMLBRElement,
+        HTMLButtonElement,
+        HTMLCanvasElement,
+        HTMLDataElement,
+        HTMLDataListElement,
+        HTMLDetailsElement,
+        HTMLDialogElement,
+        HTMLDivElement,
+        HTMLDListElement,
+        HTMLEmbedElement,
+        HTMLFieldSetElement,
+        HTMLFormElement,
+        HTMLHeadElement,
+        HTMLHeadingElement,
+        HTMLHRElement,
+        HTMLHtmlElement,
+        HTMLIFrameElement,
+        HTMLImageElement,
+        HTMLInputElement,
+        HTMLLabelElement,
+        HTMLLegendElement,
+        HTMLLIElement,
+        HTMLLinkElement,
+        HTMLMapElement,
+        HTMLMediaElement,
+        HTMLMetaElement,
+        HTMLMeterElement,
+        HTMLModElement,
+        HTMLObjectElement,
+        HTMLOListElement,
+        HTMLOptGroupElement,
+        HTMLOptionElement,
+        HTMLOutputElement,
+        HTMLParagraphElement,
+        HTMLParamElement,
+        HTMLPictureElement,
+        HTMLPreElement,
+        HTMLProgressElement,
+        HTMLQuoteElement,
+        HTMLScriptElement,
+        HTMLSelectElement,
+        HTMLSlotElement,
+        HTMLSourceElement,
+        HTMLSpanElement,
+        HTMLStyleElement,
+        HTMLTableCaptionElement,
+        HTMLTableCellElement,
+        HTMLTableColElement,
+        HTMLTableElement,
+        HTMLTableRowElement,
+        HTMLTableSectionElement,
+        HTMLTemplateElement,
+        HTMLTextAreaElement,
+        HTMLTimeElement,
+        HTMLTitleElement,
+        HTMLTrackElement,
+        HTMLUListElement,
+        HTMLUnknownElement,
+        HTMLVideoElement,
+        SVGElement,
+        SVGGraphicsElement,
+        SVGSVGElement,
+        SVGPathElement,
+        SVGCircleElement,
+        SVGEllipseElement,
+        SVGLineElement,
+        SVGRectElement,
+        SVGPolygonElement,
+        SVGPolylineElement,
+        SVGGElement,
+        SVGDefsElement,
+        SVGUseElement,
+        SVGSymbolElement,
+        SVGTitleElement,
+        SVGDescElement,
+        Document,
+        DocumentFragment,
+        ShadowRoot,
+        DOMImplementation,
+        ElementInternals,
+        DOMTokenList,
+        CustomElementRegistry,
+        CSSRule,
+        CSSStyleRule,
+        CSSMediaRule,
+        CSSStyleSheet,
+        CSSStyleDeclaration,
+        computedStyleFor
+      } = api.dom;
+      const {
+        DOMRectReadOnly,
+        DOMRect,
+        Range,
+        Selection,
+        URL,
+        URLSearchParams,
+        TextEncoder,
+        TextDecoder,
+        Headers,
+        Blob,
+        File,
+        Request,
+        Response,
+        responseHeadersFromHost,
+        loadHostResource,
+        XMLHttpRequest,
+        Storage,
+        XMLSerializer,
+        DOMParser,
+        NodeFilter,
+        locationFromURL,
+        makeMediaQueryList,
+        getRandomValues,
+        randomUUID,
+        observerStub,
+        installWptHook,
+        setTimeoutShim,
+        clearTimer,
+        setIntervalShim,
+        requestAnimationFrameShim,
+        requestIdleCallbackShim,
+        performanceNow,
+        runTimers
+      } = api.web;
+
+        installWindowIdentity(global);
+        global.top = global;
+        global.parent = global;
+        global.document = document;
+        global.DOMException = DOMException;
+        global.Window = Window;
+        global.EventTarget = EventTarget;
+        global.Event = Event;
+        global.CustomEvent = CustomEvent;
+        global.MessageEvent = MessageEvent;
+        global.MessagePort = MessagePort;
+        global.MessageChannel = MessageChannel;
+        global.UIEvent = UIEvent;
+        global.MouseEvent = MouseEvent;
+        global.KeyboardEvent = KeyboardEvent;
+        global.PointerEvent = PointerEvent;
+        global.AbortSignal = AbortSignal;
+        global.AbortController = AbortController;
+        global.MutationObserver = MutationObserver;
+        global.Node = Node;
+        global.Text = Text;
+        global.Comment = Comment;
+        global.Attr = Attr;
+        global.Element = Element;
+        global.HTMLElement = HTMLElement;
+        global.HTMLAnchorElement = HTMLAnchorElement;
+        global.HTMLAreaElement = HTMLAreaElement;
+        global.HTMLAudioElement = HTMLAudioElement;
+        global.HTMLBaseElement = HTMLBaseElement;
+        global.HTMLBodyElement = HTMLBodyElement;
+        global.HTMLBRElement = HTMLBRElement;
+        global.HTMLButtonElement = HTMLButtonElement;
+        global.HTMLCanvasElement = HTMLCanvasElement;
+        global.HTMLDataElement = HTMLDataElement;
+        global.HTMLDataListElement = HTMLDataListElement;
+        global.HTMLDetailsElement = HTMLDetailsElement;
+        global.HTMLDialogElement = HTMLDialogElement;
+        global.HTMLDivElement = HTMLDivElement;
+        global.HTMLDListElement = HTMLDListElement;
+        global.HTMLEmbedElement = HTMLEmbedElement;
+        global.HTMLFieldSetElement = HTMLFieldSetElement;
+        global.HTMLFormElement = HTMLFormElement;
+        global.HTMLHeadElement = HTMLHeadElement;
+        global.HTMLHeadingElement = HTMLHeadingElement;
+        global.HTMLHRElement = HTMLHRElement;
+        global.HTMLHtmlElement = HTMLHtmlElement;
+        global.HTMLIFrameElement = HTMLIFrameElement;
+        global.HTMLImageElement = HTMLImageElement;
+        global.HTMLInputElement = HTMLInputElement;
+        global.HTMLLabelElement = HTMLLabelElement;
+        global.HTMLLegendElement = HTMLLegendElement;
+        global.HTMLLIElement = HTMLLIElement;
+        global.HTMLLinkElement = HTMLLinkElement;
+        global.HTMLMapElement = HTMLMapElement;
+        global.HTMLMediaElement = HTMLMediaElement;
+        global.HTMLMetaElement = HTMLMetaElement;
+        global.HTMLMeterElement = HTMLMeterElement;
+        global.HTMLModElement = HTMLModElement;
+        global.HTMLObjectElement = HTMLObjectElement;
+        global.HTMLOListElement = HTMLOListElement;
+        global.HTMLOptGroupElement = HTMLOptGroupElement;
+        global.HTMLOptionElement = HTMLOptionElement;
+        global.HTMLOutputElement = HTMLOutputElement;
+        global.HTMLParagraphElement = HTMLParagraphElement;
+        global.HTMLParamElement = HTMLParamElement;
+        global.HTMLPictureElement = HTMLPictureElement;
+        global.HTMLPreElement = HTMLPreElement;
+        global.HTMLProgressElement = HTMLProgressElement;
+        global.HTMLQuoteElement = HTMLQuoteElement;
+        global.HTMLScriptElement = HTMLScriptElement;
+        global.HTMLSelectElement = HTMLSelectElement;
+        global.HTMLSlotElement = HTMLSlotElement;
+        global.HTMLSourceElement = HTMLSourceElement;
+        global.HTMLSpanElement = HTMLSpanElement;
+        global.HTMLStyleElement = HTMLStyleElement;
+        global.HTMLTableCaptionElement = HTMLTableCaptionElement;
+        global.HTMLTableCellElement = HTMLTableCellElement;
+        global.HTMLTableColElement = HTMLTableColElement;
+        global.HTMLTableElement = HTMLTableElement;
+        global.HTMLTableRowElement = HTMLTableRowElement;
+        global.HTMLTableSectionElement = HTMLTableSectionElement;
+        global.HTMLTemplateElement = HTMLTemplateElement;
+        global.HTMLTextAreaElement = HTMLTextAreaElement;
+        global.HTMLTimeElement = HTMLTimeElement;
+        global.HTMLTitleElement = HTMLTitleElement;
+        global.HTMLTrackElement = HTMLTrackElement;
+        global.HTMLUListElement = HTMLUListElement;
+        global.HTMLUnknownElement = HTMLUnknownElement;
+        global.HTMLVideoElement = HTMLVideoElement;
+        global.SVGElement = SVGElement;
+        global.SVGGraphicsElement = SVGGraphicsElement;
+        global.SVGSVGElement = SVGSVGElement;
+        global.SVGPathElement = SVGPathElement;
+        global.SVGCircleElement = SVGCircleElement;
+        global.SVGEllipseElement = SVGEllipseElement;
+        global.SVGLineElement = SVGLineElement;
+        global.SVGRectElement = SVGRectElement;
+        global.SVGPolygonElement = SVGPolygonElement;
+        global.SVGPolylineElement = SVGPolylineElement;
+        global.SVGGElement = SVGGElement;
+        global.SVGDefsElement = SVGDefsElement;
+        global.SVGUseElement = SVGUseElement;
+        global.SVGSymbolElement = SVGSymbolElement;
+        global.SVGTitleElement = SVGTitleElement;
+        global.SVGDescElement = SVGDescElement;
+        global.Document = Document;
+        global.DocumentFragment = DocumentFragment;
+        global.ShadowRoot = ShadowRoot;
+        global.DOMImplementation = DOMImplementation;
+        global.ElementInternals = ElementInternals;
+        global.DOMTokenList = DOMTokenList;
+        global.Range = Range;
+        global.Selection = Selection;
+        global.DOMRectReadOnly = DOMRectReadOnly;
+        global.DOMRect = DOMRect;
+        global.URL = URL;
+        global.URLSearchParams = URLSearchParams;
+        global.TextEncoder = TextEncoder;
+        global.TextDecoder = TextDecoder;
+        global.Headers = Headers;
+        global.Blob = Blob;
+        global.File = File;
+        global.Request = Request;
+        global.Response = Response;
+        global.XMLHttpRequest = XMLHttpRequest;
+        global.Storage = Storage;
+        global.CSSRule = CSSRule;
+        global.CSSStyleRule = CSSStyleRule;
+        global.CSSMediaRule = CSSMediaRule;
+        global.CSSStyleSheet = CSSStyleSheet;
+        global.CSSStyleDeclaration = CSSStyleDeclaration;
+        global.XMLSerializer = XMLSerializer;
+        global.DOMParser = DOMParser;
+        global.NodeFilter = NodeFilter;
+        ctx.customElementsRegistry = new CustomElementRegistry();
+        global.CustomElementRegistry = CustomElementRegistry;
+        global.customElements = ctx.customElementsRegistry;
+        global.navigator = {
+          userAgent: host.userAgent || 'PageCore/0.1',
+          language: 'en-US',
+          languages: ['en-US', 'en'],
+          onLine: true,
+          hardwareConcurrency: 1,
+          javaEnabled: () => false,
+          mediaDevices: {
+            getSupportedConstraints: () => ({})
+          }
+        };
+        global.location = locationFromURL(host.baseURL || '');
+        global.history = {
+          length: 1,
+          state: null,
+          pushState(state, _title, url = undefined) {
+            this.state = state;
+            if (url !== undefined) global.location.assign(url);
+          },
+          replaceState(state, _title, url = undefined) {
+            this.state = state;
+            if (url !== undefined) global.location.replace(url);
+          },
+          go() {},
+          back() {},
+          forward() {}
+        };
+        global.localStorage = new Storage();
+        global.sessionStorage = new Storage();
+        global.crypto = {
+          getRandomValues,
+          randomUUID
+        };
+        global.innerWidth = 1024;
+        global.innerHeight = 768;
+        global.outerWidth = 1024;
+        global.outerHeight = 768;
+        global.devicePixelRatio = 1;
+        global.screen = {
+          width: global.innerWidth,
+          height: global.innerHeight,
+          availWidth: global.innerWidth,
+          availHeight: global.innerHeight,
+          colorDepth: 24,
+          pixelDepth: 24,
+          orientation: {
+            type: 'landscape-primary',
+            angle: 0
+          }
+        };
+        global.screenX = 0;
+        global.screenY = 0;
+        global.scrollX = 0;
+        global.scrollY = 0;
+        global.pageXOffset = 0;
+        global.pageYOffset = 0;
+        global.scrollTo = () => {};
+        global.scrollBy = () => {};
+        global.scroll = () => {};
+        global.open = () => null;
+        global.close = () => {};
+        global.postMessage = (message) => {
+          global.dispatchEvent(new MessageEvent('message', { data: message, origin: global.location.origin, source: global }));
+        };
+
+        function consoleArgument(value) {
+          if (value && typeof value === 'object') {
+            try {
+              if (typeof value.stack === 'string' && value.stack) return value.stack;
+              if (typeof value.name === 'string' && typeof value.message === 'string') return `${value.name}: ${value.message}`;
+            } catch (_error) {
+              return value;
+            }
+          }
+          return value;
+        }
+
+        global.console = {
+          log: (...args) => host.log('log', ...args.map(consoleArgument)),
+          info: (...args) => host.log('info', ...args.map(consoleArgument)),
+          warn: (...args) => host.log('warn', ...args.map(consoleArgument)),
+          error: (...args) => host.log('error', ...args.map(consoleArgument)),
+          debug: (...args) => host.log('debug', ...args.map(consoleArgument))
+        };
+
+        global.setTimeout = setTimeoutShim;
+        global.clearTimeout = clearTimer;
+        global.setInterval = setIntervalShim;
+        global.clearInterval = clearTimer;
+        global.requestAnimationFrame = requestAnimationFrameShim;
+        global.cancelAnimationFrame = clearTimer;
+        global.queueMicrotask = (callback) => Promise.resolve().then(callback);
+        global.requestIdleCallback = requestIdleCallbackShim;
+        global.cancelIdleCallback = clearTimer;
+        global.getComputedStyle = (element) => computedStyleFor(element);
+        global.matchMedia = makeMediaQueryList;
+        global.IntersectionObserver = observerStub;
+        global.ResizeObserver = observerStub;
+        global.PerformanceObserver = observerStub;
+        global.performance = {
+          now: performanceNow,
+          timeOrigin: Date.now(),
+          mark() {},
+          measure() {},
+          getEntriesByName: () => [],
+          getEntriesByType: () => []
+        };
+        global.addEventListener = (...args) => EventTarget.prototype.addEventListener.apply(global, args);
+        global.removeEventListener = (...args) => EventTarget.prototype.removeEventListener.apply(global, args);
+        global.dispatchEvent = (...args) => EventTarget.prototype.dispatchEvent.apply(global, args);
+        global.Image = function(width = undefined, height = undefined) {
+          const image = document.createElement('img');
+          if (width !== undefined) image.width = Number(width);
+          if (height !== undefined) image.height = Number(height);
+          image.complete = false;
+          image.decode = () => image.getAttribute('src') ? Promise.resolve() : Promise.reject(new DOMException('The source image cannot be decoded.', 'EncodingError'));
+          return image;
+        };
+        global.fetch = (input, init = {}) => Promise.resolve().then(() => {
+          const request = new Request(input, init);
+          const loaded = loadHostResource(request.url, 'other');
+          return new Response(loaded.body || '', {
+            status: Number(loaded.status || 200),
+            headers: responseHeadersFromHost(loaded),
+            url: loaded.url || request.url
+          });
+        });
+        global.__pagecore_install_wpt_hook = installWptHook;
+        installWptHook();
+        global.__pagecore_fireDOMContentLoaded = () => {
+          if (ctx.documentReadyState === 'loading') setDocumentReadyState('interactive');
+          document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+          const handler = document.onreadystatechange;
+          if (typeof handler === 'function') handler.call(document, new Event('readystatechange'));
+        };
+        global.__pagecore_fireLoad = () => {
+          setDocumentReadyState('complete');
+          const readystatechange = new Event('readystatechange');
+          document.dispatchEvent(readystatechange);
+          const readyHandler = document.onreadystatechange;
+          if (typeof readyHandler === 'function') readyHandler.call(document, readystatechange);
+          global.dispatchEvent(new Event('load'));
+        };
+
+        for (const [name, value] of Object.entries({
+          ELEMENT_NODE: 1,
+          ATTRIBUTE_NODE: 2,
+          TEXT_NODE: 3,
+          CDATA_SECTION_NODE: 4,
+          PROCESSING_INSTRUCTION_NODE: 7,
+          COMMENT_NODE: 8,
+          DOCUMENT_NODE: 9,
+          DOCUMENT_TYPE_NODE: 10,
+          DOCUMENT_FRAGMENT_NODE: 11
+        })) {
+          defineValue(Node, name, value, true);
+          defineValue(Node.prototype, name, value, true);
+        }
+
+        global.__pagecore_run_timers = runTimers;
+
+      return {};
+    }
+  };
+});

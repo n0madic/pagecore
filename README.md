@@ -8,7 +8,7 @@ Small modular web engine for headless automation, embedding, offscreen rendering
 - Lexbor is the source of truth for HTML parsing, DOM storage, selectors, mutations, and serialization.
 - QuickJS-NG runs page JavaScript.
 - `dom_bridge` exposes primitive DOM operations to JS and keeps Lexbor as the only DOM source of truth.
-- `src/dom_shim.js` is embedded into the binary at build time and implements browser-like `window`, `document`, `Node`, `Element`, `HTMLElement`, events, timers, `classList`, `attributes`, `dataset`, and minimal `style`.
+- `src/dom_shim/` contains standalone `install(ctx, api)` JavaScript modules for the browser-like `window`, `document`, `Node`, `Element`, `HTMLElement`, events, timers, CSSOM, fetch/XHR, and related shims. Each module declares explicit dependencies and exports; CMake concatenates them into `generated/dom_shim.js` at build time and embeds that generated artifact into the binary.
 - DOM wrappers are hardened with a Lexbor-backed `mutationVersion`/`hasNode` contract so stale wrappers after destructive mutations fail cleanly instead of dereferencing removed nodes.
 - Resources flow through `ResourceRequest`/`ResourceResponse` with request kinds (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `Other`), typed `ResourceError`s, `ResourcePolicy`, and an optional `CachingResourceLoader` decorator.
 - `Page`, JS script loading, litehtml stylesheet imports, and image placeholders use the same resource pipeline.
@@ -79,6 +79,17 @@ cmake --build build-size --target pagecore_cli
 ```
 
 `PAGECORE_OPTIMIZE_SIZE=ON` enables function/data sections, linker dead-code elimination (`-dead_strip` on Darwin or `--gc-sections` on ELF linkers), IPO/LTO when CMake reports compiler support, and post-build stripping for `Release`/`MinSizeRel` executables. If symbols are needed for diagnostics, add `-DPAGECORE_STRIP_RELEASE_BINARIES=OFF`.
+
+To embed a minified DOM shim, install either `terser` or `esbuild` in `PATH` and configure with:
+
+```sh
+cmake -S . -B build-size \
+  -DPAGECORE_MINIFY_DOM_SHIM=ON
+```
+
+When enabled, CMake still writes the readable concatenated shim to `generated/dom_shim.js`, then embeds `generated/dom_shim.min.js`.
+
+If `node` is available, `pagecore_dom_shim_check` and the `pagecore_dom_shim_modules` CTest verify that each DOM shim module can be syntax-checked, executed standalone, and loaded as a module definition with the expected dependency contract. The `pagecore_dom_shim_unit_tests` target and CTest run focused Node tests from `tests/dom_shim/` for core URL/resource helpers, event dispatch/abort behavior, web utility shims, timers, and runtime dependency errors.
 
 ## CLI
 

@@ -12,11 +12,12 @@ endif()
 
 option(PAGECORE_BUILD_TESTS "Build PageCore tests" ${PAGECORE_DEFAULT_BUILD_EXTRAS})
 option(PAGECORE_BUILD_TOOLS "Build PageCore command-line tools" ${PAGECORE_DEFAULT_BUILD_EXTRAS})
-option(PAGECORE_BUILD_EXAMPLES "Build PageCore examples" ${PAGECORE_DEFAULT_BUILD_EXTRAS})
+option(PAGECORE_BUILD_EXAMPLES "Build PageCore examples" OFF)
 set(PAGECORE_DEFAULT_ENABLE_RENDERING ${PAGECORE_BUILD_TOOLS})
 option(PAGECORE_ENABLE_RENDERING "Build the litehtml layout adapter and Cairo/Pango rendering pipeline" ${PAGECORE_DEFAULT_ENABLE_RENDERING})
 option(PAGECORE_OPTIMIZE_SIZE "Enable size-focused release flags, linker dead-code elimination, LTO when available, and executable stripping" OFF)
 option(PAGECORE_STRIP_RELEASE_BINARIES "Strip Release/MinSizeRel executables when PAGECORE_OPTIMIZE_SIZE is enabled" ON)
+option(PAGECORE_MINIFY_DOM_SHIM "Minify the generated DOM shim before embedding it" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -274,20 +275,95 @@ pagecore_fetchcontent_make_available_excluded(quickjs_ng)
 find_package(CURL REQUIRED)
 
 set(PAGECORE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(PAGECORE_DOM_SHIM_PARTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/00_runtime.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/10_core.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/20_events.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/30_dom.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/40_web.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/90_install.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/99_boot.js"
+)
+set(PAGECORE_DOM_SHIM_SOURCE "${PAGECORE_GENERATED_DIR}/dom_shim.js")
+set(PAGECORE_DOM_SHIM_EMBED_INPUT "${PAGECORE_DOM_SHIM_SOURCE}")
+set(PAGECORE_DOM_SHIM_BUILD_OUTPUTS "${PAGECORE_DOM_SHIM_SOURCE}")
+set(PAGECORE_DOM_SHIM_BUILD_ARGS -DMINIFY=OFF)
+
+if(PAGECORE_MINIFY_DOM_SHIM)
+    find_program(PAGECORE_TERSER_EXECUTABLE NAMES terser)
+    find_program(PAGECORE_ESBUILD_EXECUTABLE NAMES esbuild)
+
+    if(PAGECORE_TERSER_EXECUTABLE)
+        set(PAGECORE_DOM_SHIM_MINIFIER terser)
+        set(PAGECORE_DOM_SHIM_MINIFIER_EXECUTABLE "${PAGECORE_TERSER_EXECUTABLE}")
+    elseif(PAGECORE_ESBUILD_EXECUTABLE)
+        set(PAGECORE_DOM_SHIM_MINIFIER esbuild)
+        set(PAGECORE_DOM_SHIM_MINIFIER_EXECUTABLE "${PAGECORE_ESBUILD_EXECUTABLE}")
+    else()
+        message(FATAL_ERROR "PAGECORE_MINIFY_DOM_SHIM=ON requires terser or esbuild in PATH")
+    endif()
+
+    set(PAGECORE_DOM_SHIM_EMBED_INPUT "${PAGECORE_GENERATED_DIR}/dom_shim.min.js")
+    list(APPEND PAGECORE_DOM_SHIM_BUILD_OUTPUTS "${PAGECORE_DOM_SHIM_EMBED_INPUT}")
+    set(PAGECORE_DOM_SHIM_BUILD_ARGS
+        -DMINIFY=ON
+        "-DMINIFIER=${PAGECORE_DOM_SHIM_MINIFIER}"
+        "-DMINIFIER_EXECUTABLE=${PAGECORE_DOM_SHIM_MINIFIER_EXECUTABLE}"
+    )
+endif()
+
+add_custom_command(
+    OUTPUT ${PAGECORE_DOM_SHIM_BUILD_OUTPUTS}
+    COMMAND
+        ${CMAKE_COMMAND}
+        "-DINPUTS=${PAGECORE_DOM_SHIM_PARTS}"
+        "-DCONCAT_OUTPUT=${PAGECORE_DOM_SHIM_SOURCE}"
+        "-DOUTPUT=${PAGECORE_DOM_SHIM_EMBED_INPUT}"
+        ${PAGECORE_DOM_SHIM_BUILD_ARGS}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_dom_shim.cmake
+    DEPENDS
+        ${PAGECORE_DOM_SHIM_PARTS}
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_dom_shim.cmake"
+    VERBATIM
+)
+
 set(PAGECORE_DOM_SHIM_HEADER "${PAGECORE_GENERATED_DIR}/dom_shim.hpp")
 add_custom_command(
     OUTPUT "${PAGECORE_DOM_SHIM_HEADER}"
     COMMAND
         ${CMAKE_COMMAND}
-        -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim.js
+        -DINPUT=${PAGECORE_DOM_SHIM_EMBED_INPUT}
         -DOUTPUT=${PAGECORE_DOM_SHIM_HEADER}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
     DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim.js"
+        "${PAGECORE_DOM_SHIM_EMBED_INPUT}"
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake"
     VERBATIM
 )
 add_custom_target(pagecore_dom_shim DEPENDS "${PAGECORE_DOM_SHIM_HEADER}")
+
+find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
+if(PAGECORE_NODE_EXECUTABLE)
+    add_custom_target(pagecore_dom_shim_check
+        COMMAND
+            "${PAGECORE_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_dom_shim_modules.js"
+            ${PAGECORE_DOM_SHIM_PARTS}
+        DEPENDS
+            ${PAGECORE_DOM_SHIM_PARTS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_dom_shim_modules.js"
+        VERBATIM
+    )
+    add_custom_target(pagecore_dom_shim_unit_tests
+        COMMAND
+            "${PAGECORE_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/dom_shim/dom_shim_unit_tests.js"
+        DEPENDS
+            ${PAGECORE_DOM_SHIM_PARTS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/dom_shim/dom_shim_unit_tests.js"
+        VERBATIM
+    )
+endif()
 
 if(PAGECORE_ENABLE_RENDERING)
     set(LITEHTML_BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -370,6 +446,21 @@ endif()
 
 if(PAGECORE_BUILD_TESTS)
     enable_testing()
+    if(PAGECORE_NODE_EXECUTABLE)
+        add_test(
+            NAME pagecore_dom_shim_modules
+            COMMAND
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_dom_shim_modules.js"
+                ${PAGECORE_DOM_SHIM_PARTS}
+        )
+        add_test(
+            NAME pagecore_dom_shim_unit_tests
+            COMMAND
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/dom_shim/dom_shim_unit_tests.js"
+        )
+    endif()
     add_executable(pagecore_tests tests/pagecore_tests.cpp)
     target_compile_definitions(
         pagecore_tests

@@ -1,0 +1,177 @@
+(function(root, factory) {
+  const definition = factory();
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = definition;
+  } else if (root && typeof root.__pagecore_dom_shim_define === 'function') {
+    root.__pagecore_dom_shim_define(definition);
+  } else if (root) {
+    root.PageCoreDomShimModules = root.PageCoreDomShimModules || {};
+    root.PageCoreDomShimModules[definition.name] = definition;
+  }
+})(globalThis, function() {
+  'use strict';
+
+  return {
+    name: 'core',
+    deps: [],
+    install(ctx, api) {
+      if (!ctx.bridge) throw new Error('PageCore DOM bridge is not installed');
+      if (!ctx.host) throw new Error('PageCore host bridge is not installed');
+
+      ctx.wrapperCache = new Map();
+      ctx.observedMutationVersion = ctx.bridge.mutationVersion();
+      ctx.suppressMutationRecords = 0;
+      ctx.customElementsRegistry = null;
+      ctx.pendingCustomElementNodeId = null;
+      ctx.documentReadyState = 'loading';
+      ctx.queueMutation = null;
+      ctx.wrapNode = null;
+      ctx.isDocumentFragment = null;
+      ctx.Element = null;
+      ctx.document = null;
+      const absoluteURLCache = new Map();
+
+      const DOM_EXCEPTION_CODES = {
+        IndexSizeError: 1,
+        HierarchyRequestError: 3,
+        WrongDocumentError: 4,
+        InvalidCharacterError: 5,
+        NoModificationAllowedError: 7,
+        NotFoundError: 8,
+        NotSupportedError: 9,
+        InUseAttributeError: 10,
+        InvalidStateError: 11,
+        SyntaxError: 12,
+        InvalidModificationError: 13,
+        NamespaceError: 14,
+        InvalidAccessError: 15,
+        SecurityError: 18,
+        NetworkError: 19,
+        AbortError: 20,
+        URLMismatchError: 21,
+        QuotaExceededError: 22,
+        TimeoutError: 23,
+        InvalidNodeTypeError: 24,
+        DataCloneError: 25
+      };
+
+      function defineValue(target, property, value, enumerable = false) {
+        Object.defineProperty(target, property, {
+          value,
+          writable: true,
+          configurable: true,
+          enumerable
+        });
+      }
+
+      function defineMethod(target, property, fn) {
+        if (typeof target[property] === 'function') return;
+        defineValue(target, property, fn);
+      }
+
+      function syncMutationCache() {
+        const current = ctx.bridge.mutationVersion();
+        if (current === ctx.observedMutationVersion) return;
+
+        for (const [id] of ctx.wrapperCache) {
+          if (!ctx.bridge.hasNode(id)) ctx.wrapperCache.delete(id);
+        }
+
+        ctx.observedMutationVersion = current;
+      }
+
+      function afterMutation(value, record = null) {
+        syncMutationCache();
+        if (record && ctx.suppressMutationRecords === 0 && typeof ctx.queueMutation === 'function') ctx.queueMutation(record);
+        return value;
+      }
+
+      function setDocumentReadyState(value) {
+        ctx.documentReadyState = String(value);
+      }
+
+      function isNodeWrapper(value) {
+        return Boolean(value && typeof value.__id === 'number');
+      }
+
+      function attachNodeId(target, id) {
+        Object.defineProperty(target, '__id', {
+          value: id,
+          configurable: true
+        });
+        return target;
+      }
+
+      function assertNode(value) {
+        if (!isNodeWrapper(value)) {
+          throw new TypeError('Expected a DOM Node');
+        }
+        if (!ctx.bridge.hasNode(value.__id)) {
+          throw new TypeError('DOM Node is no longer valid');
+        }
+        return value;
+      }
+
+      function liveId(value) {
+        return assertNode(value).__id;
+      }
+
+      function memo(target, property, factory) {
+        if (!Object.prototype.hasOwnProperty.call(target, property)) {
+          Object.defineProperty(target, property, {
+            value: factory(),
+            configurable: true
+          });
+        }
+        return target[property];
+      }
+
+      function toArray(ids) {
+        if (typeof ctx.wrapNode !== 'function') throw new Error('PageCore DOM node wrapper is not installed');
+        return ids.map((id) => ctx.wrapNode(id)).filter(Boolean);
+      }
+
+      function absoluteURL(value) {
+        const text = String(value ?? '');
+        if (!text) return '';
+        const base = ctx.global.location && ctx.global.location.href ? ctx.global.location.href : (ctx.host.baseURL || undefined);
+        const cacheKey = `${base || ''}\n${text}`;
+        if (absoluteURLCache.has(cacheKey)) return absoluteURLCache.get(cacheKey);
+        if (absoluteURLCache.size > 2048) absoluteURLCache.clear();
+        try {
+          const URLConstructor = ctx.global.URL || globalThis.URL;
+          const resolved = URLConstructor ? new URLConstructor(text, base).href : text;
+          absoluteURLCache.set(cacheKey, resolved);
+          return resolved;
+        } catch (_error) {
+          absoluteURLCache.set(cacheKey, text);
+          return text;
+        }
+      }
+
+      function loadHostResource(url, kind = 'other') {
+        if (!ctx.host || typeof ctx.host.loadResource !== 'function') {
+          throw new Error('resource loading is not available');
+        }
+        return ctx.host.loadResource(absoluteURL(url), kind);
+      }
+
+      return {
+        DOM_EXCEPTION_CODES,
+        defineValue,
+        defineMethod,
+        syncMutationCache,
+        afterMutation,
+        setDocumentReadyState,
+        isNodeWrapper,
+        attachNodeId,
+        assertNode,
+        liveId,
+        memo,
+        toArray,
+        absoluteURL,
+        loadHostResource
+      };
+    }
+  };
+});
