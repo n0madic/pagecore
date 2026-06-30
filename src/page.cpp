@@ -157,12 +157,14 @@ std::string remove_head_direct_text_nodes(std::string html)
     return out;
 }
 
-// Identifies the inputs that fully determine a rendered DisplayList. If these
-// match a previous render, the cached list is reused instead of re-running the
-// serialize/parse/layout pipeline. The resource loader's own byte cache is
-// intentionally not part of the key: a render is memoized against DOM state,
-// viewport, and base URL, not against external resource contents.
-struct DisplayListCacheKey {
+// Identifies the inputs that fully determine a built styled document (the
+// litehtml document backing both the rendered DisplayList and
+// getComputedStyle()). If these match a previous build, the cached engine is
+// reused instead of re-running the serialize/parse pipeline. The resource
+// loader's own byte cache is intentionally not part of the key: a build is
+// memoized against DOM state, viewport, and base URL, not against external
+// resource contents.
+struct StyledDocumentCacheKey {
     std::uint64_t mutation_version = 0;
     int viewport_width = 0;
     int viewport_height = 0;
@@ -170,7 +172,7 @@ struct DisplayListCacheKey {
     bool load_external_resources = false;
     std::string base_url;
 
-    bool operator==(const DisplayListCacheKey&) const = default;
+    bool operator==(const StyledDocumentCacheKey&) const = default;
 };
 
 struct CssUrlRef {
@@ -325,9 +327,17 @@ struct Page::Impl {
     std::unique_ptr<JsRuntime> js;
     std::string current_url;
 
-    bool display_list_valid = false;
-    DisplayListCacheKey display_list_key;
-    DisplayList display_list_cache;
+    // The single litehtml document shared by the rendered DisplayList and by
+    // getComputedStyle(): on a cache hit, cached_display_list() just runs
+    // layout() on it if that hasn't happened yet for this build.
+    std::unique_ptr<LayoutEngine> styled_document;
+    StyledDocumentCacheKey styled_document_key;
+    bool styled_document_valid = false;
+    bool styled_document_laid_out = false;
+    // getComputedStyle() has no viewport argument; it resolves against the
+    // most recently used render viewport (or the engine default if the page
+    // hasn't been rendered yet).
+    RenderOptions last_render_options;
 
     explicit Impl(LoadOptions init_options)
         : options(std::move(init_options))
@@ -340,14 +350,16 @@ struct Page::Impl {
 
     void invalidate_display_list_cache()
     {
-        display_list_valid = false;
-        display_list_cache.clear();
+        styled_document_valid = false;
+        styled_document_laid_out = false;
+        styled_document.reset();
     }
 
     void ensure_js()
     {
         if (!js) {
             js = std::make_unique<JsRuntime>(document, options, loader);
+            js->set_computed_style_resolver([this](NodeId node) { return computed_style(node); });
             js->install();
         }
     }
@@ -451,7 +463,7 @@ struct Page::Impl {
 
     std::string serialized_html_for_render() const
     {
-        std::string html = remove_head_direct_text_nodes(document.serialize_html());
+        std::string html = remove_head_direct_text_nodes(document.serialize_html_for_layout());
 
         DomDocument render_document;
         render_document.parse(html);
@@ -636,9 +648,13 @@ struct Page::Impl {
         return layout;
     }
 
-    const DisplayList& cached_display_list(const RenderOptions& render_options)
+    // Builds (or reuses) the litehtml document backing both the rendered
+    // DisplayList and getComputedStyle(), without running layout() on it —
+    // callers decide whether they need a full layout pass or just the
+    // cascade (compute_styles_only()).
+    LayoutEngine& ensure_styled_document(const RenderOptions& render_options)
     {
-        DisplayListCacheKey key{
+        StyledDocumentCacheKey key{
             document.mutation_version(),
             render_options.viewport.width,
             render_options.viewport.height,
@@ -647,15 +663,46 @@ struct Page::Impl {
             render_base_url(render_options),
         };
 
-        if (display_list_valid && display_list_key == key) {
-            return display_list_cache;
+        if (styled_document_valid && styled_document_key == key) {
+            return *styled_document;
         }
 
-        auto layout = build_layout(render_options);
-        display_list_cache = layout->display_list();
-        display_list_key = std::move(key);
-        display_list_valid = true;
-        return display_list_cache;
+        if (!layout_factory) {
+            throw std::runtime_error("no layout engine factory configured; build with PAGECORE_ENABLE_RENDERING or set one explicitly");
+        }
+
+        auto engine = layout_factory->create_layout_engine();
+        if (!engine) {
+            throw std::runtime_error("layout engine factory returned null");
+        }
+
+        engine->set_viewport(render_options.viewport);
+        engine->set_resource_loader(prepare_render_loader(render_options));
+        engine->load_html(serialized_html_for_render(), render_base_url(render_options));
+
+        styled_document = std::move(engine);
+        styled_document_key = std::move(key);
+        styled_document_valid = true;
+        styled_document_laid_out = false;
+        return *styled_document;
+    }
+
+    const DisplayList& cached_display_list(const RenderOptions& render_options)
+    {
+        last_render_options = render_options;
+        auto& engine = ensure_styled_document(render_options);
+        if (!styled_document_laid_out) {
+            engine.layout();
+            styled_document_laid_out = true;
+        }
+        return engine.display_list();
+    }
+
+    std::optional<ComputedStyle> computed_style(NodeId node)
+    {
+        auto& engine = ensure_styled_document(last_render_options);
+        engine.compute_styles_only();
+        return engine.computed_style(std::to_string(node));
     }
 };
 
@@ -768,6 +815,11 @@ std::optional<std::string> Page::outer_html(std::string_view selector)
         return std::nullopt;
     }
     return impl_->document.outer_html(found);
+}
+
+std::optional<ComputedStyle> Page::computed_style(NodeId node) const
+{
+    return impl_->computed_style(node);
 }
 
 } // namespace pagecore

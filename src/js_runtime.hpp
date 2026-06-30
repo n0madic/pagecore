@@ -2,9 +2,12 @@
 
 #include "pagecore/dom.hpp"
 #include "pagecore/page.hpp"
+#include "pagecore/render.hpp"
 
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -19,6 +22,8 @@ struct ResourceResponse;
 
 class JsRuntime {
 public:
+    using ComputedStyleResolver = std::function<std::optional<ComputedStyle>(NodeId)>;
+
     JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr<ResourceLoader> loader);
     ~JsRuntime();
 
@@ -36,12 +41,18 @@ public:
     void log_console(std::string_view severity, std::string_view message);
     bool is_timed_out() const;
 
+    // Injected by Page::Impl so getComputedStyle() can read back litehtml's
+    // cascade without JsRuntime depending on Page directly.
+    void set_computed_style_resolver(ComputedStyleResolver resolver);
+    std::optional<ComputedStyle> computed_style(NodeId node);
+
 private:
     JSRuntime* runtime_ = nullptr;
     JSContext* context_ = nullptr;
     DomDocument* document_ = nullptr;
     LoadOptions options_;
     std::shared_ptr<ResourceLoader> loader_;
+    ComputedStyleResolver computed_style_resolver_;
     std::chrono::steady_clock::time_point deadline_{};
     bool deadline_active_ = false;
 

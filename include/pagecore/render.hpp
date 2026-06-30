@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -172,6 +174,10 @@ struct DisplayList {
     }
 };
 
+struct ComputedStyle {
+    std::vector<std::pair<std::string, std::string>> properties;
+};
+
 class LayoutEngine {
 public:
     virtual ~LayoutEngine() = default;
@@ -180,6 +186,19 @@ public:
     virtual void load_html(std::string_view html, std::string_view base_url) = 0;
     virtual void layout() = 0;
     virtual const DisplayList& display_list() const = 0;
+
+    // Runs the CSS cascade without a full layout pass. Engines that don't
+    // support computed-style read-back leave this a no-op.
+    virtual void compute_styles_only() { }
+
+    // Looks up a single element by an engine-defined key (e.g. an injected
+    // marker attribute) and reads back its computed style. Default
+    // implementation is for engines without read-back support.
+    virtual std::optional<ComputedStyle> computed_style(std::string_view node_key)
+    {
+        (void) node_key;
+        return std::nullopt;
+    }
 };
 
 class LayoutEngineFactory {

@@ -70,6 +70,11 @@ public:
     void set_inner_html(NodeId id, std::string_view html);
     std::string outer_html(NodeId id) const;
     std::string serialize_html() const;
+    // Like serialize_html(), but tags every live element with a transient
+    // data-pc-sid="<NodeId>" attribute first, so a downstream HTML consumer
+    // (e.g. a layout engine) can be queried back by NodeId. The attribute is
+    // removed before this call returns and never bumps mutation_version().
+    std::string serialize_html_for_layout() const;
 
     NodeId append_child(NodeId parent, NodeId child);
     NodeId insert_before(NodeId parent, NodeId child, NodeId reference_child);

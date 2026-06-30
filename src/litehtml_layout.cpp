@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iomanip>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -113,6 +116,53 @@ std::vector<GradientStop> gradient_stops_from(const std::vector<litehtml::backgr
         });
     }
     return stops;
+}
+
+// Trims a fixed-precision float down to the shortest representation CSSOM
+// getters use (e.g. "50" not "50.000", "1.5" not "1.500").
+std::string format_number(float value)
+{
+    if (!std::isfinite(value)) {
+        value = 0.0f;
+    }
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(3) << value;
+    std::string text = stream.str();
+
+    const auto dot = text.find('.');
+    if (dot != std::string::npos) {
+        auto last = text.find_last_not_of('0');
+        if (last == dot) {
+            --last;
+        }
+        text.erase(last + 1);
+    }
+    return text;
+}
+
+std::string format_length(const litehtml::css_length& length, std::string_view predefined_keyword)
+{
+    if (length.is_predefined()) {
+        return std::string(predefined_keyword);
+    }
+    if (length.units() == litehtml::css_units_percentage) {
+        return format_number(length.val()) + "%";
+    }
+    return format_number(length.val()) + "px";
+}
+
+std::string format_color(const litehtml::web_color& color)
+{
+    if (color.alpha == 255) {
+        std::ostringstream stream;
+        stream << "rgb(" << static_cast<int>(color.red) << ", " << static_cast<int>(color.green) << ", "
+               << static_cast<int>(color.blue) << ")";
+        return stream.str();
+    }
+    std::ostringstream stream;
+    stream << "rgba(" << static_cast<int>(color.red) << ", " << static_cast<int>(color.green) << ", "
+           << static_cast<int>(color.blue) << ", " << format_number(static_cast<float>(color.alpha) / 255.0f) << ")";
+    return stream.str();
 }
 
 void transform_ascii(std::string& text, litehtml::text_transform transform)
@@ -687,6 +737,9 @@ public:
         if (!document_) {
             throw std::runtime_error("litehtml failed to parse HTML");
         }
+        // createFromString() already runs the cascade once (document.cpp),
+        // so styles are computed before any explicit compute_styles_only().
+        styles_computed_ = true;
         display_list_.clear();
         display_list_.viewport = viewport_;
     }
@@ -719,7 +772,116 @@ public:
         return display_list_;
     }
 
+    void compute_styles_only() override
+    {
+        ensure_styles_computed();
+    }
+
+    std::optional<ComputedStyle> computed_style(std::string_view node_key) override
+    {
+        if (!document_) {
+            return std::nullopt;
+        }
+        ensure_styles_computed();
+
+        std::string selector = "[data-pc-sid=\"";
+        selector += node_key;
+        selector += "\"]";
+
+        auto element = document_->root()->select_one(selector);
+        if (!element) {
+            return std::nullopt;
+        }
+        return ComputedStyle{computed_style_properties(element)};
+    }
+
 private:
+    void ensure_styles_computed()
+    {
+        if (!styles_computed_ && document_) {
+            document_->root()->compute_styles(true);
+            styles_computed_ = true;
+        }
+    }
+
+    std::vector<std::pair<std::string, std::string>> computed_style_properties(
+        const litehtml::element::ptr& element) const
+    {
+        const litehtml::css_properties& css = element->css();
+        std::vector<std::pair<std::string, std::string>> properties;
+        properties.reserve(32);
+
+        properties.emplace_back("display", std::string(litehtml::style_display_strings[css.get_display()]));
+        properties.emplace_back("position", std::string(litehtml::element_position_strings[css.get_position()]));
+        properties.emplace_back("float", std::string(litehtml::element_float_strings[css.get_float()]));
+        properties.emplace_back("color", format_color(css.get_color()));
+        properties.emplace_back("background-color", format_color(css.get_bg().m_color));
+        properties.emplace_back("font-size", format_number(px(css.get_font_size())) + "px");
+
+        const auto* font = reinterpret_cast<const FontHandle*>(css.get_font());
+        if (font != nullptr) {
+            properties.emplace_back("font-family", font->font.family);
+            properties.emplace_back("font-weight", std::to_string(font->font.weight));
+            properties.emplace_back("font-style", font->font.italic ? "italic" : "normal");
+        } else {
+            properties.emplace_back("font-family", container_.get_default_font_name());
+            properties.emplace_back("font-weight", "400");
+            properties.emplace_back("font-style", "normal");
+        }
+
+        properties.emplace_back("line-height", format_number(px(css.line_height().computed_value)) + "px");
+
+        properties.emplace_back("width", format_length(css.get_width(), "auto"));
+        properties.emplace_back("height", format_length(css.get_height(), "auto"));
+        properties.emplace_back("min-width", format_length(css.get_min_width(), "auto"));
+        properties.emplace_back("min-height", format_length(css.get_min_height(), "auto"));
+        properties.emplace_back("max-width", format_length(css.get_max_width(), "none"));
+        properties.emplace_back("max-height", format_length(css.get_max_height(), "none"));
+
+        const litehtml::css_margins& margins = css.get_margins();
+        properties.emplace_back("margin-left", format_length(margins.left, "auto"));
+        properties.emplace_back("margin-right", format_length(margins.right, "auto"));
+        properties.emplace_back("margin-top", format_length(margins.top, "auto"));
+        properties.emplace_back("margin-bottom", format_length(margins.bottom, "auto"));
+
+        const litehtml::css_margins& padding = css.get_padding();
+        properties.emplace_back("padding-left", format_length(padding.left, "0px"));
+        properties.emplace_back("padding-right", format_length(padding.right, "0px"));
+        properties.emplace_back("padding-top", format_length(padding.top, "0px"));
+        properties.emplace_back("padding-bottom", format_length(padding.bottom, "0px"));
+
+        const litehtml::css_offsets& offsets = css.get_offsets();
+        properties.emplace_back("left", format_length(offsets.left, "auto"));
+        properties.emplace_back("right", format_length(offsets.right, "auto"));
+        properties.emplace_back("top", format_length(offsets.top, "auto"));
+        properties.emplace_back("bottom", format_length(offsets.bottom, "auto"));
+
+        properties.emplace_back("text-align", std::string(litehtml::text_align_strings[css.get_text_align()]));
+        properties.emplace_back("visibility", std::string(litehtml::visibility_strings[css.get_visibility()]));
+        properties.emplace_back("white-space", std::string(litehtml::white_space_strings[css.get_white_space()]));
+        properties.emplace_back("overflow", std::string(litehtml::overflow_strings[css.get_overflow()]));
+        properties.emplace_back("box-sizing", std::string(litehtml::box_sizing_strings[css.get_box_sizing()]));
+        // get_z_index() collapses "auto" and an explicit "0" to the same
+        // value (litehtml doesn't expose is_predefined() for z-index).
+        properties.emplace_back("z-index", std::to_string(css.get_z_index()));
+        properties.emplace_back("vertical-align", std::string(litehtml::vertical_align_strings[css.get_vertical_align()]));
+        properties.emplace_back("text-indent", format_length(css.get_text_indent(), "0px"));
+
+        properties.emplace_back(
+            "list-style-type", std::string(litehtml::list_style_type_strings[css.get_list_style_type()]));
+        properties.emplace_back(
+            "list-style-position", std::string(litehtml::list_style_position_strings[css.get_list_style_position()]));
+        properties.emplace_back(
+            "list-style-image",
+            css.get_list_style_image().empty() ? "none" : ("url(\"" + css.get_list_style_image() + "\")"));
+
+        // litehtml applies opacity at draw time and doesn't store it on
+        // css_properties; known limitation until upstream exposes it.
+        properties.emplace_back("opacity", "1");
+
+        return properties;
+    }
+
     Viewport viewport_;
     std::shared_ptr<ResourceLoader> loader_;
     LiteHtmlDisplayListContainer container_;
@@ -727,6 +889,7 @@ private:
     std::string base_url_;
     litehtml::document::ptr document_;
     DisplayList display_list_;
+    bool styles_computed_ = false;
 };
 
 } // namespace

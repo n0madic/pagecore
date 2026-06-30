@@ -51,6 +51,7 @@ public:
     RenderedImage render(RasterBackend& backend, RenderOptions options = {}) const;
     std::optional<std::string> text_content(std::string_view selector);
     std::optional<std::string> outer_html(std::string_view selector);
+    std::optional<ComputedStyle> computed_style(NodeId node) const;
 
 private:
     struct Impl;

@@ -57,11 +57,8 @@
       let stylesheetListKey = '';
       let stylesheetListCache = null;
       let adoptedStyleSheets = [];
-      const computedStyleCache = new Map();
       let cssomVersion = 0;
       let stylesheetListMutationVersion = -1;
-      let cascadeEntriesKey = '';
-      let cascadeEntriesCache = [];
 
       function locationFromURL(href) {
         let url = null;
@@ -1439,7 +1436,6 @@
             super(CSSRule.STYLE_RULE, parentStyleSheet, sourceOrder);
             this.selectorText = String(selectorText).trim();
             this._styleText = String(cssText || '').trim();
-            this._compiledSelectors = null;
             this.style = makeCSSStyleDeclaration(
               () => this._styleText,
               (value) => {
@@ -1456,25 +1452,10 @@
             if (!parsed) throw new DOMException('Invalid CSS rule', 'SyntaxError');
             this.selectorText = parsed.selectorText;
             this._styleText = parsed.style.cssText;
-            this._compiledSelectors = null;
             cssomVersion++;
             if (this.parentStyleSheet) this.parentStyleSheet._syncOwnerText();
           }
 
-          _selectors() {
-            if (!this._compiledSelectors) {
-              this._compiledSelectors = splitSelectorList(this.selectorText).map((selector) => {
-                const tokens = selectorTokens(selector);
-                return {
-                  selector,
-                  tokens,
-                  filter: selectorRightmostFilter(tokens),
-                  specificity: selectorSpecificity(selector)
-                };
-              });
-            }
-            return this._compiledSelectors;
-          }
         }
 
         class CSSMediaRule extends CSSRule {
@@ -1697,163 +1678,8 @@
           return list;
         }
 
-        function rootAdoptedStyleSheets(root) {
-          if (root === document) return adoptedStyleSheets;
-          if (root && Array.isArray(root._adoptedStyleSheets)) return root._adoptedStyleSheets;
-          return [];
-        }
-
-        function cssRootKey(root) {
-          if (root === document) return 'document';
-          if (!root) return 'none';
-          if (!root._cssomRootId) defineValue(root, '_cssomRootId', nextCssRootId++);
-          return `root:${root._cssomRootId}`;
-        }
-
-        function cascadeStyleSheets(root = document) {
-          const rootSheets = root === document ? styleSheetsForDocument() : [];
-          return [...rootSheets, ...rootAdoptedStyleSheets(root)];
-        }
-
-        function defaultDisplayFor(element) {
-          const name = element && element.localName;
-          if (name === 'script' || name === 'style' || name === 'template' || name === 'head' || name === 'meta' || name === 'link' || name === 'title') {
-            return 'none';
-          }
-          if (name === 'span' || name === 'a' || name === 'b' || name === 'i' || name === 'strong' || name === 'em' || name === 'small' || name === 'label') {
-            return 'inline';
-          }
-          if (name === 'img' || name === 'input' || name === 'button' || name === 'select' || name === 'textarea' || name === 'canvas' || name === 'iframe') {
-            return 'inline-block';
-          }
-          return 'block';
-        }
-
         function computedDisplay(element) {
-          return computedPropertyValue(element, 'display');
-        }
-
-        const inheritedProperties = new Set([
-          'color',
-          'font',
-          'font-family',
-          'font-size',
-          'font-style',
-          'font-weight',
-          'line-height',
-          'text-align',
-          'visibility',
-          'white-space'
-        ]);
-
-        const commonComputedProperties = [
-          'background-color',
-          'color',
-          'display',
-          'float',
-          'font',
-          'font-family',
-          'font-size',
-          'font-style',
-          'font-weight',
-          'height',
-          'line-height',
-          'margin',
-          'margin-bottom',
-          'margin-left',
-          'margin-right',
-          'margin-top',
-          'opacity',
-          'padding',
-          'padding-bottom',
-          'padding-left',
-          'padding-right',
-          'padding-top',
-          'position',
-          'text-align',
-          'visibility',
-          'white-space',
-          'width'
-        ];
-
-        function defaultComputedPropertyValue(element, property) {
-          if (property === 'display') return defaultDisplayFor(element);
-          if (property === 'float') return 'none';
-          if (property === 'opacity') return '1';
-          if (property === 'position') return 'static';
-          if (property === 'visibility') return 'visible';
-          return '';
-        }
-
-        function mediaRuleApplies(rule) {
-          const text = String(rule.conditionText || '').trim().toLowerCase();
-          return !text || text === 'all' || text === 'screen' || text === 'only screen' || text.includes('min-width');
-        }
-
-        function collectStyleRules(rules, out = []) {
-          for (const rule of rules) {
-            if (rule.type === CSSRule.STYLE_RULE) out.push(rule);
-            else if (rule.type === CSSRule.MEDIA_RULE && mediaRuleApplies(rule)) collectStyleRules(rule.cssRules, out);
-          }
-          return out;
-        }
-
-        function cascadeEntries(root = document) {
-          const sheets = cascadeStyleSheets(root);
-          const key = `${cssRootKey(root)}:${bridge.mutationVersion()}:${cssomVersion}:` + sheets.map((sheet) => {
-            if (!sheet) return '';
-            return sheet._cacheKey();
-          }).join('|');
-          if (key === cascadeEntriesKey) return cascadeEntriesCache;
-
-          const entries = [];
-          let sourceOrder = 0;
-          for (const sheet of sheets) {
-            if (!sheet || sheet.disabled) continue;
-            for (const rule of collectStyleRules(sheet.cssRules)) {
-              const declarations = parseDeclarations(rule.style.cssText);
-              if (declarations.length === 0) continue;
-              for (const selector of rule._selectors()) {
-                entries.push({
-                  selector: selector.selector,
-                  tokens: selector.tokens,
-                  filter: selector.filter,
-                  specificity: selector.specificity,
-                  declarations,
-                  sourceOrder: sourceOrder++
-                });
-              }
-            }
-          }
-
-          cascadeEntriesKey = key;
-          cascadeEntriesCache = entries;
-          return entries;
-        }
-
-        function selectorSpecificity(selector) {
-          let text = String(selector || '');
-          text = text.replace(/:where\([^)]*\)/g, '');
-          const ids = (text.match(/#[A-Za-z0-9_-]+/g) || []).length;
-          const classes = (text.match(/\.[A-Za-z0-9_-]+/g) || []).length;
-          const attributes = (text.match(/\[[^\]]+\]/g) || []).length;
-          const pseudos = (text.match(/:(?!:)[A-Za-z0-9_-]+(?:\([^)]*\))?/g) || [])
-            .filter((pseudo) => !pseudo.startsWith(':where')).length;
-          text = text
-            .replace(/#[A-Za-z0-9_-]+/g, ' ')
-            .replace(/\.[A-Za-z0-9_-]+/g, ' ')
-            .replace(/\[[^\]]+\]/g, ' ')
-            .replace(/::?[A-Za-z0-9_-]+(?:\([^)]*\))?/g, ' ')
-            .replace(/[>+~*,]/g, ' ');
-          const types = (text.match(/\b[A-Za-z][A-Za-z0-9_-]*\b/g) || []).length;
-          return [ids, classes + attributes + pseudos, types];
-        }
-
-        function compareSpecificity(left, right) {
-          for (let index = 0; index < 3; index++) {
-            if (left[index] !== right[index]) return left[index] - right[index];
-          }
-          return 0;
+          return computedStyleFor(element).display;
         }
 
         function selectorTokens(selector) {
@@ -2020,100 +1846,27 @@
           return matchFrom(tokens.length - 1, element);
         }
 
-        function applyCascadeValue(values, name, value, priority, specificity, sourceOrder) {
-          if (value === '') return;
-          const important = priority === 'important';
-          const existing = values.get(name);
-          let wins = !existing;
-          if (existing) {
-            if (important !== existing.important) wins = important;
-            else {
-              const specificityCompare = compareSpecificity(specificity, existing.specificity);
-              wins = specificityCompare > 0 || (specificityCompare === 0 && sourceOrder >= existing.sourceOrder);
-            }
-          }
-          if (wins) values.set(name, { value, important, specificity, sourceOrder });
-        }
-
-        function computeCascade(element) {
-          if (!(element instanceof Element)) return Object.create(null);
-          const root = element.getRootNode ? element.getRootNode() : document;
-          const entries = cascadeEntries(root);
-          const cacheKey = `${element.__id}:${cssRootKey(root)}:${bridge.mutationVersion()}:${cssomVersion}:${cascadeEntriesKey}`;
-          const cached = computedStyleCache.get(cacheKey);
-          if (cached) return cached;
-
-          const values = new Map();
-
-          for (const entry of entries) {
-            try {
-              if (!selectorFilterMayMatch(element, entry.filter)) continue;
-              if (!selectorMatchesElementFast(element, entry.tokens)) continue;
-            } catch (_error) {
-              continue;
-            }
-            for (const declaration of entry.declarations) {
-              applyCascadeValue(values, declaration.name, declaration.value, declaration.priority, entry.specificity, entry.sourceOrder);
-            }
-          }
-
-          let sourceOrder = entries.length;
-          for (const declaration of parseDeclarations(element.getAttribute('style') || '')) {
-            applyCascadeValue(values, declaration.name, declaration.value, declaration.priority, [1, 0, 0], sourceOrder++);
-          }
-
-          if (element.hasAttribute('hidden')) {
-            applyCascadeValue(values, 'display', 'none', 'important', [1, 0, 0], sourceOrder++);
-          }
-          const out = Object.create(null);
-          for (const [name, record] of values) out[name] = record.value;
-          computedStyleCache.set(cacheKey, out);
-          if (computedStyleCache.size > 4096) computedStyleCache.clear();
-          return out;
-        }
-
-        function inheritedPropertyValue(element, property, depth) {
-          if (depth > 64) return defaultComputedPropertyValue(element, property);
-          const parent = element && element.parentElement;
-          return parent ? computedPropertyValue(parent, property, depth + 1) : defaultComputedPropertyValue(element, property);
-        }
-
-        function resolveCSSWideValue(element, property, value, depth) {
-          const keyword = String(value || '').trim().toLowerCase();
-          if (keyword === 'inherit') return inheritedPropertyValue(element, property, depth);
-          if (keyword === 'initial') return defaultComputedPropertyValue(element, property);
-          if (keyword === 'unset') {
-            return inheritedProperties.has(property)
-              ? inheritedPropertyValue(element, property, depth)
-              : defaultComputedPropertyValue(element, property);
-          }
-          return value;
-        }
-
-        function computedPropertyValue(element, name, depth = 0) {
-          if (!(element instanceof Element)) return '';
-          const property = cssPropertyName(name);
-          if (!property) return '';
-          const values = computeCascade(element);
-          if (Object.prototype.hasOwnProperty.call(values, property)) {
-            return resolveCSSWideValue(element, property, values[property], depth);
-          }
-          if (inheritedProperties.has(property)) {
-            return inheritedPropertyValue(element, property, depth);
-          }
-          return defaultComputedPropertyValue(element, property);
-        }
-
-        function computedPropertyNames(element) {
-          const names = new Set(Object.keys(computeCascade(element)));
-          for (const property of commonComputedProperties) names.add(property);
-          for (const property of inheritedProperties) names.add(property);
-          return Array.from(names);
-        }
-
         function computedStyleFor(element) {
-          const propertyNames = () => computedPropertyNames(element);
-          const propertyValue = (name) => computedPropertyValue(element, name);
+          // litehtml's cascade is keyed on the bridge's mutation version (see
+          // Page::Impl::ensure_styled_document), so a value computed for the
+          // current version stays valid until the DOM changes again.
+          let cachedValues = null;
+          let cachedVersion = -1;
+          const styleValues = () => {
+            if (!(element instanceof Element)) return Object.create(null);
+            const version = bridge.mutationVersion();
+            if (cachedValues === null || cachedVersion !== version) {
+              cachedValues = bridge.computedStyle(element.__id);
+              cachedVersion = version;
+            }
+            return cachedValues;
+          };
+          const propertyNames = () => Object.keys(styleValues());
+          const propertyValue = (name) => {
+            const property = cssPropertyName(name);
+            if (!property) return '';
+            return styleValues()[property] || '';
+          };
           const declaration = Object.create(CSSStyleDeclaration.prototype);
           defineValue(declaration, 'item', (index) => propertyNames()[Number(index)] || '');
           defineValue(declaration, 'getPropertyValue', (name) => propertyValue(name));

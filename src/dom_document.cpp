@@ -104,6 +104,30 @@ void collect_subtree(lxb_dom_node_t* node, std::vector<lxb_dom_node_t*>& out)
     }
 }
 
+constexpr std::string_view kLayoutIdAttribute = "data-pc-sid";
+
+// Bypasses lxb_dom_element_set/remove_attribute's normal call sites
+// (DomDocument::set_attribute/remove_attribute), which bump mutation_version
+// — this round-trip must stay invisible to layout-cache keys.
+void set_layout_id_attribute(lxb_dom_element_t* element, NodeId id)
+{
+    const std::string value = std::to_string(id);
+    lxb_dom_element_set_attribute(
+        element,
+        reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
+        kLayoutIdAttribute.size(),
+        reinterpret_cast<const lxb_char_t*>(value.data()),
+        value.size());
+}
+
+void remove_layout_id_attribute(lxb_dom_element_t* element)
+{
+    lxb_dom_element_remove_attribute(
+        element,
+        reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
+        kLayoutIdAttribute.size());
+}
+
 struct SelectorResults {
     const DomDocument::Impl* impl;
     std::vector<NodeId> ids;
@@ -712,6 +736,39 @@ std::string DomDocument::serialize_html() const
         throw std::runtime_error("failed to serialize HTML document");
     }
     return out;
+}
+
+std::string DomDocument::serialize_html_for_layout() const
+{
+    std::vector<lxb_dom_node_t*> nodes;
+    collect_subtree(lxb_dom_interface_node(impl_->document), nodes);
+
+    std::vector<lxb_dom_element_t*> tagged;
+    tagged.reserve(nodes.size());
+    for (auto* node : nodes) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+            continue;
+        }
+        auto* element = lxb_dom_interface_element(node);
+        set_layout_id_attribute(element, impl_->id_for(node));
+        tagged.push_back(element);
+    }
+
+    std::string html;
+    try {
+        html = serialize_html();
+    } catch (...) {
+        for (auto* element : tagged) {
+            remove_layout_id_attribute(element);
+        }
+        throw;
+    }
+
+    for (auto* element : tagged) {
+        remove_layout_id_attribute(element);
+    }
+
+    return html;
 }
 
 NodeId DomDocument::append_child(NodeId parent, NodeId child)

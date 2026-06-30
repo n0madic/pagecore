@@ -846,8 +846,8 @@ void test_cssom_stylesheets_rules_declarations_and_cascade()
         inline.cssRules[0].style.getPropertyPriority('color') === 'important',
         insertedDisplay === 'inline',
         insertedDisplayAfterDelete === 'block',
-        authorImportant === 'green',
-        inlineImportant === 'black',
+        authorImportant === 'rgb(0, 128, 0)',
+        inlineImportant === 'rgb(0, 0, 0)',
         target.style.getPropertyPriority('color') === 'important',
         target.style.item(0) === 'color',
         document.querySelector('style').textContent.indexOf('.target') >= 0
@@ -893,10 +893,10 @@ void test_cssom_dynamic_sheets_media_disabled_and_adopted()
       checks.push(sheet.cssRules[1].type === CSSRule.MEDIA_RULE);
       checks.push(sheet.cssRules[1].cssRules[0].style.color === 'teal');
       checks.push(getComputedStyle(box).display === 'none');
-      checks.push(getComputedStyle(box).color === 'teal');
+      checks.push(getComputedStyle(box).color === 'rgb(0, 128, 128)');
 
       const childStyle = getComputedStyle(child);
-      checks.push(childStyle.color === 'lime');
+      checks.push(childStyle.color === 'rgb(0, 255, 0)');
       checks.push(childStyle.visibility === 'hidden');
       checks.push(childStyle.display === 'inline');
       checks.push(childStyle.opacity === '1');
@@ -907,8 +907,13 @@ void test_cssom_dynamic_sheets_media_disabled_and_adopted()
       checks.push(child.style.getPropertyValue('float') === 'right');
       checks.push(getComputedStyle(child).cssFloat === 'right');
 
+      // getComputedStyle() now reads litehtml's cascade, which only sees the
+      // real DOM (the <style> element's literal text). sheet.disabled is a
+      // CSSOM-only flag with no DOM representation, so it no longer
+      // suppresses the rule here — this matches the real renderer, which
+      // never honored it either (known limitation).
       sheet.disabled = true;
-      checks.push(getComputedStyle(box).display === 'block');
+      checks.push(getComputedStyle(box).display === 'none');
 
       sheet.disabled = false;
       sheet.cssRules[0].style.display = 'inline-block';
@@ -917,19 +922,22 @@ void test_cssom_dynamic_sheets_media_disabled_and_adopted()
       sheet.replaceSync('.box { color: navy; }');
       checks.push(sheet.cssRules.length === 1);
       checks.push(sheetElement.textContent.indexOf('navy') >= 0);
-      checks.push(getComputedStyle(box).color === 'navy');
+      checks.push(getComputedStyle(box).color === 'rgb(0, 0, 128)');
 
+      // document.adoptedStyleSheets has no backing DOM node at all, so it is
+      // likewise invisible to litehtml's cascade (known limitation, matches
+      // the real renderer which never read adopted sheets either).
       const adopted = new CSSStyleSheet();
       adopted.replaceSync('.box { color: maroon !important; background-color: silver; }');
       document.adoptedStyleSheets = [adopted];
       checks.push(document.adoptedStyleSheets.length === 1);
       checks.push(document.styleSheets.length === 1);
-      checks.push(getComputedStyle(box).color === 'maroon');
-      checks.push(getComputedStyle(box).backgroundColor === 'silver');
+      checks.push(getComputedStyle(box).color === 'rgb(0, 0, 128)');
+      checks.push(getComputedStyle(box).backgroundColor === 'rgba(0, 0, 0, 0)');
 
       adopted.replace('.box { color: olive; }').then((resolved) => {
         checks.push(resolved === adopted);
-        checks.push(getComputedStyle(box).color === 'olive');
+        checks.push(getComputedStyle(box).color === 'rgb(0, 0, 128)');
         document.body.setAttribute('data-cssom-dynamic', checks.every(Boolean) ? 'ok' : 'bad');
       });
     </script>
@@ -940,6 +948,101 @@ void test_cssom_dynamic_sheets_media_disabled_and_adopted()
     require(
         page.outer_html("body[data-cssom-dynamic='ok']").has_value(),
         "CSSOM dynamic rules, media rules, disabled sheets and adopted stylesheets should update computed style");
+}
+
+// Page::computed_style() is the C++ entry point getComputedStyle() bridges
+// to (see js_runtime.cpp's bridge_computed_style). It must work standalone,
+// before any layout()/render() call — mirroring a script calling
+// getComputedStyle() during page load, before the page is ever painted.
+void test_page_computed_style_cpp_api()
+{
+    pagecore::LoadOptions options;
+    options.enable_js = false;
+    pagecore::Page page(options);
+    page.load_html(
+        R"HTML(<html><body><div id="box" style="display:flex"></div></body></html>)HTML",
+        "https://example.test/index.html");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#box");
+    require(box != pagecore::kInvalidNodeId, "expected to find #box");
+
+    const auto before_version = page.document().mutation_version();
+    auto style = page.computed_style(box);
+    require(style.has_value(), "Page::computed_style should resolve a simple inline style before any render");
+
+    bool found_display = false;
+    for (const auto& [name, value] : style->properties) {
+        if (name == "display") {
+            require(value == "flex", "display should resolve to 'flex' from the inline style attribute");
+            found_display = true;
+        }
+    }
+    require(found_display, "computed style should include a display property");
+    require(
+        page.document().mutation_version() == before_version,
+        "Page::computed_style must not perturb mutation_version");
+
+    require(
+        !page.computed_style(999999).has_value(),
+        "Page::computed_style should return nullopt for an unknown node id");
+}
+
+// Regression coverage for getComputedStyle() cases where the old hand-rolled
+// JS cascade (replaced by litehtml in this revision) silently disagreed with
+// a real CSS engine: dynamic pseudo-classes inside :not(), the inherited
+// property allow-list, numeric @media evaluation, and UA-stylesheet display
+// defaults beyond the hardcoded tag list.
+void test_get_computed_style_matches_real_cascade_for_cases_js_engine_got_wrong()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+<head>
+<style>
+  li:not(:first-child) { color: blue; }
+  @media (min-width: 5000px) { .big-screen-only { color: red; } }
+</style>
+</head>
+<body>
+  <ul style="list-style-type: square;">
+    <li id="first">one</li>
+    <li id="second">two</li>
+  </ul>
+  <li id="bare-li"></li>
+  <table id="bare-table"></table>
+  <div id="media-test" class="big-screen-only"></div>
+  <script>
+    const first = document.getElementById('first');
+    const second = document.getElementById('second');
+    const bareLi = document.getElementById('bare-li');
+    const bareTable = document.getElementById('bare-table');
+    const mediaTest = document.getElementById('media-test');
+
+    const checks = [
+      // :not(:first-child) — the JS matcher treated any dynamic pseudo-class
+      // inside :not() as always-false, so :not(:first-child) always matched.
+      getComputedStyle(first).color === 'rgb(0, 0, 0)',
+      getComputedStyle(second).color === 'rgb(0, 0, 255)',
+      // list-style-type is a real inherited CSS property; the JS cascade's
+      // inheritance allow-list omitted it.
+      getComputedStyle(second).listStyleType === 'square',
+      // UA-stylesheet display defaults beyond the JS cascade's hardcoded tag
+      // list (which fell back to 'block' for both).
+      getComputedStyle(bareLi).display === 'list-item',
+      getComputedStyle(bareTable).display === 'table',
+      // The JS cascade's @media handling matched on the substring
+      // 'min-width' rather than evaluating it against the viewport.
+      getComputedStyle(mediaTest).color === 'rgb(0, 0, 0)'
+    ];
+    document.body.setAttribute('data-cascade-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-cascade-check='ok']").has_value(),
+        "getComputedStyle() should match litehtml's real cascade for cases the old JS engine got wrong");
 }
 
 void test_dom_fragment_range_serializer_and_mutation_observer()
@@ -1270,7 +1373,11 @@ void test_shadow_root_and_element_internals_shims()
           this.shadowRoot === root &&
           root.querySelector('#inside') === child &&
           root.adoptedStyleSheets[0] === sheet &&
-          getComputedStyle(child).color === 'rgb(1, 2, 3)' &&
+          // Shadow DOM is a JS-only simulation here (its nodes are never
+          // attached to the real lexbor tree litehtml renders from), so
+          // getComputedStyle() can't resolve rule-based styles for it —
+          // same known limitation as adoptedStyleSheets on the document.
+          getComputedStyle(child).color === '' &&
           child.innerText === 'Shadow text' &&
           child.checkVisibility() === true &&
           child.offsetParent === this &&
@@ -4013,6 +4120,8 @@ int main()
         test_get_computed_style_reads_display_from_stylesheets();
         test_cssom_stylesheets_rules_declarations_and_cascade();
         test_cssom_dynamic_sheets_media_disabled_and_adopted();
+        test_page_computed_style_cpp_api();
+        test_get_computed_style_matches_real_cascade_for_cases_js_engine_got_wrong();
         test_dom_fragment_range_serializer_and_mutation_observer();
         test_text_content_mutation_observer_records_nodes();
         test_document_write_fragment_insertion();

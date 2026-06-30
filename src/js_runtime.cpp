@@ -507,6 +507,22 @@ JSValue bridge_forget_version(JSContext* ctx, JSValue, int, JSValue*)
     });
 }
 
+JSValue bridge_computed_style(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("computedStyle requires a node id");
+        auto style = js.computed_style(to_node_id(ctx, argv[0]));
+
+        JSValue result = JS_NewObject(ctx);
+        if (style) {
+            for (const auto& [name, value] : style->properties) {
+                JS_SetPropertyStr(ctx, result, name.c_str(), js_string(ctx, value));
+            }
+        }
+        return result;
+    });
+}
+
 JSValue bridge_get_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -864,6 +880,7 @@ void JsRuntime::install()
     set_function(context_, dom, "isConnected", bridge_is_connected, 1);
     set_function(context_, dom, "mutationVersion", bridge_mutation_version, 0);
     set_function(context_, dom, "forgetVersion", bridge_forget_version, 0);
+    set_function(context_, dom, "computedStyle", bridge_computed_style, 1);
     set_function(context_, dom, "getAttribute", bridge_get_attribute, 2);
     set_function(context_, dom, "hasAttribute", bridge_has_attribute, 2);
     set_function(context_, dom, "attributes", bridge_attributes, 1);
@@ -1014,6 +1031,19 @@ void JsRuntime::run_until_idle()
 DomDocument& JsRuntime::document()
 {
     return *document_;
+}
+
+void JsRuntime::set_computed_style_resolver(ComputedStyleResolver resolver)
+{
+    computed_style_resolver_ = std::move(resolver);
+}
+
+std::optional<ComputedStyle> JsRuntime::computed_style(NodeId node)
+{
+    if (!computed_style_resolver_) {
+        return std::nullopt;
+    }
+    return computed_style_resolver_(node);
 }
 
 ResourceResponse JsRuntime::load_resource(std::string_view url, std::string_view kind)
