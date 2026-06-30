@@ -7,7 +7,9 @@
 #include <lexbor/selectors/selectors.h>
 
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace pagecore {
 
@@ -17,6 +19,13 @@ struct DomDocument::Impl {
     mutable std::unordered_map<NodeId, lxb_dom_node_t*> id_to_node;
     mutable NodeId next_id = 1;
     std::uint64_t mutation_version = 1;
+
+    // Reused across queries so each querySelector(All) avoids recreating the
+    // CSS parser and selector engine. The selector engine is created lazily and
+    // auto-cleans after every find; compiled selector lists are cached by their
+    // source text (each owns its own memory pool and is freed in the dtor).
+    lxb_selectors_t* selectors = nullptr;
+    std::unordered_map<std::string, lxb_css_selector_list_t*> selector_cache;
 
     Impl();
     ~Impl();
@@ -28,6 +37,9 @@ struct DomDocument::Impl {
     void forget_node(lxb_dom_node_t* node);
     void forget_subtree(lxb_dom_node_t* node);
     void mark_mutated();
+
+    lxb_css_selector_list_t* compiled_selector(std::string_view selector);
+    std::vector<NodeId> run_selector(lxb_dom_node_t* root, std::string_view selector, bool first_only);
 };
 
 } // namespace pagecore

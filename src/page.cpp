@@ -7,6 +7,7 @@
 #include <memory>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -155,6 +156,22 @@ std::string remove_head_direct_text_nodes(std::string html)
     return out;
 }
 
+// Identifies the inputs that fully determine a rendered DisplayList. If these
+// match a previous render, the cached list is reused instead of re-running the
+// serialize/parse/layout pipeline. The resource loader's own byte cache is
+// intentionally not part of the key: a render is memoized against DOM state,
+// viewport, and base URL, not against external resource contents.
+struct DisplayListCacheKey {
+    std::uint64_t mutation_version = 0;
+    int viewport_width = 0;
+    int viewport_height = 0;
+    float device_scale_factor = 0.0f;
+    bool load_external_resources = false;
+    std::string base_url;
+
+    bool operator==(const DisplayListCacheKey&) const = default;
+};
+
 } // namespace
 
 struct Page::Impl {
@@ -165,6 +182,10 @@ struct Page::Impl {
     std::unique_ptr<JsRuntime> js;
     std::string current_url;
 
+    bool display_list_valid = false;
+    DisplayListCacheKey display_list_key;
+    DisplayList display_list_cache;
+
     explicit Impl(LoadOptions init_options)
         : options(std::move(init_options))
         , loader(std::make_shared<CurlResourceLoader>(options.user_agent))
@@ -172,6 +193,12 @@ struct Page::Impl {
 #if defined(PAGECORE_ENABLE_RENDERING)
         layout_factory = create_litehtml_layout_engine_factory();
 #endif
+    }
+
+    void invalidate_display_list_cache()
+    {
+        display_list_valid = false;
+        display_list_cache.clear();
     }
 
     void ensure_js()
@@ -299,6 +326,46 @@ struct Page::Impl {
 
         return render_document.serialize_html();
     }
+
+    std::unique_ptr<LayoutEngine> build_layout(const RenderOptions& render_options)
+    {
+        if (!layout_factory) {
+            throw std::runtime_error("no layout engine factory configured; build with PAGECORE_ENABLE_RENDERING or set one explicitly");
+        }
+
+        auto layout = layout_factory->create_layout_engine();
+        if (!layout) {
+            throw std::runtime_error("layout engine factory returned null");
+        }
+
+        layout->set_viewport(render_options.viewport);
+        layout->set_resource_loader(render_options.load_external_resources ? loader : nullptr);
+        layout->load_html(serialized_html_for_render(), render_base_url(render_options));
+        layout->layout();
+        return layout;
+    }
+
+    const DisplayList& cached_display_list(const RenderOptions& render_options)
+    {
+        DisplayListCacheKey key{
+            document.mutation_version(),
+            render_options.viewport.width,
+            render_options.viewport.height,
+            render_options.viewport.device_scale_factor,
+            render_options.load_external_resources,
+            render_base_url(render_options),
+        };
+
+        if (display_list_valid && display_list_key == key) {
+            return display_list_cache;
+        }
+
+        auto layout = build_layout(render_options);
+        display_list_cache = layout->display_list();
+        display_list_key = std::move(key);
+        display_list_valid = true;
+        return display_list_cache;
+    }
 };
 
 Page::Page(LoadOptions options)
@@ -314,6 +381,7 @@ void Page::set_resource_loader(std::shared_ptr<ResourceLoader> loader)
         throw std::runtime_error("resource loader must not be null");
     }
     impl_->loader = std::move(loader);
+    impl_->invalidate_display_list_cache();
 }
 
 void Page::set_layout_engine_factory(std::shared_ptr<LayoutEngineFactory> factory)
@@ -322,11 +390,13 @@ void Page::set_layout_engine_factory(std::shared_ptr<LayoutEngineFactory> factor
         throw std::runtime_error("layout engine factory must not be null");
     }
     impl_->layout_factory = std::move(factory);
+    impl_->invalidate_display_list_cache();
 }
 
 void Page::load_html(std::string_view html, std::string base_url)
 {
     impl_->js.reset();
+    impl_->invalidate_display_list_cache();
     impl_->current_url = std::move(base_url);
     impl_->options.base_url = impl_->current_url;
     impl_->document.parse(html);
@@ -372,26 +442,12 @@ std::string Page::serialize_html() const
 
 std::unique_ptr<LayoutEngine> Page::layout(RenderOptions render_options) const
 {
-    if (!impl_->layout_factory) {
-        throw std::runtime_error("no layout engine factory configured; build with PAGECORE_ENABLE_RENDERING or set one explicitly");
-    }
-
-    auto layout = impl_->layout_factory->create_layout_engine();
-    if (!layout) {
-        throw std::runtime_error("layout engine factory returned null");
-    }
-
-    layout->set_viewport(render_options.viewport);
-    layout->set_resource_loader(render_options.load_external_resources ? impl_->loader : nullptr);
-    layout->load_html(impl_->serialized_html_for_render(), impl_->render_base_url(render_options));
-    layout->layout();
-    return layout;
+    return impl_->build_layout(render_options);
 }
 
 DisplayList Page::display_list(RenderOptions render_options) const
 {
-    auto rendered_layout = layout(std::move(render_options));
-    return rendered_layout->display_list();
+    return impl_->cached_display_list(render_options);
 }
 
 RenderedImage Page::render(RenderOptions render_options) const

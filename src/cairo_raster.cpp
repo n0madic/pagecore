@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -334,7 +335,61 @@ PangoWeight pango_weight(int weight)
     return static_cast<PangoWeight>(std::clamp(weight, 100, 1000));
 }
 
-void draw_text(cairo_t* cr, const TextCommand& command, float scale)
+int scaled_font_pango_size(const Font& font, float scale)
+{
+    return static_cast<int>(
+        std::round(std::max(1.0, static_cast<double>(font.size_px) * scale) * PANGO_SCALE));
+}
+
+// Per-render-pass text resources. One Pango layout is created lazily and reused
+// for every text run, and font descriptions are cached by their resolved
+// properties, so a page with many text runs no longer pays a layout/description
+// allocation per draw. The destructor releases everything (exception-safe).
+struct TextRenderState {
+    PangoLayout* layout = nullptr;
+    std::unordered_map<std::string, PangoFontDescription*> descriptions;
+
+    TextRenderState() = default;
+    TextRenderState(const TextRenderState&) = delete;
+    TextRenderState& operator=(const TextRenderState&) = delete;
+
+    ~TextRenderState()
+    {
+        for (auto& [key, description] : descriptions) {
+            pango_font_description_free(description);
+        }
+        if (layout != nullptr) {
+            g_object_unref(layout);
+        }
+    }
+
+    PangoFontDescription* description_for(const Font& font, float scale)
+    {
+        const int size = scaled_font_pango_size(font, scale);
+        const int weight = std::clamp(font.weight, 100, 1000);
+        std::string key = font_family(font);
+        key += '\x1f';
+        key += std::to_string(size);
+        key += '\x1f';
+        key += std::to_string(weight);
+        key += font.italic ? "\x1fi" : "\x1fn";
+
+        auto cached = descriptions.find(key);
+        if (cached != descriptions.end()) {
+            return cached->second;
+        }
+
+        PangoFontDescription* description = pango_font_description_new();
+        pango_font_description_set_family(description, font_family(font).c_str());
+        pango_font_description_set_absolute_size(description, size);
+        pango_font_description_set_weight(description, static_cast<PangoWeight>(weight));
+        pango_font_description_set_style(description, font.italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
+        descriptions.emplace(std::move(key), description);
+        return description;
+    }
+};
+
+void draw_text(cairo_t* cr, const TextCommand& command, float scale, TextRenderState& text)
 {
     if (command.text.empty() || command.color.a == 0) {
         return;
@@ -345,21 +400,17 @@ void draw_text(cairo_t* cr, const TextCommand& command, float scale)
         return;
     }
 
-    PangoLayout* layout = pango_cairo_create_layout(cr);
-    if (layout == nullptr) {
-        throw std::runtime_error("failed to create Pango layout");
+    if (text.layout == nullptr) {
+        text.layout = pango_cairo_create_layout(cr);
+        if (text.layout == nullptr) {
+            throw std::runtime_error("failed to create Pango layout");
+        }
     }
+    PangoLayout* layout = text.layout;
 
-    PangoFontDescription* description = pango_font_description_new();
-    pango_font_description_set_family(description, font_family(command.font).c_str());
-    pango_font_description_set_absolute_size(
-        description,
-        static_cast<int>(std::round(std::max(1.0, static_cast<double>(command.font.size_px) * scale) * PANGO_SCALE)));
-    pango_font_description_set_weight(description, pango_weight(command.font.weight));
-    pango_font_description_set_style(description, command.font.italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
-    pango_layout_set_font_description(layout, description);
-    pango_font_description_free(description);
-
+    // pango_layout_set_font_description copies the description, so the cached
+    // instance stays owned by TextRenderState.
+    pango_layout_set_font_description(layout, text.description_for(command.font, scale));
     pango_layout_set_text(layout, command.text.c_str(), static_cast<int>(command.text.size()));
     pango_layout_set_width(layout, rect.width * PANGO_SCALE);
     pango_layout_set_height(layout, rect.height * PANGO_SCALE);
@@ -367,7 +418,6 @@ void draw_text(cairo_t* cr, const TextCommand& command, float scale)
     set_source(cr, command.color);
     cairo_move_to(cr, rect.x, rect.y);
     pango_cairo_show_layout(cr, layout);
-    g_object_unref(layout);
 }
 
 std::uint8_t unpremultiply(std::uint8_t value, std::uint8_t alpha)
@@ -614,32 +664,32 @@ void draw_linear_gradient(cairo_t* cr, const LinearGradientCommand& command, flo
 
 void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color background, float scale);
 
-void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&)
+void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&, TextRenderState&)
 {
     fill_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, command.color, scale);
 }
 
-void draw_command(cairo_t* cr, const BorderCommand& command, float scale, int&)
+void draw_command(cairo_t* cr, const BorderCommand& command, float scale, int&, TextRenderState&)
 {
     draw_border(cr, command, scale);
 }
 
-void draw_command(cairo_t* cr, const TextCommand& command, float scale, int&)
+void draw_command(cairo_t* cr, const TextCommand& command, float scale, int&, TextRenderState& text)
 {
-    draw_text(cr, command, scale);
+    draw_text(cr, command, scale, text);
 }
 
-void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&)
+void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&, TextRenderState&)
 {
     draw_decoded_image(cr, command, scale);
 }
 
-void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&)
+void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&, TextRenderState&)
 {
     draw_linear_gradient(cr, command, scale);
 }
 
-void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth)
+void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth, TextRenderState&)
 {
     if (command.push) {
         cairo_save(cr);
@@ -657,11 +707,12 @@ void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color backg
     set_source(cr, background);
     cairo_paint(cr);
 
+    TextRenderState text;
     int clip_depth = 0;
     for (const auto& command : display_list.commands) {
         std::visit(
             [&](const auto& typed) {
-                draw_command(cr, typed, scale, clip_depth);
+                draw_command(cr, typed, scale, clip_depth, text);
             },
             command);
         check_status(cairo_status(cr), "draw display command");

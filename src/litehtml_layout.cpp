@@ -24,6 +24,9 @@ namespace {
 struct FontHandle {
     Font font;
     PangoFontDescription* description = nullptr;
+    // Pango text shaping is deterministic for a given (font, string), so widths
+    // are memoized per font. The cache lives and dies with the font handle.
+    std::unordered_map<std::string, int> width_cache;
 };
 
 float px(litehtml::pixel_t value)
@@ -175,10 +178,22 @@ public:
             || cairo_status(measure_cr_) != CAIRO_STATUS_SUCCESS) {
             throw std::runtime_error("failed to create Cairo/Pango measurement context");
         }
+
+        // Reused across text_width()/create_font() so measurement does not
+        // allocate a fresh PangoLayout per call (the hot path during layout).
+        measure_layout_ = pango_cairo_create_layout(measure_cr_);
+        if (measure_layout_ == nullptr) {
+            cairo_destroy(measure_cr_);
+            cairo_surface_destroy(measure_surface_);
+            throw std::runtime_error("failed to create Pango measurement layout");
+        }
     }
 
     ~LiteHtmlDisplayListContainer() override
     {
+        if (measure_layout_ != nullptr) {
+            g_object_unref(measure_layout_);
+        }
         cairo_destroy(measure_cr_);
         cairo_surface_destroy(measure_surface_);
     }
@@ -312,22 +327,31 @@ public:
 
     litehtml::pixel_t text_width(const char* text, litehtml::uint_ptr hFont) override
     {
-        const auto* handle = reinterpret_cast<const FontHandle*>(hFont);
+        auto* handle = reinterpret_cast<FontHandle*>(hFont);
         if (text == nullptr || *text == '\0') {
             return 0;
         }
 
-        PangoLayout* layout = pango_cairo_create_layout(measure_cr_);
-        if (handle != nullptr && handle->description != nullptr) {
-            pango_layout_set_font_description(layout, handle->description);
+        if (handle != nullptr) {
+            auto cached = handle->width_cache.find(text);
+            if (cached != handle->width_cache.end()) {
+                return cached->second;
+            }
         }
-        pango_layout_set_text(layout, text, -1);
-        pango_cairo_update_layout(measure_cr_, layout);
+
+        // Always set the description (handle's or NULL=default) so the reused
+        // layout never inherits a font from a previous measurement.
+        pango_layout_set_font_description(measure_layout_, handle != nullptr ? handle->description : nullptr);
+        pango_layout_set_text(measure_layout_, text, -1);
+        pango_cairo_update_layout(measure_cr_, measure_layout_);
 
         int width = 0;
         int height = 0;
-        pango_layout_get_pixel_size(layout, &width, &height);
-        g_object_unref(layout);
+        pango_layout_get_pixel_size(measure_layout_, &width, &height);
+
+        if (handle != nullptr) {
+            handle->width_cache.emplace(text, width);
+        }
         return width;
     }
 
@@ -634,6 +658,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<const DecodedImage>> decoded_images_;
     cairo_surface_t* measure_surface_ = nullptr;
     cairo_t* measure_cr_ = nullptr;
+    PangoLayout* measure_layout_ = nullptr;
 };
 
 class LiteHtmlLayoutEngine final : public LayoutEngine {

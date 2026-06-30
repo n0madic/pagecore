@@ -107,6 +107,7 @@ void collect_subtree(lxb_dom_node_t* node, std::vector<lxb_dom_node_t*>& out)
 struct SelectorResults {
     const DomDocument::Impl* impl;
     std::vector<NodeId> ids;
+    bool first_only = false;
 };
 
 lxb_status_t selector_callback(lxb_dom_node_t* node, lxb_css_selector_specificity_t, void* ctx)
@@ -116,6 +117,11 @@ lxb_status_t selector_callback(lxb_dom_node_t* node, lxb_css_selector_specificit
     try {
         auto* results = static_cast<SelectorResults*>(ctx);
         results->ids.push_back(results->impl->id_for(node));
+        if (results->first_only) {
+            // Stops the tree walk after the first match; Lexbor treats STOP as a
+            // clean early exit and lxb_selectors_find still returns LXB_STATUS_OK.
+            return LXB_STATUS_STOP;
+        }
     } catch (...) {
         return LXB_STATUS_ERROR;
     }
@@ -135,10 +141,88 @@ DomDocument::Impl::Impl()
 
 DomDocument::Impl::~Impl()
 {
+    for (auto& [text, list] : selector_cache) {
+        if (list != nullptr) {
+            lxb_css_selector_list_destroy_memory(list);
+        }
+    }
+    selector_cache.clear();
+
+    if (selectors != nullptr) {
+        lxb_selectors_destroy(selectors, true);
+        selectors = nullptr;
+    }
+
     if (document != nullptr) {
         lxb_html_document_destroy(document);
         document = nullptr;
     }
+}
+
+lxb_css_selector_list_t* DomDocument::Impl::compiled_selector(std::string_view selector)
+{
+    std::string key(selector);
+    auto cached = selector_cache.find(key);
+    if (cached != selector_cache.end()) {
+        return cached->second;
+    }
+
+    auto* parser = lxb_css_parser_create();
+    if (parser == nullptr) {
+        throw std::runtime_error("failed to create CSS parser");
+    }
+    if (lxb_css_parser_init(parser, nullptr) != LXB_STATUS_OK) {
+        lxb_css_parser_destroy(parser, true);
+        throw std::runtime_error("failed to initialize CSS parser");
+    }
+
+    auto* list = lxb_css_selectors_parse(
+        parser,
+        reinterpret_cast<const lxb_char_t*>(selector.data()),
+        selector.size());
+    const bool ok = list != nullptr && parser->status == LXB_STATUS_OK;
+
+    // Destroying the parser leaves the compiled list and its own memory pool
+    // intact (lxb_css_parser_destroy does not own list->memory), so the cached
+    // list stays valid until the document is destroyed.
+    lxb_css_parser_destroy(parser, true);
+
+    if (!ok) {
+        if (list != nullptr) {
+            lxb_css_selector_list_destroy_memory(list);
+        }
+        throw std::runtime_error("invalid CSS selector");
+    }
+
+    selector_cache.emplace(std::move(key), list);
+    return list;
+}
+
+std::vector<NodeId> DomDocument::Impl::run_selector(lxb_dom_node_t* root, std::string_view selector, bool first_only)
+{
+    if (selectors == nullptr) {
+        selectors = lxb_selectors_create();
+        if (selectors == nullptr || lxb_selectors_init(selectors) != LXB_STATUS_OK) {
+            if (selectors != nullptr) {
+                lxb_selectors_destroy(selectors, true);
+                selectors = nullptr;
+            }
+            throw std::runtime_error("failed to initialize CSS selector engine");
+        }
+    }
+
+    auto* list = compiled_selector(selector);
+
+    SelectorResults results{this, {}, first_only};
+    lxb_selectors_opt_set(selectors, static_cast<lxb_selectors_opt_t>(
+        LXB_SELECTORS_OPT_MATCH_ROOT | LXB_SELECTORS_OPT_MATCH_FIRST));
+
+    const lxb_status_t status = lxb_selectors_find(selectors, root, list, selector_callback, &results);
+    if (status != LXB_STATUS_OK) {
+        throw std::runtime_error("CSS selector lookup failed");
+    }
+
+    return std::move(results.ids);
 }
 
 lxb_dom_node_t* DomDocument::Impl::require_node(NodeId id) const
@@ -679,62 +763,12 @@ NodeId DomDocument::clone_node(NodeId id, bool deep)
 
 std::vector<NodeId> DomDocument::query_selector_all(NodeId root, std::string_view selector)
 {
-    auto* parser = lxb_css_parser_create();
-    if (parser == nullptr) {
-        throw std::runtime_error("failed to create CSS parser");
-    }
-
-    auto* selectors = lxb_selectors_create();
-    if (selectors == nullptr) {
-        lxb_css_parser_destroy(parser, true);
-        throw std::runtime_error("failed to create CSS selector engine");
-    }
-
-    lxb_status_t status = lxb_css_parser_init(parser, nullptr);
-    if (status != LXB_STATUS_OK) {
-        lxb_selectors_destroy(selectors, true);
-        lxb_css_parser_destroy(parser, true);
-        throw std::runtime_error("failed to initialize CSS parser");
-    }
-
-    status = lxb_selectors_init(selectors);
-    if (status != LXB_STATUS_OK) {
-        lxb_selectors_destroy(selectors, true);
-        lxb_css_parser_destroy(parser, true);
-        throw std::runtime_error("failed to initialize CSS selector engine");
-    }
-
-    auto* list = lxb_css_selectors_parse(
-        parser,
-        reinterpret_cast<const lxb_char_t*>(selector.data()),
-        selector.size());
-
-    if (list == nullptr || parser->status != LXB_STATUS_OK) {
-        lxb_selectors_destroy(selectors, true);
-        lxb_css_parser_destroy(parser, true);
-        throw std::runtime_error("invalid CSS selector");
-    }
-
-    SelectorResults results{impl_, {}};
-    lxb_selectors_opt_set(selectors, static_cast<lxb_selectors_opt_t>(
-        LXB_SELECTORS_OPT_MATCH_ROOT | LXB_SELECTORS_OPT_MATCH_FIRST));
-
-    status = lxb_selectors_find(selectors, impl_->require_node(root), list, selector_callback, &results);
-
-    lxb_css_selector_list_destroy_memory(list);
-    lxb_selectors_destroy(selectors, true);
-    lxb_css_parser_destroy(parser, true);
-
-    if (status != LXB_STATUS_OK) {
-        throw std::runtime_error("CSS selector lookup failed");
-    }
-
-    return results.ids;
+    return impl_->run_selector(impl_->require_node(root), selector, /*first_only=*/false);
 }
 
 NodeId DomDocument::query_selector(NodeId root, std::string_view selector)
 {
-    auto ids = query_selector_all(root, selector);
+    auto ids = impl_->run_selector(impl_->require_node(root), selector, /*first_only=*/true);
     if (ids.empty()) {
         return kInvalidNodeId;
     }

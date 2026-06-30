@@ -2664,6 +2664,39 @@ void test_deep_dom_traversal_is_iterative()
             "set_inner_html over a deep subtree must not overflow the native stack");
 }
 
+void test_query_selector_cache_returns_all_and_first()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<html><body>"
+        "<section><p class='x'>1</p><p class='x'>2</p></section>"
+        "<p class='x'>3</p>"
+        "<span class='y'>4</span>"
+        "</body></html>");
+    const pagecore::NodeId root = doc.document_node();
+
+    const auto all = doc.query_selector_all(root, ".x");
+    require(all.size() == 3, "querySelectorAll should return every match");
+
+    // Re-run identical and varying selectors to exercise the compiled-selector
+    // cache (a stale/shared memory pool would corrupt subsequent results).
+    const auto all_again = doc.query_selector_all(root, ".x");
+    require(all_again == all, "cached querySelectorAll must return the same matches");
+    require(doc.query_selector_all(root, ".y").size() == 1,
+            "a second distinct selector must not be corrupted by the cache");
+    require(doc.query_selector_all(root, ".x").size() == 3,
+            "the first selector must still match after caching a second one");
+
+    // Early-stop query_selector must yield the first match in document order.
+    const pagecore::NodeId first = doc.query_selector(root, ".x");
+    require(first == all.front(), "querySelector should return the first match in tree order");
+
+    require(doc.query_selector(root, ".missing") == pagecore::kInvalidNodeId,
+            "querySelector returns invalid when nothing matches");
+    require(doc.query_selector_all(root, ".missing").empty(),
+            "querySelectorAll returns empty when nothing matches");
+}
+
 void test_eval_api()
 {
     pagecore::Page page;
@@ -2880,6 +2913,60 @@ void test_js_exception_message_includes_source_name()
 }
 
 #if defined(PAGECORE_ENABLE_RENDERING)
+class CountingLayoutEngineFactory final : public pagecore::LayoutEngineFactory {
+public:
+    explicit CountingLayoutEngineFactory(std::shared_ptr<pagecore::LayoutEngineFactory> inner)
+        : inner_(std::move(inner))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        ++count;
+        return inner_->create_layout_engine();
+    }
+
+    int count = 0;
+
+private:
+    std::shared_ptr<pagecore::LayoutEngineFactory> inner_;
+};
+
+void test_page_display_list_is_memoized()
+{
+    auto counting = std::make_shared<CountingLayoutEngineFactory>(
+        pagecore::create_litehtml_layout_engine_factory());
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(counting);
+    page.load_html(
+        "<html><body><div id='x' style='width:50px;height:20px'>hi</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    const auto first = page.display_list(options);
+    const auto second = page.display_list(options);
+    require(counting->count == 1, "repeated display_list with identical options must reuse the cache");
+    require(first.content_height == second.content_height, "cached display list must be identical");
+
+    // render() goes through the same cached display_list().
+    (void) page.render(options);
+    require(counting->count == 1, "render() with the same options must reuse the cached display list");
+
+    // A different viewport is a distinct cache key and must rebuild.
+    pagecore::RenderOptions other = options;
+    other.viewport = pagecore::Viewport{640, 480, 1.0f};
+    (void) page.display_list(other);
+    require(counting->count == 2, "changing the viewport must rebuild the layout");
+
+    // Mutating the DOM bumps the document mutation version and invalidates the cache.
+    page.eval("document.getElementById('x').textContent = 'changed and considerably longer text'");
+    (void) page.display_list(options);
+    require(counting->count == 3, "a DOM mutation must rebuild the layout");
+}
+
 void test_page_display_list_pipeline_with_external_css()
 {
     auto loader = std::make_shared<RecordingResourceLoader>();
@@ -3619,6 +3706,7 @@ int main()
         test_cairo_raster_and_io_error_paths();
 #endif
         test_deep_dom_traversal_is_iterative();
+        test_query_selector_cache_returns_all_and_first();
         test_eval_api();
         test_event_capture_bubble_phases();
         test_mutation_observer_old_value();
@@ -3627,6 +3715,7 @@ int main()
         test_streams_writable_controller_and_tee();
         test_js_exception_message_includes_source_name();
 #if defined(PAGECORE_ENABLE_RENDERING)
+        test_page_display_list_is_memoized();
         test_page_display_list_pipeline_with_external_css();
         test_page_display_list_hides_head_text_nodes();
         test_page_display_list_resolves_litehtml_relative_base_urls();
