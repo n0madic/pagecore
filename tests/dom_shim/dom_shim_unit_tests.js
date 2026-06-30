@@ -19,6 +19,7 @@ const compatDefinition = require(modulePath('60_compat.js'));
 function makeBridge() {
   return {
     mutationVersion: () => 1,
+    forgetVersion: () => 1,
     hasNode: () => true
   };
 }
@@ -180,6 +181,10 @@ function makeDomBridge() {
 
   return {
     mutationVersion: () => version,
+    // This mock detaches nodes but never deletes them from `nodes`, so hasNode
+    // stays true and nothing is ever forgotten; a constant forget version is the
+    // faithful behaviour and keeps syncMutationCache's prune a no-op here.
+    forgetVersion: () => 1,
     hasNode: (id) => nodes.has(id),
     documentNode: () => documentId,
     documentElement: () => htmlId,

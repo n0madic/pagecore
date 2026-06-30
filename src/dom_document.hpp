@@ -19,6 +19,11 @@ struct DomDocument::Impl {
     mutable std::unordered_map<NodeId, lxb_dom_node_t*> id_to_node;
     mutable NodeId next_id = 1;
     std::uint64_t mutation_version = 1;
+    // Bumped only when a tracked node id is invalidated (forgotten) or the
+    // document is reparsed — i.e. exactly when a JS wrapper may become stale.
+    // Lets the wrapper layer skip its O(N) prune scan on ordinary mutations
+    // (append/remove/setAttribute) that never invalidate an id.
+    std::uint64_t forget_version = 1;
 
     // Reused across queries so each querySelector(All) avoids recreating the
     // CSS parser and selector engine. The selector engine is created lazily and

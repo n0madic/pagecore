@@ -19,7 +19,7 @@
       if (!ctx.host) throw new Error('PageCore host bridge is not installed');
 
       ctx.wrapperCache = new Map();
-      ctx.observedMutationVersion = ctx.bridge.mutationVersion();
+      ctx.observedForgetVersion = ctx.bridge.forgetVersion();
       ctx.suppressMutationRecords = 0;
       ctx.customElementsRegistry = null;
       ctx.pendingCustomElementNodeId = null;
@@ -102,14 +102,18 @@
       }
 
       function syncMutationCache() {
-        const current = ctx.bridge.mutationVersion();
-        if (current === ctx.observedMutationVersion) return;
+        // Only a "forget" (innerHTML replacement or document reparse) can turn a
+        // cached id stale; ordinary append/remove/setAttribute mutations leave
+        // every tracked id valid. Gating on the forget version keeps DOM-building
+        // and removal loops O(1) per step instead of rescanning every wrapper.
+        const current = ctx.bridge.forgetVersion();
+        if (current === ctx.observedForgetVersion) return;
 
         for (const [id] of ctx.wrapperCache) {
           if (!ctx.bridge.hasNode(id)) ctx.wrapperCache.delete(id);
         }
 
-        ctx.observedMutationVersion = current;
+        ctx.observedForgetVersion = current;
       }
 
       function afterMutation(value, record = null) {

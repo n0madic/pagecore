@@ -52,6 +52,10 @@ public:
     bool contains(NodeId root, NodeId candidate) const;
     bool is_connected(NodeId id) const;
     std::uint64_t mutation_version() const;
+    // Monotonic counter bumped only when a node id is invalidated (forgotten via
+    // innerHTML replacement) or the document is reparsed. Wrapper layers use it
+    // to know when a cached id may have become stale.
+    std::uint64_t forget_version() const;
 
     std::optional<std::string> get_attribute(NodeId id, std::string_view name) const;
     bool has_attribute(NodeId id, std::string_view name) const;

@@ -271,6 +271,8 @@ void DomDocument::Impl::forget_node(lxb_dom_node_t* node)
     if (it != node_to_id.end()) {
         id_to_node.erase(it->second);
         node_to_id.erase(it);
+        // A previously tracked id just became invalid; signal the wrapper layer.
+        ++forget_version;
     }
 }
 
@@ -323,20 +325,24 @@ DomDocument& DomDocument::operator=(DomDocument&& other) noexcept
 
 void DomDocument::parse(std::string_view html)
 {
-    // Carry the id counter and mutation version forward across reparse so node
-    // ids from a previous document are never reused and the monotonic mutation
-    // version keeps invalidating any stale wrappers held elsewhere.
+    // Carry the id counter and version counters forward across reparse so node
+    // ids from a previous document are never reused, the monotonic mutation
+    // version keeps invalidating any stale wrappers held elsewhere, and the
+    // forget version bumps so the wrapper layer prunes ids from the old document.
     NodeId carried_next_id = 1;
     std::uint64_t carried_mutation_version = 1;
+    std::uint64_t carried_forget_version = 1;
     if (impl_ != nullptr) {
         carried_next_id = impl_->next_id;
         carried_mutation_version = impl_->mutation_version;
+        carried_forget_version = impl_->forget_version;
     }
 
     delete impl_;
     impl_ = new Impl();
     impl_->next_id = carried_next_id;
     impl_->mutation_version = carried_mutation_version + 1;
+    impl_->forget_version = carried_forget_version + 1;
 
     const auto status = lxb_html_document_parse(
         impl_->document,
@@ -504,6 +510,11 @@ bool DomDocument::is_connected(NodeId id) const
 std::uint64_t DomDocument::mutation_version() const
 {
     return impl_ == nullptr ? 0 : impl_->mutation_version;
+}
+
+std::uint64_t DomDocument::forget_version() const
+{
+    return impl_ == nullptr ? 0 : impl_->forget_version;
 }
 
 std::optional<std::string> DomDocument::get_attribute(NodeId id, std::string_view name) const

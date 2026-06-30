@@ -557,6 +557,41 @@ void test_inner_html_invalidates_stale_wrappers()
             "innerHTML should invalidate stale JS wrappers for destroyed Lexbor nodes");
 }
 
+void test_wrapper_cache_prunes_only_on_forget()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body><div id="host"><span id="a">A</span><span id="b">B</span></div>
+<script>
+  const host = document.getElementById('host');
+  const a = document.getElementById('a');
+
+  // removeChild detaches but does NOT forget the node: its wrapper stays usable
+  // and must not be pruned (this is the common path kept O(1) by forget-gating).
+  host.removeChild(a);
+  window.__removedUsable = (a.textContent === 'A' && a.isConnected === false);
+
+  // innerHTML replacement forgets host's current subtree (the still-attached b),
+  // so b's wrapper must become invalid.
+  const b = document.getElementById('b');
+  host.innerHTML = '<span id="c">C</span>';
+  let bInvalid = false;
+  try { b.textContent = 'x'; } catch (error) { bInvalid = true; }
+  window.__forgottenInvalid = bInvalid;
+
+  // The fresh subtree is wrapped correctly after the forget-triggered prune.
+  window.__freshOk = (host.firstElementChild.textContent === 'C');
+</script></body></html>
+)HTML");
+
+    require(page.eval("window.__removedUsable") == "true",
+            "a detached-but-not-forgotten node keeps a usable wrapper");
+    require(page.eval("window.__forgottenInvalid") == "true",
+            "innerHTML replacement invalidates wrappers for forgotten nodes");
+    require(page.eval("window.__freshOk") == "true",
+            "the replacement subtree is wrapped correctly after the prune");
+}
+
 void test_timer_wait_budget()
 {
     pagecore::LoadOptions options;
@@ -3747,6 +3782,7 @@ int main()
         test_tree_operations_and_clone();
         test_dataset_attributes_and_cached_facades();
         test_inner_html_invalidates_stale_wrappers();
+        test_wrapper_cache_prunes_only_on_forget();
         test_timer_wait_budget();
         test_browser_like_web_api_shims();
         test_event_constructor_ignores_prototype_accessors();

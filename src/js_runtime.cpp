@@ -500,6 +500,13 @@ JSValue bridge_mutation_version(JSContext* ctx, JSValue, int, JSValue*)
     });
 }
 
+JSValue bridge_forget_version(JSContext* ctx, JSValue, int, JSValue*)
+{
+    return bridge_call(ctx, [ctx](JsRuntime& js) {
+        return JS_NewFloat64(ctx, static_cast<double>(js.document().forget_version()));
+    });
+}
+
 JSValue bridge_get_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -856,6 +863,7 @@ void JsRuntime::install()
     set_function(context_, dom, "contains", bridge_contains, 2);
     set_function(context_, dom, "isConnected", bridge_is_connected, 1);
     set_function(context_, dom, "mutationVersion", bridge_mutation_version, 0);
+    set_function(context_, dom, "forgetVersion", bridge_forget_version, 0);
     set_function(context_, dom, "getAttribute", bridge_get_attribute, 2);
     set_function(context_, dom, "hasAttribute", bridge_has_attribute, 2);
     set_function(context_, dom, "attributes", bridge_attributes, 1);
