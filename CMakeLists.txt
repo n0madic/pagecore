@@ -272,7 +272,7 @@ FetchContent_Declare(
 pagecore_fetchcontent_make_available_excluded(lexbor)
 pagecore_fetchcontent_make_available_excluded(quickjs_ng)
 
-find_package(CURL REQUIRED)
+find_package(CURL REQUIRED COMPONENTS libz)
 
 find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
 

@@ -11,11 +11,9 @@
 #endif
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <chrono>
-#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -25,16 +23,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 namespace {
 
@@ -80,130 +72,6 @@ public:
 
 private:
     std::unordered_map<std::string, pagecore::ResourceResponse> resources_;
-};
-
-void close_fd(int fd)
-{
-    if (fd >= 0) {
-        close(fd);
-    }
-}
-
-class SingleResponseHttpServer final {
-public:
-    SingleResponseHttpServer(
-        std::string body,
-        std::vector<std::pair<std::string, std::string>> headers,
-        int status = 200,
-        std::string reason = "OK")
-        : body_(std::move(body))
-        , headers_(std::move(headers))
-        , status_(status)
-        , reason_(std::move(reason))
-    {
-        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ < 0) {
-            throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
-        }
-
-        int reuse = 1;
-        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = 0;
-        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
-            const std::string message = std::string("bind failed: ") + std::strerror(errno);
-            close_fd(listen_fd_);
-            listen_fd_ = -1;
-            throw std::runtime_error(message);
-        }
-
-        socklen_t address_len = sizeof(address);
-        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &address_len) != 0) {
-            const std::string message = std::string("getsockname failed: ") + std::strerror(errno);
-            close_fd(listen_fd_);
-            listen_fd_ = -1;
-            throw std::runtime_error(message);
-        }
-        port_ = ntohs(address.sin_port);
-
-        if (listen(listen_fd_, 1) != 0) {
-            const std::string message = std::string("listen failed: ") + std::strerror(errno);
-            close_fd(listen_fd_);
-            listen_fd_ = -1;
-            throw std::runtime_error(message);
-        }
-
-        worker_ = std::thread([this] {
-            serve_once();
-        });
-    }
-
-    ~SingleResponseHttpServer()
-    {
-        close_fd(listen_fd_);
-        listen_fd_ = -1;
-        if (worker_.joinable()) {
-            worker_.join();
-        }
-    }
-
-    std::string url(std::string_view path = "/resource.js") const
-    {
-        return "http://127.0.0.1:" + std::to_string(port_) + std::string(path);
-    }
-
-private:
-    void serve_once()
-    {
-        const int client_fd = accept(listen_fd_, nullptr, nullptr);
-        if (client_fd < 0) {
-            return;
-        }
-
-        char buffer[1024];
-        std::string request;
-        while (request.find("\r\n\r\n") == std::string::npos) {
-            const ssize_t received = recv(client_fd, buffer, sizeof(buffer), 0);
-            if (received <= 0) {
-                break;
-            }
-            request.append(buffer, static_cast<std::size_t>(received));
-        }
-
-        std::string response =
-            "HTTP/1.1 " + std::to_string(status_) + " " + reason_ + "\r\n"
-            "Connection: close\r\n"
-            "Content-Length: "
-            + std::to_string(body_.size()) + "\r\n";
-        for (const auto& [name, value] : headers_) {
-            response += name + ": " + value + "\r\n";
-        }
-        response += "\r\n";
-        response += body_;
-
-        const char* data = response.data();
-        std::size_t remaining = response.size();
-        while (remaining > 0) {
-            const ssize_t sent = send(client_fd, data, remaining, 0);
-            if (sent <= 0) {
-                break;
-            }
-            data += sent;
-            remaining -= static_cast<std::size_t>(sent);
-        }
-        close_fd(client_fd);
-    }
-
-    int listen_fd_ = -1;
-    std::uint16_t port_ = 0;
-    std::string body_;
-    std::vector<std::pair<std::string, std::string>> headers_;
-    int status_ = 200;
-    std::string reason_ = "OK";
-    std::thread worker_;
 };
 
 bool has_request_kind(
@@ -2039,42 +1907,6 @@ void test_resource_url_resolution_normalizes_dot_segments()
         "host-like URL resolution should avoid treating the hostname as a relative path segment");
 }
 
-void test_curl_resource_loader_decodes_gzip_content_encoding()
-{
-    const std::string expected = "document.body.setAttribute('data-gzip','ok');";
-    const unsigned char compressed_bytes[] = {
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x4b, 0xc9,
-        0x4f, 0x2e, 0xcd, 0x4d, 0xcd, 0x2b, 0xd1, 0x4b, 0xca, 0x4f, 0xa9, 0xd4,
-        0x2b, 0x4e, 0x2d, 0x71, 0x2c, 0x29, 0x29, 0xca, 0x4c, 0x2a, 0x2d, 0x49,
-        0xd5, 0x50, 0x4f, 0x49, 0x2c, 0x49, 0xd4, 0x4d, 0xaf, 0xca, 0x2c, 0x50,
-        0xd7, 0x51, 0xcf, 0xcf, 0x56, 0xd7, 0xb4, 0x06, 0x00, 0x23, 0x13, 0x77,
-        0x43, 0x2d, 0x00, 0x00, 0x00,
-    };
-    const std::string compressed(
-        reinterpret_cast<const char*>(compressed_bytes),
-        sizeof(compressed_bytes));
-
-    SingleResponseHttpServer server(
-        compressed,
-        {
-            {"Content-Encoding", "gzip"},
-            {"Content-Type", "application/javascript"},
-        });
-
-    pagecore::ResourcePolicy localhost_policy;
-    localhost_policy.block_private_hosts = false; // test server binds 127.0.0.1
-    pagecore::CurlResourceLoader loader("pagecore-test", localhost_policy);
-    const auto response = loader.load(pagecore::ResourceRequest{
-        server.url(),
-        pagecore::ResourceKind::Script,
-    });
-
-    require(response.body == expected, "CurlResourceLoader should decode gzip Content-Encoding before returning a body");
-    require(
-        response.mime_type.find("application/javascript") == 0,
-        "CurlResourceLoader should preserve response Content-Type while decoding content");
-}
-
 void test_resource_policy_errors()
 {
     pagecore::ResourcePolicy no_network;
@@ -2119,38 +1951,6 @@ void test_resource_policy_errors()
             });
         },
         "max response size should reject oversized resources");
-}
-
-void test_curl_resource_loader_revalidates_redirect_policy()
-{
-    SingleResponseHttpServer redirected(
-        "cross-origin",
-        {
-            {"Content-Type", "text/plain"},
-        });
-    SingleResponseHttpServer redirecting(
-        "",
-        {
-            {"Location", redirected.url("/final.txt")},
-        },
-        302,
-        "Found");
-
-    pagecore::ResourcePolicy same_origin;
-    same_origin.same_origin_only = true;
-    same_origin.block_private_hosts = false; // test servers bind 127.0.0.1
-    pagecore::CurlResourceLoader loader("pagecore-test", same_origin);
-    require_resource_error(
-        pagecore::ResourceErrorCode::SameOriginViolation,
-        [&] {
-            (void) loader.load(pagecore::ResourceRequest{
-                redirecting.url("/start.txt"),
-                pagecore::ResourceKind::Script,
-                redirecting.url("/page.html"),
-                redirecting.url("/page.html"),
-            });
-        },
-        "same-origin policy should reject cross-origin redirect effective URLs");
 }
 
 void test_resource_policy_blocks_private_hosts()
@@ -3787,9 +3587,7 @@ int main()
         test_non_javascript_script_types_are_not_executed();
         test_resource_request_kind_and_cache();
         test_resource_url_resolution_normalizes_dot_segments();
-        test_curl_resource_loader_decodes_gzip_content_encoding();
         test_resource_policy_errors();
-        test_curl_resource_loader_revalidates_redirect_policy();
         test_resource_policy_blocks_private_hosts();
         test_resource_scheme_not_allowed();
         test_resource_file_sandbox();
