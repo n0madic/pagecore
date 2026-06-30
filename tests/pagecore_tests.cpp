@@ -2843,6 +2843,41 @@ void test_described_traversal_wraps_children_correctly()
             "a newly appended element is wrapped via describeNode with the correct constructor");
 }
 
+void test_child_node_list_cache_reflects_mutations()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body><ul id="l"><li>1</li><li>2</li></ul>
+<script>
+  const l = document.getElementById('l');
+  const before = l.childNodes.length;       // builds + caches the list
+
+  // The returned list is a copy: mutating it must not corrupt the cache.
+  const snapshot = l.childNodes;
+  snapshot.length = 0;
+  const afterSnapshotMutate = l.childNodes.length;
+
+  // A real DOM mutation must invalidate the cache (the version bumps).
+  const li = document.createElement('li');
+  li.textContent = '3';
+  l.appendChild(li);
+  const afterAppend = l.childNodes.length;
+
+  // Cached fast paths stay consistent with the rebuilt list.
+  const consistent = l.firstChild === l.childNodes[0]
+    && l.lastChild.textContent === '3'
+    && l.children.length === 3
+    && l.lastElementChild.textContent === '3';
+
+  document.body.setAttribute(
+    'data-r', before + ',' + afterSnapshotMutate + ',' + afterAppend + ',' + consistent);
+</script></body></html>
+)HTML");
+
+    require(page.eval("document.body.getAttribute('data-r')") == "2,2,3,true",
+            "childNodes cache reflects mutations, isolates the returned copy, and keeps fast paths consistent");
+}
+
 void test_eval_api()
 {
     pagecore::Page page;
@@ -3859,6 +3894,7 @@ int main()
         test_deep_dom_traversal_is_iterative();
         test_query_selector_cache_returns_all_and_first();
         test_described_traversal_wraps_children_correctly();
+        test_child_node_list_cache_reflects_mutations();
         test_eval_api();
         test_event_capture_bubble_phases();
         test_mutation_observer_old_value();

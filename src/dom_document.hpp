@@ -40,7 +40,6 @@ struct DomDocument::Impl {
     NodeId id_for(lxb_dom_node_t* node) const;
     bool has_node(NodeId id) const;
     void forget_node(lxb_dom_node_t* node);
-    void forget_subtree(lxb_dom_node_t* node);
     void mark_mutated();
 
     lxb_css_selector_list_t* compiled_selector(std::string_view selector);

@@ -276,24 +276,6 @@ void DomDocument::Impl::forget_node(lxb_dom_node_t* node)
     }
 }
 
-void DomDocument::Impl::forget_subtree(lxb_dom_node_t* node)
-{
-    if (node == nullptr) {
-        return;
-    }
-
-    std::vector<lxb_dom_node_t*> stack;
-    stack.push_back(node);
-    while (!stack.empty()) {
-        auto* current = stack.back();
-        stack.pop_back();
-        for (auto* child = current->first_child; child != nullptr; child = child->next) {
-            stack.push_back(child);
-        }
-        forget_node(current);
-    }
-}
-
 void DomDocument::Impl::mark_mutated()
 {
     ++mutation_version;

@@ -42,6 +42,12 @@
         invokeCustomElementConnected
       } = api.events;
       const wrapperCache = ctx.wrapperCache;
+      // Per-node cache of the materialized childNodes/children wrapper lists,
+      // keyed (per entry) by the bridge mutation version. Repeated traversal
+      // (firstChild/lastChild/siblings/loops) then avoids rebuilding the list and
+      // re-crossing the bridge until the DOM actually changes. WeakMap keeps it
+      // off the node objects and lets entries be collected with their nodes.
+      const traversalCache = new WeakMap();
       let activeElement = null;
       let nextCssRootId = 1;
       const cookieJar = new Map();
@@ -108,23 +114,23 @@
             return parent instanceof Element ? parent : null;
           }
           get ownerDocument() { return this instanceof Document ? null : document; }
-          get childNodes() { return wrapDescribedList(bridge.childNodesDescribed(this._liveId())); }
-          get firstChild() { return this.childNodes[0] || null; }
+          get childNodes() { return liveChildNodeList(this).slice(); }
+          get firstChild() { const nodes = liveChildNodeList(this); return nodes[0] || null; }
           get lastChild() {
-            const nodes = this.childNodes;
+            const nodes = liveChildNodeList(this);
             return nodes[nodes.length - 1] || null;
           }
           get previousSibling() {
             const parent = this.parentNode;
             if (!parent) return null;
-            const nodes = parent.childNodes;
+            const nodes = liveChildNodeList(parent);
             const index = nodes.findIndex((node) => node.__id === this.__id);
             return index > 0 ? nodes[index - 1] : null;
           }
           get nextSibling() {
             const parent = this.parentNode;
             if (!parent) return null;
-            const nodes = parent.childNodes;
+            const nodes = liveChildNodeList(parent);
             const index = nodes.findIndex((node) => node.__id === this.__id);
             return index >= 0 && index + 1 < nodes.length ? nodes[index + 1] : null;
           }
@@ -2352,13 +2358,13 @@
           get classList() { return memo(this, '__classList', () => new DOMTokenList(this, 'class')); }
           get attributes() { return memo(this, '__attributes', () => namedNodeMap(this)); }
           get dataset() { return memo(this, '__dataset', () => datasetFor(this)); }
-          get children() { return wrapDescribedList(bridge.childrenDescribed(this._liveId())); }
-          get firstElementChild() { return this.children[0] || null; }
+          get children() { return liveChildElementList(this).slice(); }
+          get firstElementChild() { const children = liveChildElementList(this); return children[0] || null; }
           get lastElementChild() {
-            const children = this.children;
+            const children = liveChildElementList(this);
             return children[children.length - 1] || null;
           }
-          get childElementCount() { return this.children.length; }
+          get childElementCount() { return liveChildElementList(this).length; }
           get innerHTML() { return bridge.innerHTML(this._liveId()); }
           set innerHTML(value) {
             afterMutation(bridge.setInnerHTML(this._liveId(), String(value ?? '')), {
@@ -3319,6 +3325,36 @@
             out.push(cached !== undefined ? cached : materializeNode(descriptor.id, descriptor.type, descriptor.tag));
           }
           return out;
+        }
+
+        // Returns the traversal cache entry for `node` valid at the current
+        // mutation version, resetting it whenever the DOM has changed.
+        function traversalEntry(node) {
+          const version = bridge.mutationVersion();
+          let entry = traversalCache.get(node);
+          if (entry === undefined || entry.version !== version) {
+            entry = { version, childNodes: null, children: null };
+            traversalCache.set(node, entry);
+          }
+          return entry;
+        }
+
+        // Internal: returns the SHARED cached childNodes list (callers must not
+        // mutate it). The public childNodes getter hands out a copy.
+        function liveChildNodeList(node) {
+          const entry = traversalEntry(node);
+          if (entry.childNodes === null) {
+            entry.childNodes = wrapDescribedList(bridge.childNodesDescribed(node._liveId()));
+          }
+          return entry.childNodes;
+        }
+
+        function liveChildElementList(node) {
+          const entry = traversalEntry(node);
+          if (entry.children === null) {
+            entry.children = wrapDescribedList(bridge.childrenDescribed(node._liveId()));
+          }
+          return entry.children;
         }
 
         const document = wrapNode(bridge.documentNode());
