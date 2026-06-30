@@ -212,6 +212,9 @@ struct Page::Impl {
     std::vector<ScriptSource> collect_scripts()
     {
         std::vector<ScriptSource> scripts;
+        std::vector<ResourceRequest> external_requests;
+        std::vector<std::size_t> external_slots;
+
         const NodeId root = document.document_node();
         std::size_t inline_script_index = 0;
         std::size_t inline_module_index = 0;
@@ -227,14 +230,14 @@ struct Page::Impl {
 
             const auto src = document.get_attribute(script, "src");
             if (src && !src->empty()) {
-                const std::string url = resolve_url(current_url.empty() ? options.base_url : current_url, *src);
-                auto response = loader->load(ResourceRequest{
-                    url,
-                    ResourceKind::Script,
-                    current_url.empty() ? options.base_url : current_url,
-                    current_url.empty() ? options.base_url : current_url,
-                });
-                scripts.push_back(ScriptSource{script, response.url, std::move(response.body), module});
+                const std::string base = current_url.empty() ? options.base_url : current_url;
+                const std::string url = resolve_url(base, *src);
+                // Record the slot; the body is fetched in one batched, concurrent
+                // pass after the whole document is scanned. Execution still happens
+                // in document order in execute_scripts().
+                scripts.push_back(ScriptSource{script, url, std::string{}, module});
+                external_slots.push_back(scripts.size() - 1);
+                external_requests.push_back(ResourceRequest{url, ResourceKind::Script, base, base});
             } else {
                 std::string filename = "<inline-script>";
                 if (module) {
@@ -250,6 +253,16 @@ struct Page::Impl {
                 scripts.push_back(ScriptSource{script, std::move(filename), document.text_content(script), module});
             }
         }
+
+        if (!external_requests.empty()) {
+            std::vector<ResourceResponse> responses = loader->load_all(external_requests);
+            for (std::size_t i = 0; i < responses.size() && i < external_slots.size(); ++i) {
+                ScriptSource& slot = scripts[external_slots[i]];
+                slot.filename = std::move(responses[i].url);
+                slot.code = std::move(responses[i].body);
+            }
+        }
+
         return scripts;
     }
 

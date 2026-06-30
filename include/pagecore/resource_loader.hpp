@@ -91,6 +91,12 @@ public:
     virtual ~ResourceLoader() = default;
     ResourceResponse load(std::string_view url);
     virtual ResourceResponse load(const ResourceRequest& request) = 0;
+
+    // Loads multiple resources, returning responses in request order. Throws the
+    // first (request-order) ResourceError if any request fails, matching the
+    // single-resource load(). The default implementation loads serially; loaders
+    // such as CurlResourceLoader override it to fetch concurrently.
+    virtual std::vector<ResourceResponse> load_all(const std::vector<ResourceRequest>& requests);
 };
 
 class CurlResourceLoader final : public ResourceLoader {
@@ -99,6 +105,7 @@ public:
 
     explicit CurlResourceLoader(std::string user_agent = "PageCore/0.1", ResourcePolicy policy = {});
     ResourceResponse load(const ResourceRequest& request) override;
+    std::vector<ResourceResponse> load_all(const std::vector<ResourceRequest>& requests) override;
 
     const ResourcePolicy& policy() const noexcept;
     void set_policy(ResourcePolicy policy);
@@ -106,6 +113,10 @@ public:
 private:
     std::string user_agent_;
     ResourcePolicy policy_;
+    // Opaque libcurl share handle (connection/DNS/TLS-session reuse) plus its
+    // lock mutexes. Type-erased so the public header stays curl-free; shared so
+    // the loader remains copyable. Defined as CurlShared in the .cpp.
+    std::shared_ptr<void> shared_;
 };
 
 class MemoryResourceLoader final : public ResourceLoader {
@@ -133,6 +144,7 @@ public:
     explicit CachingResourceLoader(std::shared_ptr<ResourceLoader> inner, std::size_t max_entries = 256);
 
     ResourceResponse load(const ResourceRequest& request) override;
+    std::vector<ResourceResponse> load_all(const std::vector<ResourceRequest>& requests) override;
     void clear();
     std::size_t size() const noexcept;
 

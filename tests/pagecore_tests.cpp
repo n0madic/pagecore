@@ -2138,6 +2138,91 @@ void test_caching_loader_bounds_and_skips_errors()
     require(second_throws, "thrown errors must not be cached as success");
 }
 
+void test_resource_load_all_returns_in_order()
+{
+    auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
+    memory->add("https://example.test/a", "A");
+    memory->add("https://example.test/b", "B");
+    memory->add("https://example.test/c", "C");
+
+    const std::vector<pagecore::ResourceRequest> requests{
+        {"https://example.test/a", pagecore::ResourceKind::Script},
+        {"https://example.test/b", pagecore::ResourceKind::Script},
+        {"https://example.test/c", pagecore::ResourceKind::Script},
+    };
+    const auto responses = memory->load_all(requests);
+    require(responses.size() == 3, "load_all returns one response per request");
+    require(responses[0].body == "A" && responses[1].body == "B" && responses[2].body == "C",
+            "load_all preserves request order");
+    require(responses[0].kind == pagecore::ResourceKind::Script, "load_all carries the request kind");
+}
+
+void test_resource_load_all_propagates_first_error()
+{
+    auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
+    memory->add("https://example.test/a", "A");
+    memory->add("https://example.test/c", "C");
+
+    const std::vector<pagecore::ResourceRequest> requests{
+        {"https://example.test/a"},
+        {"https://example.test/missing"},
+        {"https://example.test/c"},
+    };
+    require_resource_error(
+        pagecore::ResourceErrorCode::NotFound,
+        [&] { (void) memory->load_all(requests); },
+        "load_all surfaces the first request-order failure");
+}
+
+void test_caching_loader_load_all_serves_hits_and_caches()
+{
+    auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
+    memory->add("https://example.test/a", "A");
+    memory->add("https://example.test/b", "B");
+
+    pagecore::CachingResourceLoader cache(memory, 8);
+    const auto warm = cache.load(pagecore::ResourceRequest{"https://example.test/a", pagecore::ResourceKind::Script});
+    require(!warm.from_cache, "first load is not served from cache");
+    require(cache.size() == 1, "first load populates the cache");
+
+    const std::vector<pagecore::ResourceRequest> requests{
+        {"https://example.test/a", pagecore::ResourceKind::Script},
+        {"https://example.test/b", pagecore::ResourceKind::Script},
+    };
+    const auto responses = cache.load_all(requests);
+    require(responses.size() == 2, "load_all returns all responses in order");
+    require(responses[0].body == "A" && responses[0].from_cache, "previously cached entry is served from cache");
+    require(responses[1].body == "B" && !responses[1].from_cache, "uncached entry is fetched fresh");
+    require(cache.size() == 2, "load_all caches freshly fetched misses");
+
+    const auto again = cache.load_all(requests);
+    require(again[0].from_cache && again[1].from_cache, "a repeated batch is served entirely from cache");
+}
+
+void test_external_scripts_load_in_document_order()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/one.js", "window.__order = (window.__order || '') + '1';");
+    loader->add("https://example.test/two.js", "window.__order = (window.__order || '') + '2';");
+    loader->add("https://example.test/three.js", "window.__order = (window.__order || '') + '3';");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script src="/one.js"></script>
+  <script src="/two.js"></script>
+  <script src="/three.js"></script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.eval("window.__order") == "123",
+            "batch-prefetched external scripts must still execute in document order");
+    require(loader->requests.size() == 3, "all external scripts are fetched");
+    require(has_request_kind(*loader, "https://example.test/two.js", pagecore::ResourceKind::Script),
+            "external scripts are requested with the Script kind");
+}
+
 void test_native_bridge_not_exposed_to_page()
 {
     pagecore::Page page;
@@ -3681,6 +3766,10 @@ int main()
         test_resource_relative_file_url();
         test_resource_blocks_file_from_network_origin();
         test_caching_loader_bounds_and_skips_errors();
+        test_resource_load_all_returns_in_order();
+        test_resource_load_all_propagates_first_error();
+        test_caching_loader_load_all_serves_hits_and_caches();
+        test_external_scripts_load_in_document_order();
         test_native_bridge_not_exposed_to_page();
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_cairo_raster_backend();

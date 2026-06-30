@@ -7,9 +7,11 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -20,6 +22,9 @@
 #endif
 
 namespace pagecore {
+
+void ensure_curl_global_init();
+
 namespace {
 
 struct CurlBody {
@@ -27,6 +32,52 @@ struct CurlBody {
     std::size_t max_bytes = 0;
     bool too_large = false;
 };
+
+// libcurl share handle for connection / DNS-cache / TLS-session reuse across
+// requests, with one lock mutex per shared data type so the share is safe to use
+// from multiple threads. Owned (type-erased) by each CurlResourceLoader.
+struct CurlShared;
+void share_lock_callback(CURL* handle, curl_lock_data data, curl_lock_access access, void* userptr);
+void share_unlock_callback(CURL* handle, curl_lock_data data, void* userptr);
+
+struct CurlShared {
+    CURLSH* share = nullptr;
+    std::array<std::mutex, CURL_LOCK_DATA_LAST> mutexes;
+
+    CurlShared()
+    {
+        ensure_curl_global_init();
+        share = curl_share_init();
+        if (share != nullptr) {
+            curl_share_setopt(share, CURLSHOPT_LOCKFUNC, share_lock_callback);
+            curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, share_unlock_callback);
+            curl_share_setopt(share, CURLSHOPT_USERDATA, this);
+            curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+            curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+            curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+        }
+    }
+
+    ~CurlShared()
+    {
+        if (share != nullptr) {
+            curl_share_cleanup(share);
+        }
+    }
+
+    CurlShared(const CurlShared&) = delete;
+    CurlShared& operator=(const CurlShared&) = delete;
+};
+
+void share_lock_callback(CURL*, curl_lock_data data, curl_lock_access, void* userptr)
+{
+    static_cast<CurlShared*>(userptr)->mutexes[static_cast<std::size_t>(data)].lock();
+}
+
+void share_unlock_callback(CURL*, curl_lock_data data, void* userptr)
+{
+    static_cast<CurlShared*>(userptr)->mutexes[static_cast<std::size_t>(data)].unlock();
+}
 
 size_t write_body(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
@@ -214,12 +265,14 @@ bool is_blocked_literal_host(const std::string& host, const ResourcePolicy& poli
     return false;
 }
 
-#if !defined(_WIN32)
+// Platform-neutral so the same helpers compile on Windows, where the open-socket
+// guard is unavailable and `blocked` simply stays false.
 struct OpenSocketContext {
     const ResourcePolicy* policy = nullptr;
     bool blocked = false;
 };
 
+#if !defined(_WIN32)
 bool is_blocked_sockaddr(const sockaddr* sa)
 {
     if (sa == nullptr) {
@@ -669,6 +722,108 @@ bool looks_like_host_reference(std::string_view candidate)
     return true;
 }
 
+// Applies every libcurl option for a single network transfer. Shared verbatim by
+// the serial load() and the concurrent load_all() so both paths enforce the same
+// protocol pinning, SSRF socket guard, size cap, timeout, and connection reuse.
+void configure_network_handle(
+    CURL* curl,
+    const std::string& url,
+    const std::string& user_agent,
+    const ResourcePolicy& policy,
+    CURLSH* share,
+    CurlBody& body,
+    OpenSocketContext& socket_context)
+{
+    body.max_bytes = policy.max_response_bytes;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    // Pin the protocol set for the initial transfer too (not just redirects);
+    // otherwise curl's build-dependent default enables file/scp/gopher/etc.
+#if LIBCURL_VERSION_NUM >= 0x075500
+    const std::string request_protocols = curl_request_protocols_string(policy);
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, request_protocols.empty() ? "" : request_protocols.c_str());
+    const std::string redirect_protocols = curl_redirect_protocols_string(policy);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, redirect_protocols.empty() ? "" : redirect_protocols.c_str());
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, curl_redirect_protocols_mask(policy));
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, curl_redirect_protocols_mask(policy));
+#endif
+#if !defined(_WIN32)
+    socket_context.policy = &policy;
+    socket_context.blocked = false;
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, guarded_open_socket);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &socket_context);
+#else
+    (void) socket_context;
+#endif
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(policy.timeout.count()));
+    if (share != nullptr) {
+        curl_easy_setopt(curl, CURLOPT_SHARE, share);
+    }
+}
+
+// Reads back the transfer result, enforces the post-transfer policy (size cap,
+// SSRF socket block, effective-URL re-validation after redirects), and builds the
+// response. Throws ResourceError on any failure. Shared by load()/load_all().
+ResourceResponse build_network_response(
+    CURL* curl,
+    const ResourceRequest& request,
+    const ResourcePolicy& policy,
+    CurlBody& body,
+    OpenSocketContext& socket_context,
+    CURLcode code)
+{
+    const std::string url_string(request.url);
+    long status = 0;
+    char* content_type = nullptr;
+    char* effective_url = nullptr;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+    const std::string response_url = effective_url == nullptr ? url_string : std::string(effective_url);
+    const std::string response_mime_type =
+        content_type == nullptr ? infer_mime_type(url_string, request.kind) : std::string(content_type);
+
+    if (body.too_large) {
+        throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
+    }
+
+    if (socket_context.blocked) {
+        throw ResourceError(
+            ResourceErrorCode::BlockedHost,
+            request.url,
+            "resource resolved to a blocked (private/loopback/link-local) address");
+    }
+
+    if (code != CURLE_OK) {
+        const auto error_code = code == CURLE_OPERATION_TIMEDOUT ? ResourceErrorCode::Timeout : ResourceErrorCode::Transport;
+        throw ResourceError(error_code, request.url, std::string("resource load failed: ") + curl_easy_strerror(code));
+    }
+
+    // Re-validate the effective URL after any redirects (scheme, host, origin).
+    enforce_request_policy(
+        ResourceRequest{response_url, request.kind, request.referrer, request.base_url},
+        policy);
+
+    ResourceResponse response{
+        response_url,
+        std::move(body.body),
+        static_cast<int>(status),
+        response_mime_type,
+        request.kind,
+        false,
+    };
+    enforce_response_policy(request, response, policy);
+    return response;
+}
+
 } // namespace
 
 ResourceError::ResourceError(ResourceErrorCode code, std::string url, std::string message)
@@ -693,9 +848,20 @@ ResourceResponse ResourceLoader::load(std::string_view url)
     return load(ResourceRequest{std::string(url)});
 }
 
+std::vector<ResourceResponse> ResourceLoader::load_all(const std::vector<ResourceRequest>& requests)
+{
+    std::vector<ResourceResponse> responses;
+    responses.reserve(requests.size());
+    for (const auto& request : requests) {
+        responses.push_back(load(request));
+    }
+    return responses;
+}
+
 CurlResourceLoader::CurlResourceLoader(std::string user_agent, ResourcePolicy policy)
     : user_agent_(std::move(user_agent))
     , policy_(std::move(policy))
+    , shared_(std::make_shared<CurlShared>())
 {
 }
 
@@ -732,79 +898,132 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
         throw ResourceError(ResourceErrorCode::Transport, request.url, "failed to initialize libcurl");
     }
 
-    CurlBody body;
-    body.max_bytes = policy_.max_response_bytes;
-    long status = 0;
-    char* content_type = nullptr;
-    char* effective_url = nullptr;
+    auto* curl_shared = static_cast<CurlShared*>(shared_.get());
+    CURLSH* share = curl_shared == nullptr ? nullptr : curl_shared->share;
 
-    curl_easy_setopt(curl.get(), CURLOPT_URL, url_string.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 10L);
-    // Pin the protocol set for the initial transfer too (not just redirects);
-    // otherwise curl's build-dependent default enables file/scp/gopher/etc.
-#if LIBCURL_VERSION_NUM >= 0x075500
-    const std::string request_protocols = curl_request_protocols_string(policy_);
-    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, request_protocols.empty() ? "" : request_protocols.c_str());
-    const std::string redirect_protocols = curl_redirect_protocols_string(policy_);
-    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, redirect_protocols.empty() ? "" : redirect_protocols.c_str());
-#else
-    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, curl_redirect_protocols_mask(policy_));
-    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, curl_redirect_protocols_mask(policy_));
-#endif
-#if !defined(_WIN32)
-    OpenSocketContext socket_context{&policy_, false};
-    curl_easy_setopt(curl.get(), CURLOPT_OPENSOCKETFUNCTION, guarded_open_socket);
-    curl_easy_setopt(curl.get(), CURLOPT_OPENSOCKETDATA, &socket_context);
-#endif
-    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, user_agent_.c_str());
-    curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_body);
-    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(policy_.timeout.count()));
+    CurlBody body;
+    OpenSocketContext socket_context;
+    configure_network_handle(curl.get(), url_string, user_agent_, policy_, share, body, socket_context);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_getinfo(curl.get(), CURLINFO_CONTENT_TYPE, &content_type);
-    curl_easy_getinfo(curl.get(), CURLINFO_EFFECTIVE_URL, &effective_url);
-    const std::string response_url = effective_url == nullptr ? url_string : std::string(effective_url);
-    const std::string response_mime_type =
-        content_type == nullptr ? infer_mime_type(url_string, request.kind) : std::string(content_type);
+    return build_network_response(curl.get(), request, policy_, body, socket_context, code);
+}
 
-    if (body.too_large) {
-        throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
+std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<ResourceRequest>& requests)
+{
+    if (requests.empty()) {
+        return {};
+    }
+    if (requests.size() == 1) {
+        return {load(requests.front())};
     }
 
-#if !defined(_WIN32)
-    if (socket_context.blocked) {
-        throw ResourceError(
-            ResourceErrorCode::BlockedHost,
-            request.url,
-            "resource resolved to a blocked (private/loopback/link-local) address");
+    ensure_curl_global_init();
+
+    const std::size_t count = requests.size();
+    std::vector<ResourceResponse> responses(count);
+    std::vector<std::exception_ptr> errors(count);
+    std::vector<bool> done(count, false);
+
+    // Stable storage: handles in the multi reference these by address, so the
+    // vectors must not reallocate while transfers are in flight.
+    std::vector<CURL*> handles(count, nullptr);
+    std::vector<CurlBody> bodies(count);
+    std::vector<OpenSocketContext> contexts(count);
+
+    auto* curl_shared = static_cast<CurlShared*>(shared_.get());
+    CURLSH* share = curl_shared == nullptr ? nullptr : curl_shared->share;
+
+    CURLM* multi = curl_multi_init();
+    if (multi == nullptr) {
+        // Fall back to serial loading rather than failing the whole batch.
+        for (std::size_t i = 0; i < count; ++i) {
+            responses[i] = load(requests[i]);
+        }
+        return responses;
     }
-#endif
+    // Bound parallelism the way browsers do, so a page cannot open an unbounded
+    // number of sockets at once.
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 8L);
+    curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS, 6L);
 
-    if (code != CURLE_OK) {
-        const auto error_code = code == CURLE_OPERATION_TIMEDOUT ? ResourceErrorCode::Timeout : ResourceErrorCode::Transport;
-        throw ResourceError(error_code, request.url, std::string("resource load failed: ") + curl_easy_strerror(code));
+    for (std::size_t i = 0; i < count; ++i) {
+        try {
+            enforce_request_policy(requests[i], policy_);
+            const std::string scheme = scheme_of(requests[i].url);
+            if (!is_network_scheme(scheme)) {
+                ResourceResponse response{
+                    requests[i].url,
+                    read_file(requests[i].url, policy_),
+                    200,
+                    infer_mime_type(requests[i].url, requests[i].kind),
+                    requests[i].kind,
+                    false,
+                };
+                enforce_response_policy(requests[i], response, policy_);
+                responses[i] = std::move(response);
+                done[i] = true;
+                continue;
+            }
+
+            CURL* handle = curl_easy_init();
+            if (handle == nullptr) {
+                throw ResourceError(ResourceErrorCode::Transport, requests[i].url, "failed to initialize libcurl");
+            }
+            configure_network_handle(handle, requests[i].url, user_agent_, policy_, share, bodies[i], contexts[i]);
+            handles[i] = handle;
+            curl_multi_add_handle(multi, handle);
+        } catch (...) {
+            errors[i] = std::current_exception();
+            done[i] = true;
+        }
     }
 
-    // Re-validate the effective URL after any redirects (scheme, host, origin).
-    enforce_request_policy(
-        ResourceRequest{response_url, request.kind, request.referrer, request.base_url},
-        policy_);
+    int still_running = 0;
+    curl_multi_perform(multi, &still_running);
+    while (still_running > 0) {
+        const CURLMcode poll_code = curl_multi_poll(multi, nullptr, 0, 1000, nullptr);
+        if (poll_code != CURLM_OK) {
+            break;
+        }
+        curl_multi_perform(multi, &still_running);
+    }
 
-    ResourceResponse response{
-        response_url,
-        std::move(body.body),
-        static_cast<int>(status),
-        response_mime_type,
-        request.kind,
-        false,
-    };
-    enforce_response_policy(request, response, policy_);
-    return response;
+    // Collect the per-handle transfer result codes.
+    std::unordered_map<CURL*, CURLcode> result_codes;
+    CURLMsg* message = nullptr;
+    int in_queue = 0;
+    while ((message = curl_multi_info_read(multi, &in_queue)) != nullptr) {
+        if (message->msg == CURLMSG_DONE) {
+            result_codes[message->easy_handle] = message->data.result;
+        }
+    }
+
+    for (std::size_t i = 0; i < count; ++i) {
+        if (done[i] || handles[i] == nullptr) {
+            continue;
+        }
+        const auto found = result_codes.find(handles[i]);
+        const CURLcode code = found == result_codes.end() ? CURLE_RECV_ERROR : found->second;
+        try {
+            responses[i] = build_network_response(handles[i], requests[i], policy_, bodies[i], contexts[i], code);
+        } catch (...) {
+            errors[i] = std::current_exception();
+        }
+        curl_multi_remove_handle(multi, handles[i]);
+        curl_easy_cleanup(handles[i]);
+        handles[i] = nullptr;
+    }
+
+    curl_multi_cleanup(multi);
+
+    // Match load(): surface the first request-order failure.
+    for (std::size_t i = 0; i < count; ++i) {
+        if (errors[i]) {
+            std::rethrow_exception(errors[i]);
+        }
+    }
+    return responses;
 }
 
 const ResourcePolicy& CurlResourceLoader::policy() const noexcept
@@ -910,6 +1129,57 @@ ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
         cache_[key] = response;
     }
     return response;
+}
+
+std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<ResourceRequest>& requests)
+{
+    const std::size_t count = requests.size();
+    std::vector<ResourceResponse> responses(count);
+    std::vector<std::string> keys(count);
+    std::vector<ResourceRequest> misses;
+    std::vector<std::size_t> miss_slots;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t i = 0; i < count; ++i) {
+            keys[i] = resource_kind_name(requests[i].kind) + "\n" + requests[i].url + "\n" + requests[i].referrer;
+            auto cached = cache_.find(keys[i]);
+            if (cached != cache_.end()) {
+                responses[i] = cached->second;
+                responses[i].from_cache = true;
+            } else {
+                misses.push_back(requests[i]);
+                miss_slots.push_back(i);
+            }
+        }
+    }
+
+    if (!misses.empty()) {
+        // Misses keep their original relative order, so the inner loader still
+        // surfaces the first request-order failure. Cache hits never fail, so the
+        // first thrown error is also the first overall failure, matching load().
+        std::vector<ResourceResponse> fetched = inner_->load_all(misses);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t m = 0; m < fetched.size(); ++m) {
+            const std::size_t i = miss_slots[m];
+            fetched[m].from_cache = false;
+            responses[i] = std::move(fetched[m]);
+
+            if (responses[i].status < 400) {
+                if (cache_.find(keys[i]) == cache_.end()) {
+                    order_.push_back(keys[i]);
+                    while (order_.size() > max_entries_) {
+                        cache_.erase(order_.front());
+                        order_.pop_front();
+                    }
+                }
+                cache_[keys[i]] = responses[i];
+            }
+        }
+    }
+
+    return responses;
 }
 
 void CachingResourceLoader::clear()
