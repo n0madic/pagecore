@@ -191,6 +191,18 @@ function makeDomBridge() {
     parentNode: (id) => nodes.get(id).parent,
     childNodes: (id) => nodes.get(id).children.slice(),
     children: (id) => nodes.get(id).children.filter((childId) => nodes.get(childId).type === 1),
+    describeNode: (id) => {
+      if (!nodes.has(id)) return null;
+      const type = nodes.get(id).type;
+      return type === 1 ? { type, tag: nodes.get(id).tagName } : { type };
+    },
+    childNodesDescribed: (id) => nodes.get(id).children.map((childId) => {
+      const type = nodes.get(childId).type;
+      return type === 1 ? { id: childId, type, tag: nodes.get(childId).tagName } : { id: childId, type };
+    }),
+    childrenDescribed: (id) => nodes.get(id).children
+      .filter((childId) => nodes.get(childId).type === 1)
+      .map((childId) => ({ id: childId, type: 1, tag: nodes.get(childId).tagName })),
     isConnected: (id) => {
       for (let current = id; current != null; current = nodes.get(current).parent) {
         if (current === documentId) return true;

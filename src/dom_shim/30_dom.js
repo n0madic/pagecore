@@ -108,7 +108,7 @@
             return parent instanceof Element ? parent : null;
           }
           get ownerDocument() { return this instanceof Document ? null : document; }
-          get childNodes() { return toArray(bridge.childNodes(this._liveId())); }
+          get childNodes() { return wrapDescribedList(bridge.childNodesDescribed(this._liveId())); }
           get firstChild() { return this.childNodes[0] || null; }
           get lastChild() {
             const nodes = this.childNodes;
@@ -2352,7 +2352,7 @@
           get classList() { return memo(this, '__classList', () => new DOMTokenList(this, 'class')); }
           get attributes() { return memo(this, '__attributes', () => namedNodeMap(this)); }
           get dataset() { return memo(this, '__dataset', () => datasetFor(this)); }
-          get children() { return toArray(bridge.children(this._liveId())); }
+          get children() { return wrapDescribedList(bridge.childrenDescribed(this._liveId())); }
           get firstElementChild() { return this.children[0] || null; }
           get lastElementChild() {
             const children = this.children;
@@ -3275,25 +3275,50 @@
 
         const domImplementation = new DOMImplementation();
 
-        function wrapNode(id) {
-          if (!id) return null;
-          syncMutationCache();
-          if (!bridge.hasNode(id)) return null;
-          if (wrapperCache.has(id)) return wrapperCache.get(id);
-
-          const type = bridge.nodeType(id);
+        // Builds (and caches) a wrapper from an already-fetched descriptor, so no
+        // bridge crossing is needed here. `tag` is only present for elements.
+        function materializeNode(id, type, tag) {
           let node;
           if (type === 9) node = new Document(id);
           else if (type === 3) node = new Text(id);
           else if (type === 8) node = new Comment(id);
           else if (type === 1) {
-            const tagName = bridge.tagName(id).toLowerCase();
+            const tagName = (tag || '').toLowerCase();
             const Constructor = htmlElementConstructors[tagName] || (tagName.includes('-') ? HTMLElement : HTMLUnknownElement);
             node = new Constructor(id);
           } else node = new Node(id);
 
           wrapperCache.set(id, node);
           return node;
+        }
+
+        function wrapNode(id) {
+          if (!id) return null;
+          // syncMutationCache() prunes any wrapper whose node was removed, so a
+          // surviving cache entry is guaranteed live and needs no hasNode check.
+          syncMutationCache();
+          const cached = wrapperCache.get(id);
+          if (cached !== undefined) return cached;
+
+          // One bridge crossing returns liveness + type (+ tag) instead of the
+          // former hasNode + nodeType + tagName round-trips.
+          const descriptor = bridge.describeNode(id);
+          if (!descriptor) return null;
+          return materializeNode(id, descriptor.type, descriptor.tag);
+        }
+
+        // Materializes a list of descriptors (from childNodesDescribed/
+        // childrenDescribed) into wrappers with a single bridge crossing for the
+        // whole list, reusing cached wrappers where present.
+        function wrapDescribedList(descriptors) {
+          syncMutationCache();
+          const out = [];
+          for (let i = 0; i < descriptors.length; i++) {
+            const descriptor = descriptors[i];
+            const cached = wrapperCache.get(descriptor.id);
+            out.push(cached !== undefined ? cached : materializeNode(descriptor.id, descriptor.type, descriptor.tag));
+          }
+          return out;
         }
 
         const document = wrapNode(bridge.documentNode());

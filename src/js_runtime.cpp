@@ -85,6 +85,30 @@ JSValue js_attributes(JSContext* ctx, const std::vector<DomDocument::Attribute>&
     return array;
 }
 
+// A node "descriptor": everything the JS wrapper layer needs to construct a
+// wrapper (type, and tag for elements) in a single bridge crossing instead of a
+// hasNode + nodeType + tagName round-trip per node.
+JSValue js_node_descriptor(JSContext* ctx, DomDocument& document, NodeId id)
+{
+    JSValue item = JS_NewObject(ctx);
+    const int type = document.node_type(id);
+    JS_SetPropertyStr(ctx, item, "id", js_id(ctx, id));
+    JS_SetPropertyStr(ctx, item, "type", JS_NewInt32(ctx, type));
+    if (type == 1) {
+        JS_SetPropertyStr(ctx, item, "tag", js_string(ctx, document.tag_name(id)));
+    }
+    return item;
+}
+
+JSValue js_node_descriptors(JSContext* ctx, DomDocument& document, const std::vector<NodeId>& ids)
+{
+    JSValue array = JS_NewArray(ctx);
+    for (uint32_t i = 0; i < ids.size(); ++i) {
+        JS_SetPropertyUint32(ctx, array, i, js_node_descriptor(ctx, document, ids[i]));
+    }
+    return array;
+}
+
 template <typename Func>
 JSValue bridge_call(JSContext* ctx, Func&& func)
 {
@@ -414,6 +438,34 @@ JSValue bridge_children(JSContext* ctx, JSValue, int argc, JSValue* argv)
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("children requires node id");
         return js_ids(ctx, js.document().children(to_node_id(ctx, argv[0])));
+    });
+}
+
+JSValue bridge_describe_node(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("describeNode requires node id");
+        const NodeId id = to_node_id(ctx, argv[0]);
+        if (!js.document().has_node(id)) {
+            return JS_NULL;
+        }
+        return js_node_descriptor(ctx, js.document(), id);
+    });
+}
+
+JSValue bridge_child_nodes_described(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("childNodesDescribed requires node id");
+        return js_node_descriptors(ctx, js.document(), js.document().child_nodes(to_node_id(ctx, argv[0])));
+    });
+}
+
+JSValue bridge_children_described(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("childrenDescribed requires node id");
+        return js_node_descriptors(ctx, js.document(), js.document().children(to_node_id(ctx, argv[0])));
     });
 }
 
@@ -797,6 +849,9 @@ void JsRuntime::install()
     set_function(context_, dom, "parentNode", bridge_parent_node, 1);
     set_function(context_, dom, "childNodes", bridge_child_nodes, 1);
     set_function(context_, dom, "children", bridge_children, 1);
+    set_function(context_, dom, "describeNode", bridge_describe_node, 1);
+    set_function(context_, dom, "childNodesDescribed", bridge_child_nodes_described, 1);
+    set_function(context_, dom, "childrenDescribed", bridge_children_described, 1);
     set_function(context_, dom, "hasNode", bridge_has_node, 1);
     set_function(context_, dom, "contains", bridge_contains, 2);
     set_function(context_, dom, "isConnected", bridge_is_connected, 1);

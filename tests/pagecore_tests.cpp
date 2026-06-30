@@ -2782,6 +2782,32 @@ void test_query_selector_cache_returns_all_and_first()
             "querySelectorAll returns empty when nothing matches");
 }
 
+void test_described_traversal_wraps_children_correctly()
+{
+    pagecore::Page page;
+    page.load_html(
+        "<html><body><div id=\"host\">a<span class=\"s\">b</span><!--c--><p>d</p></div></body></html>");
+
+    // childNodes goes through the batched describe path: text, element, comment, element.
+    require(page.eval(
+                "(() => { const k = document.getElementById('host').childNodes;"
+                " return k.length + ':' + k.map(n => n.nodeType).join(','); })()") == "4:3,1,8,1",
+            "childNodes returns every child with the correct node types in order");
+
+    // children must surface only the element children, with correct tags.
+    require(page.eval(
+                "document.getElementById('host').children.map(e => e.tagName).join(',')") == "SPAN,P",
+            "children returns only element nodes with correct tag names");
+
+    // A freshly created + appended element exercises describeNode for a new node:
+    // it must be wrapped with the right HTMLElement subclass.
+    require(page.eval(
+                "(() => { const d = document.createElement('b'); document.body.appendChild(d);"
+                " const kids = document.body.children; const last = kids[kids.length - 1];"
+                " return last.tagName + ':' + (last instanceof HTMLElement); })()") == "B:true",
+            "a newly appended element is wrapped via describeNode with the correct constructor");
+}
+
 void test_eval_api()
 {
     pagecore::Page page;
@@ -3796,6 +3822,7 @@ int main()
 #endif
         test_deep_dom_traversal_is_iterative();
         test_query_selector_cache_returns_all_and_first();
+        test_described_traversal_wraps_children_correctly();
         test_eval_api();
         test_event_capture_bubble_phases();
         test_mutation_observer_old_value();
