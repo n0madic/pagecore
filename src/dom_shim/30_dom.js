@@ -1930,6 +1930,22 @@
           });
         }
 
+        // Per-element cache of litehtml's box-model geometry, keyed (per entry)
+        // by the bridge mutation version — same invalidation pattern as
+        // traversalCache/liveChildNodeList. Returns null for elements that
+        // don't participate in layout (display:none, or layout() hasn't run).
+        const elementGeometryCache = new WeakMap();
+        function elementGeometry(element) {
+          if (!(element instanceof Element)) return null;
+          const version = bridge.mutationVersion();
+          let entry = elementGeometryCache.get(element);
+          if (entry === undefined || entry.version !== version) {
+            entry = { version, geometry: bridge.elementGeometry(element.__id) };
+            elementGeometryCache.set(element, entry);
+          }
+          return entry.geometry;
+        }
+
         function getCookieString() {
           return Array.from(cookieJar.entries()).map(([name, value]) => `${name}=${value}`).join('; ');
         }
@@ -2308,16 +2324,63 @@
             const style = computedStyleFor(this);
             return style.display !== 'none' && style.visibility !== 'hidden';
           }
-          getBoundingClientRect() { return new DOMRect(0, 0, 0, 0); }
-          getClientRects() { return []; }
-          get offsetWidth() { return 0; }
-          get offsetHeight() { return 0; }
-          get offsetTop() { return 0; }
-          get offsetLeft() { return 0; }
-          get clientWidth() { return 0; }
-          get clientHeight() { return 0; }
-          get scrollWidth() { return 0; }
-          get scrollHeight() { return 0; }
+          getBoundingClientRect() {
+            const geometry = elementGeometry(this);
+            if (!geometry) return new DOMRect(0, 0, 0, 0);
+            return new DOMRect(geometry.borderX, geometry.borderY, geometry.borderWidth, geometry.borderHeight);
+          }
+          getClientRects() {
+            // Known simplification: returns one bounding rect instead of a
+            // rect per line-box fragment for inline elements.
+            const rect = this.getBoundingClientRect();
+            return rect.width > 0 || rect.height > 0 ? [rect] : [];
+          }
+          get offsetWidth() {
+            const geometry = elementGeometry(this);
+            return geometry ? Math.round(geometry.borderWidth) : 0;
+          }
+          get offsetHeight() {
+            const geometry = elementGeometry(this);
+            return geometry ? Math.round(geometry.borderHeight) : 0;
+          }
+          get offsetTop() {
+            const geometry = elementGeometry(this);
+            if (!geometry) return 0;
+            const parentGeometry = this.offsetParent ? elementGeometry(this.offsetParent) : null;
+            return Math.round(geometry.borderY - (parentGeometry ? parentGeometry.borderY : 0));
+          }
+          get offsetLeft() {
+            const geometry = elementGeometry(this);
+            if (!geometry) return 0;
+            const parentGeometry = this.offsetParent ? elementGeometry(this.offsetParent) : null;
+            return Math.round(geometry.borderX - (parentGeometry ? parentGeometry.borderX : 0));
+          }
+          get clientWidth() {
+            const geometry = elementGeometry(this);
+            return geometry ? Math.round(geometry.paddingWidth) : 0;
+          }
+          get clientHeight() {
+            const geometry = elementGeometry(this);
+            return geometry ? Math.round(geometry.paddingHeight) : 0;
+          }
+          get clientTop() {
+            const geometry = elementGeometry(this);
+            return geometry ? Math.round(geometry.paddingY - geometry.borderY) : 0;
+          }
+          get clientLeft() {
+            const geometry = elementGeometry(this);
+            return geometry ? Math.round(geometry.paddingX - geometry.borderX) : 0;
+          }
+          // Approximation (no patch to litehtml's protected scroll-size
+          // state): equates scroll size with the padding-box client size.
+          // Known limitation for overflow:scroll|auto content.
+          get scrollWidth() { return this.clientWidth; }
+          get scrollHeight() { return this.clientHeight; }
+          // No real scroll write-channel from JS back into litehtml layout.
+          get scrollTop() { return 0; }
+          set scrollTop(_value) {}
+          get scrollLeft() { return 0; }
+          set scrollLeft(_value) {}
         }
 
         class HTMLElement extends Element {
@@ -2326,8 +2389,12 @@
           get offsetParent() {
             if (!isNodeWrapper(this)) return null;
             if (!this.isConnected || this.hidden || computedDisplay(this) === 'none') return null;
+            for (let ancestor = this.parentElement; ancestor; ancestor = ancestor.parentElement) {
+              const position = computedStyleFor(ancestor).position;
+              if (position && position !== 'static') return ancestor;
+            }
             const root = this.getRootNode ? this.getRootNode() : null;
-            return this.parentElement || (root instanceof ShadowRoot ? root.host : null) || document.body || null;
+            return (root instanceof ShadowRoot ? root.host : null) || document.body || null;
           }
         }
         class HTMLFormControlElement extends HTMLElement {

@@ -360,6 +360,8 @@ struct Page::Impl {
         if (!js) {
             js = std::make_unique<JsRuntime>(document, options, loader);
             js->set_computed_style_resolver([this](NodeId node) { return computed_style(node); });
+            js->set_element_geometry_resolver([this](NodeId node) { return element_geometry(node); });
+            js->set_viewport_resolver([this] { return last_render_options.viewport; });
             js->install();
         }
     }
@@ -687,15 +689,24 @@ struct Page::Impl {
         return *styled_document;
     }
 
-    const DisplayList& cached_display_list(const RenderOptions& render_options)
+    // Builds (or reuses) the styled document and runs a full layout() pass
+    // on it if that hasn't happened yet for this build. Shared by
+    // cached_display_list() and element_geometry(), both of which need real
+    // render_item geometry rather than just the cascade.
+    LayoutEngine& ensure_layout(const RenderOptions& render_options)
     {
-        last_render_options = render_options;
         auto& engine = ensure_styled_document(render_options);
         if (!styled_document_laid_out) {
             engine.layout();
             styled_document_laid_out = true;
         }
-        return engine.display_list();
+        return engine;
+    }
+
+    const DisplayList& cached_display_list(const RenderOptions& render_options)
+    {
+        last_render_options = render_options;
+        return ensure_layout(render_options).display_list();
     }
 
     std::optional<ComputedStyle> computed_style(NodeId node)
@@ -703,6 +714,12 @@ struct Page::Impl {
         auto& engine = ensure_styled_document(last_render_options);
         engine.compute_styles_only();
         return engine.computed_style(std::to_string(node));
+    }
+
+    std::optional<ElementGeometry> element_geometry(NodeId node)
+    {
+        auto& engine = ensure_layout(last_render_options);
+        return engine.element_geometry(std::to_string(node));
     }
 };
 
@@ -820,6 +837,11 @@ std::optional<std::string> Page::outer_html(std::string_view selector)
 std::optional<ComputedStyle> Page::computed_style(NodeId node) const
 {
     return impl_->computed_style(node);
+}
+
+std::optional<ElementGeometry> Page::element_geometry(NodeId node) const
+{
+    return impl_->element_geometry(node);
 }
 
 } // namespace pagecore

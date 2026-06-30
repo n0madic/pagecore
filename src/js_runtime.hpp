@@ -23,6 +23,8 @@ struct ResourceResponse;
 class JsRuntime {
 public:
     using ComputedStyleResolver = std::function<std::optional<ComputedStyle>(NodeId)>;
+    using ElementGeometryResolver = std::function<std::optional<ElementGeometry>(NodeId)>;
+    using ViewportResolver = std::function<Viewport()>;
 
     JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr<ResourceLoader> loader);
     ~JsRuntime();
@@ -46,6 +48,17 @@ public:
     void set_computed_style_resolver(ComputedStyleResolver resolver);
     std::optional<ComputedStyle> computed_style(NodeId node);
 
+    // Injected by Page::Impl so getBoundingClientRect()/offsetWidth/etc. can
+    // read back litehtml's box-model geometry without JsRuntime depending on
+    // Page directly.
+    void set_element_geometry_resolver(ElementGeometryResolver resolver);
+    std::optional<ElementGeometry> element_geometry(NodeId node);
+
+    // Injected by Page::Impl so window.innerWidth/innerHeight/etc. reflect
+    // the most recently used render viewport.
+    void set_viewport_resolver(ViewportResolver resolver);
+    Viewport viewport();
+
 private:
     JSRuntime* runtime_ = nullptr;
     JSContext* context_ = nullptr;
@@ -53,6 +66,8 @@ private:
     LoadOptions options_;
     std::shared_ptr<ResourceLoader> loader_;
     ComputedStyleResolver computed_style_resolver_;
+    ElementGeometryResolver element_geometry_resolver_;
+    ViewportResolver viewport_resolver_;
     std::chrono::steady_clock::time_point deadline_{};
     bool deadline_active_ = false;
 

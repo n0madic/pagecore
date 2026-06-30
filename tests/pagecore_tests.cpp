@@ -4098,6 +4098,251 @@ void test_visual_fixture_regression()
         region_has_close_pixel(image, 12, 930, 760, 54, pagecore::Color{23, 32, 42, 255}, 4),
         "visual fixture footer should be visible and not clipped out of the viewport");
 }
+
+// getBoundingClientRect()/offsetWidth/clientWidth/clientTop etc. read back
+// litehtml's real box-model geometry (see LiteHtmlLayoutEngine::element_geometry
+// and Element.elementGeometry() in 30_dom.js), replacing the old hardcoded
+// zeros. width:100,height:50,padding:10,border:5,margin:20 gives a
+// border-box of 130x80 (100 + 2*10 + 2*5) and a padding-box of 120x70
+// (100 + 2*10); border thickness (5) is clientTop/clientLeft.
+void test_geometry_box_model_apis_reflect_real_layout()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="box" style="width:100px;height:50px;padding:10px;border:5px solid black;margin:20px;"></div>
+  <script>
+    const box = document.getElementById('box');
+    const rect = box.getBoundingClientRect();
+    const rects = box.getClientRects();
+    const checks = [
+      rect.width === 130,
+      rect.height === 80,
+      box.offsetWidth === 130,
+      box.offsetHeight === 80,
+      box.clientWidth === 120,
+      box.clientHeight === 70,
+      box.clientTop === 5,
+      box.clientLeft === 5,
+      box.scrollWidth === box.clientWidth,
+      box.scrollHeight === box.clientHeight,
+      rects.length === 1,
+      rects[0].width === 130 && rects[0].height === 80
+    ];
+    document.body.setAttribute('data-geometry-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-geometry-check='ok']").has_value(),
+        "box-model geometry APIs should reflect the real litehtml layout");
+}
+
+// offsetTop/offsetLeft must be measured relative to offsetParent's
+// border-box, not the viewport — an absolutely positioned child inside a
+// position:relative container offsets exactly by its own top/left.
+void test_geometry_offset_top_left_relative_to_offset_parent()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="container" style="position:relative; width:300px; height:200px; margin:50px;">
+    <div id="child" style="position:absolute; top:10px; left:20px; width:40px; height:30px;"></div>
+  </div>
+  <script>
+    const container = document.getElementById('container');
+    const child = document.getElementById('child');
+    const checks = [
+      child.offsetParent === container,
+      child.offsetTop === 10,
+      child.offsetLeft === 20
+    ];
+    document.body.setAttribute('data-offset-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-offset-check='ok']").has_value(),
+        "offsetTop/offsetLeft should be measured relative to offsetParent, not the viewport");
+}
+
+// offsetParent must walk up to the nearest *positioned* ancestor, not just
+// return parentElement. #target's parentElement is #staticWrapper
+// (position:static), so the old "return this.parentElement" fallback would
+// have gotten this wrong; the real offsetParent is #positioned.
+void test_geometry_offset_parent_finds_nearest_positioned_ancestor()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="positioned" style="position:absolute;">
+    <div id="staticWrapper">
+      <div id="target"></div>
+    </div>
+  </div>
+  <script>
+    const positioned = document.getElementById('positioned');
+    const target = document.getElementById('target');
+    document.body.setAttribute('data-offset-parent-check', target.offsetParent === positioned ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-offset-parent-check='ok']").has_value(),
+        "offsetParent should walk to the nearest positioned ancestor, not just parentElement");
+}
+
+// window.innerWidth/innerHeight/devicePixelRatio (and screen.*) used to be
+// flat values fixed at install() time; they must now reflect whatever
+// viewport the page was most recently rendered with.
+void test_window_viewport_reflects_last_render_options()
+{
+    pagecore::Page page;
+    page.load_html("<html><body></body></html>", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{375, 812, 2.0f};
+    (void) page.display_list(options);
+
+    require(page.eval("window.innerWidth") == "375", "window.innerWidth should reflect the last render viewport");
+    require(page.eval("window.innerHeight") == "812", "window.innerHeight should reflect the last render viewport");
+    require(
+        page.eval("window.devicePixelRatio") == "2",
+        "window.devicePixelRatio should reflect the last render viewport");
+    require(page.eval("window.outerWidth") == "375", "window.outerWidth should mirror the render viewport width");
+    require(
+        page.eval("screen.width === window.innerWidth") == "true",
+        "screen.width should stay in sync with the live viewport, not a stale snapshot");
+}
+
+// Regression: a display:none element has no render_item (layout() skips it
+// entirely), so geometry reads must keep returning zeros, exactly like
+// before this migration — not throw or return stale/garbage geometry.
+void test_geometry_apis_return_zero_for_display_none()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="hidden" style="display:none; width:100px; height:50px;"></div>
+  <script>
+    const hidden = document.getElementById('hidden');
+    const rect = hidden.getBoundingClientRect();
+    const checks = [
+      rect.x === 0,
+      rect.y === 0,
+      rect.width === 0,
+      rect.height === 0,
+      hidden.offsetWidth === 0,
+      hidden.offsetHeight === 0,
+      hidden.clientWidth === 0,
+      hidden.clientHeight === 0,
+      hidden.getClientRects().length === 0
+    ];
+    document.body.setAttribute('data-hidden-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-hidden-check='ok']").has_value(),
+        "geometry APIs should still return zeros for display:none elements");
+}
+
+// Decorates a LayoutEngine to count real layout() passes (distinct from
+// CountingLayoutEngineFactory's engine-creation count above), so the geometry
+// cache-reuse guarantee can be checked directly rather than just inferred.
+class LayoutCallCountingEngine final : public pagecore::LayoutEngine {
+public:
+    LayoutCallCountingEngine(std::unique_ptr<pagecore::LayoutEngine> inner, std::shared_ptr<int> layout_calls)
+        : inner_(std::move(inner))
+        , layout_calls_(std::move(layout_calls))
+    {
+    }
+
+    void set_resource_loader(std::shared_ptr<pagecore::ResourceLoader> loader) override
+    {
+        inner_->set_resource_loader(std::move(loader));
+    }
+    void set_viewport(pagecore::Viewport viewport) override { inner_->set_viewport(viewport); }
+    void load_html(std::string_view html, std::string_view base_url) override { inner_->load_html(html, base_url); }
+    void layout() override
+    {
+        ++(*layout_calls_);
+        inner_->layout();
+    }
+    const pagecore::DisplayList& display_list() const override { return inner_->display_list(); }
+    void compute_styles_only() override { inner_->compute_styles_only(); }
+    std::optional<pagecore::ComputedStyle> computed_style(std::string_view node_key) override
+    {
+        return inner_->computed_style(node_key);
+    }
+    std::optional<pagecore::ElementGeometry> element_geometry(std::string_view node_key) override
+    {
+        return inner_->element_geometry(node_key);
+    }
+
+private:
+    std::unique_ptr<pagecore::LayoutEngine> inner_;
+    std::shared_ptr<int> layout_calls_;
+};
+
+class LayoutCallCountingFactory final : public pagecore::LayoutEngineFactory {
+public:
+    explicit LayoutCallCountingFactory(std::shared_ptr<pagecore::LayoutEngineFactory> inner)
+        : inner_(std::move(inner))
+        , layout_calls(std::make_shared<int>(0))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        return std::make_unique<LayoutCallCountingEngine>(inner_->create_layout_engine(), layout_calls);
+    }
+
+    std::shared_ptr<int> layout_calls;
+
+private:
+    std::shared_ptr<pagecore::LayoutEngineFactory> inner_;
+};
+
+void test_element_geometry_reuses_cached_layout()
+{
+    auto counting = std::make_shared<LayoutCallCountingFactory>(pagecore::create_litehtml_layout_engine_factory());
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(counting);
+    page.load_html(
+        "<html><body><div id='x' style='width:50px;height:20px'>hi</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(*counting->layout_calls == 1, "display_list() should run layout() exactly once");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected to find #x");
+
+    (void) page.element_geometry(box);
+    require(
+        *counting->layout_calls == 1,
+        "element_geometry() after display_list() must reuse the cached layout, not rerun it");
+
+    (void) page.display_list(options);
+    require(
+        *counting->layout_calls == 1,
+        "display_list() after element_geometry() must reuse the cached layout, not rerun it");
+
+    page.eval("document.getElementById('x').setAttribute('style', 'width:70px;height:20px')");
+    (void) page.element_geometry(box);
+    require(
+        *counting->layout_calls == 2,
+        "a DOM mutation must invalidate the cache and force a fresh layout() on next access");
+}
 #endif
 
 } // namespace
@@ -4222,6 +4467,12 @@ int main()
         test_page_render_clips_background_image_to_border_radius();
         test_page_render_hides_noscript_when_javascript_is_enabled();
         test_visual_fixture_regression();
+        test_geometry_box_model_apis_reflect_real_layout();
+        test_geometry_offset_top_left_relative_to_offset_parent();
+        test_geometry_offset_parent_finds_nearest_positioned_ancestor();
+        test_window_viewport_reflects_last_render_options();
+        test_geometry_apis_return_zero_for_display_none();
+        test_element_geometry_reuses_cached_layout();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";

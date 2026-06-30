@@ -178,6 +178,11 @@ struct ComputedStyle {
     std::vector<std::pair<std::string, std::string>> properties;
 };
 
+struct ElementGeometry {
+    Rect border_box; // getBoundingClientRect / offsetWidth,offsetHeight
+    Rect padding_box; // clientWidth,clientHeight (+ clientTop/Left = padding_box - border_box)
+};
+
 class LayoutEngine {
 public:
     virtual ~LayoutEngine() = default;
@@ -195,6 +200,17 @@ public:
     // marker attribute) and reads back its computed style. Default
     // implementation is for engines without read-back support.
     virtual std::optional<ComputedStyle> computed_style(std::string_view node_key)
+    {
+        (void) node_key;
+        return std::nullopt;
+    }
+
+    // Looks up a single element by the same engine-defined key and reads
+    // back its box-model geometry from the last layout() pass. Returns
+    // nullopt if the element doesn't participate in layout (display:none,
+    // or layout() hasn't run yet). Default implementation is for engines
+    // without read-back support.
+    virtual std::optional<ElementGeometry> element_geometry(std::string_view node_key)
     {
         (void) node_key;
         return std::nullopt;

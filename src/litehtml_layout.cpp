@@ -5,6 +5,7 @@
 
 #include <cairo.h>
 #include <litehtml.h>
+#include <litehtml/render_item.h>
 #include <pango/pangocairo.h>
 
 #include <algorithm>
@@ -784,18 +785,53 @@ public:
         }
         ensure_styles_computed();
 
-        std::string selector = "[data-pc-sid=\"";
-        selector += node_key;
-        selector += "\"]";
-
-        auto element = document_->root()->select_one(selector);
+        auto element = find_tagged_element(node_key);
         if (!element) {
             return std::nullopt;
         }
         return ComputedStyle{computed_style_properties(element)};
     }
 
+    std::optional<ElementGeometry> element_geometry(std::string_view node_key) override
+    {
+        if (!document_) {
+            return std::nullopt;
+        }
+
+        auto element = find_tagged_element(node_key);
+        if (!element) {
+            return std::nullopt;
+        }
+
+        auto render_item = element->get_render_item();
+        if (!render_item) {
+            // No layout() pass has run yet, or the element is display:none.
+            return std::nullopt;
+        }
+
+        litehtml::position content = render_item->get_placement();
+        litehtml::position padding_box = content;
+        padding_box += render_item->get_paddings();
+        litehtml::position border_box = padding_box;
+        border_box += render_item->get_borders();
+
+        return ElementGeometry{rect_from(border_box), rect_from(padding_box)};
+    }
+
 private:
+    litehtml::element::ptr find_tagged_element(std::string_view node_key)
+    {
+        if (!document_) {
+            return nullptr;
+        }
+
+        std::string selector = "[data-pc-sid=\"";
+        selector += node_key;
+        selector += "\"]";
+
+        return document_->root()->select_one(selector);
+    }
+
     void ensure_styles_computed()
     {
         if (!styles_computed_ && document_) {

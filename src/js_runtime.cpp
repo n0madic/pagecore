@@ -523,6 +523,40 @@ JSValue bridge_computed_style(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue bridge_element_geometry(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("elementGeometry requires a node id");
+        auto geometry = js.element_geometry(to_node_id(ctx, argv[0]));
+        if (!geometry) {
+            return JS_NULL;
+        }
+
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "borderX", JS_NewFloat64(ctx, geometry->border_box.x));
+        JS_SetPropertyStr(ctx, result, "borderY", JS_NewFloat64(ctx, geometry->border_box.y));
+        JS_SetPropertyStr(ctx, result, "borderWidth", JS_NewFloat64(ctx, geometry->border_box.width));
+        JS_SetPropertyStr(ctx, result, "borderHeight", JS_NewFloat64(ctx, geometry->border_box.height));
+        JS_SetPropertyStr(ctx, result, "paddingX", JS_NewFloat64(ctx, geometry->padding_box.x));
+        JS_SetPropertyStr(ctx, result, "paddingY", JS_NewFloat64(ctx, geometry->padding_box.y));
+        JS_SetPropertyStr(ctx, result, "paddingWidth", JS_NewFloat64(ctx, geometry->padding_box.width));
+        JS_SetPropertyStr(ctx, result, "paddingHeight", JS_NewFloat64(ctx, geometry->padding_box.height));
+        return result;
+    });
+}
+
+JSValue bridge_viewport(JSContext* ctx, JSValue, int, JSValue*)
+{
+    return bridge_call(ctx, [ctx](JsRuntime& js) {
+        const Viewport viewport = js.viewport();
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "width", JS_NewFloat64(ctx, viewport.width));
+        JS_SetPropertyStr(ctx, result, "height", JS_NewFloat64(ctx, viewport.height));
+        JS_SetPropertyStr(ctx, result, "deviceScaleFactor", JS_NewFloat64(ctx, viewport.device_scale_factor));
+        return result;
+    });
+}
+
 JSValue bridge_get_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -881,6 +915,8 @@ void JsRuntime::install()
     set_function(context_, dom, "mutationVersion", bridge_mutation_version, 0);
     set_function(context_, dom, "forgetVersion", bridge_forget_version, 0);
     set_function(context_, dom, "computedStyle", bridge_computed_style, 1);
+    set_function(context_, dom, "elementGeometry", bridge_element_geometry, 1);
+    set_function(context_, dom, "viewport", bridge_viewport, 0);
     set_function(context_, dom, "getAttribute", bridge_get_attribute, 2);
     set_function(context_, dom, "hasAttribute", bridge_has_attribute, 2);
     set_function(context_, dom, "attributes", bridge_attributes, 1);
@@ -1044,6 +1080,32 @@ std::optional<ComputedStyle> JsRuntime::computed_style(NodeId node)
         return std::nullopt;
     }
     return computed_style_resolver_(node);
+}
+
+void JsRuntime::set_element_geometry_resolver(ElementGeometryResolver resolver)
+{
+    element_geometry_resolver_ = std::move(resolver);
+}
+
+std::optional<ElementGeometry> JsRuntime::element_geometry(NodeId node)
+{
+    if (!element_geometry_resolver_) {
+        return std::nullopt;
+    }
+    return element_geometry_resolver_(node);
+}
+
+void JsRuntime::set_viewport_resolver(ViewportResolver resolver)
+{
+    viewport_resolver_ = std::move(resolver);
+}
+
+Viewport JsRuntime::viewport()
+{
+    if (!viewport_resolver_) {
+        return Viewport{};
+    }
+    return viewport_resolver_();
 }
 
 ResourceResponse JsRuntime::load_resource(std::string_view url, std::string_view kind)

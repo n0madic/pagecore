@@ -15,7 +15,7 @@
     name: 'install',
     deps: ['core', 'events', 'dom', 'web', 'forms', 'streams', 'compat'],
     install(ctx, api) {
-      const { global, host } = ctx;
+      const { global, host, bridge } = ctx;
       const { defineValue, setDocumentReadyState } = api.core;
       const {
         DOMException,
@@ -397,16 +397,27 @@
           getRandomValues,
           randomUUID
         };
-        global.innerWidth = 1024;
-        global.innerHeight = 768;
-        global.outerWidth = 1024;
-        global.outerHeight = 768;
-        global.devicePixelRatio = 1;
+        const defaultViewport = { width: 1280, height: 720, deviceScaleFactor: 1 };
+        function currentViewport() {
+          try {
+            return bridge.viewport();
+          } catch (_viewportError) {
+            return defaultViewport;
+          }
+        }
+        Object.defineProperty(global, 'innerWidth', { configurable: true, get: () => currentViewport().width });
+        Object.defineProperty(global, 'innerHeight', { configurable: true, get: () => currentViewport().height });
+        Object.defineProperty(global, 'outerWidth', { configurable: true, get: () => currentViewport().width });
+        Object.defineProperty(global, 'outerHeight', { configurable: true, get: () => currentViewport().height });
+        Object.defineProperty(global, 'devicePixelRatio', {
+          configurable: true,
+          get: () => currentViewport().deviceScaleFactor
+        });
         global.screen = {
-          width: global.innerWidth,
-          height: global.innerHeight,
-          availWidth: global.innerWidth,
-          availHeight: global.innerHeight,
+          get width() { return currentViewport().width; },
+          get height() { return currentViewport().height; },
+          get availWidth() { return currentViewport().width; },
+          get availHeight() { return currentViewport().height; },
           colorDepth: 24,
           pixelDepth: 24,
           orientation: {
