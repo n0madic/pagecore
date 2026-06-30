@@ -43,6 +43,15 @@ for (const file of files) {
   runNode([file]);
 }
 
+// Every known module (plus the runtime and boot files) must be present in the
+// input set; silently omitting one would let a dependency regression pass.
+const requiredFiles = new Set(['00_runtime.js', '99_boot.js', ...expected.keys()]);
+const providedFiles = new Set(files.map((file) => path.basename(file)));
+const missing = [...requiredFiles].filter((name) => !providedFiles.has(name));
+if (missing.length > 0) {
+  throw new Error(`Missing DOM shim module file(s): ${missing.join(', ')}`);
+}
+
 for (const file of files) {
   const base = path.basename(file);
   const exported = require(file);

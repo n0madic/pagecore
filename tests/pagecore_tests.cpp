@@ -1,5 +1,6 @@
 #include "pagecore/image_io.hpp"
 #include "pagecore/image_decoder.hpp"
+#include "pagecore/dom.hpp"
 #include "pagecore/page.hpp"
 #include "pagecore/render.hpp"
 #include "pagecore/resource_loader.hpp"
@@ -11,13 +12,16 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -2017,7 +2021,9 @@ void test_curl_resource_loader_decodes_gzip_content_encoding()
             {"Content-Type", "application/javascript"},
         });
 
-    pagecore::CurlResourceLoader loader("pagecore-test");
+    pagecore::ResourcePolicy localhost_policy;
+    localhost_policy.block_private_hosts = false; // test server binds 127.0.0.1
+    pagecore::CurlResourceLoader loader("pagecore-test", localhost_policy);
     const auto response = loader.load(pagecore::ResourceRequest{
         server.url(),
         pagecore::ResourceKind::Script,
@@ -2092,6 +2098,7 @@ void test_curl_resource_loader_revalidates_redirect_policy()
 
     pagecore::ResourcePolicy same_origin;
     same_origin.same_origin_only = true;
+    same_origin.block_private_hosts = false; // test servers bind 127.0.0.1
     pagecore::CurlResourceLoader loader("pagecore-test", same_origin);
     require_resource_error(
         pagecore::ResourceErrorCode::SameOriginViolation,
@@ -2104,6 +2111,208 @@ void test_curl_resource_loader_revalidates_redirect_policy()
             });
         },
         "same-origin policy should reject cross-origin redirect effective URLs");
+}
+
+void test_resource_policy_blocks_private_hosts()
+{
+    pagecore::CurlResourceLoader loader("pagecore-test"); // default: block_private_hosts = true
+    const char* blocked_urls[] = {
+        "http://127.0.0.1/x",
+        "http://localhost/x",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/x",
+        "http://10.0.0.1/x",
+        "http://192.168.1.1/x",
+        "http://172.16.0.1/x",
+    };
+    for (const char* url : blocked_urls) {
+        require_resource_error(
+            pagecore::ResourceErrorCode::BlockedHost,
+            [&] { (void) loader.load(pagecore::ResourceRequest{url, pagecore::ResourceKind::Script}); },
+            std::string("private/loopback/link-local host should be blocked: ") + url);
+    }
+
+    pagecore::ResourcePolicy custom;
+    custom.block_private_hosts = false;
+    custom.blocked_hosts = {"evil.test"};
+    pagecore::CurlResourceLoader custom_loader("pagecore-test", custom);
+    require_resource_error(
+        pagecore::ResourceErrorCode::BlockedHost,
+        [&] {
+            (void) custom_loader.load(pagecore::ResourceRequest{
+                "http://evil.test/x", pagecore::ResourceKind::Script});
+        },
+        "explicitly blocked host should be rejected");
+}
+
+void test_resource_scheme_not_allowed()
+{
+    pagecore::CurlResourceLoader loader("pagecore-test");
+    require_resource_error(
+        pagecore::ResourceErrorCode::SchemeNotAllowed,
+        [&] {
+            (void) loader.load(pagecore::ResourceRequest{
+                "ftp://example.test/x", pagecore::ResourceKind::Other});
+        },
+        "non-allowlisted scheme should be rejected");
+}
+
+void test_resource_file_sandbox()
+{
+    const std::filesystem::path root = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_sandbox_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "sub");
+    const std::filesystem::path inside = root / "sub" / "inside.txt";
+    const std::filesystem::path outside = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_sandbox_outside.txt";
+    {
+        std::ofstream(inside, std::ios::binary) << "INSIDE";
+        std::ofstream(outside, std::ios::binary) << "OUTSIDE";
+    }
+
+    pagecore::ResourcePolicy policy;
+    policy.file_root = root.string();
+    pagecore::CurlResourceLoader loader("pagecore-test", policy);
+
+    const auto ok = loader.load(pagecore::ResourceRequest{"file://" + inside.string(), pagecore::ResourceKind::Other});
+    require(ok.body == "INSIDE", "file inside sandbox root should be readable");
+
+    require_resource_error(
+        pagecore::ResourceErrorCode::FileDisabled,
+        [&] {
+            (void) loader.load(pagecore::ResourceRequest{
+                "file://" + outside.string(), pagecore::ResourceKind::Other});
+        },
+        "file outside sandbox root should be rejected");
+
+    require_resource_error(
+        pagecore::ResourceErrorCode::FileDisabled,
+        [&] {
+            (void) loader.load(pagecore::ResourceRequest{
+                "file://" + (root / "sub" / ".." / ".." / "pagecore_sandbox_outside.txt").string(),
+                pagecore::ResourceKind::Other});
+        },
+        "traversal out of sandbox root should be rejected");
+
+    require_resource_error(
+        pagecore::ResourceErrorCode::NotFound,
+        [&] {
+            (void) loader.load(pagecore::ResourceRequest{
+                "file://" + root.string(), pagecore::ResourceKind::Other});
+        },
+        "non-regular file (directory) should be rejected");
+
+    pagecore::ResourcePolicy tiny = policy;
+    tiny.max_response_bytes = 3;
+    pagecore::CurlResourceLoader tiny_loader("pagecore-test", tiny);
+    require_resource_error(
+        pagecore::ResourceErrorCode::TooLarge,
+        [&] {
+            (void) tiny_loader.load(pagecore::ResourceRequest{
+                "file://" + inside.string(), pagecore::ResourceKind::Other});
+        },
+        "file exceeding max_response_bytes should be rejected before slurping");
+
+    std::filesystem::remove_all(root);
+    std::filesystem::remove(outside);
+}
+
+void test_resource_relative_file_url()
+{
+    // Regression: "file://sub/f.txt" must resolve to the relative path "sub/f.txt"
+    // (PageCore builds file URLs as file:// + path), not be misread as host=sub
+    // yielding "/f.txt".
+    const std::filesystem::path saved = std::filesystem::current_path();
+    const std::filesystem::path root = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_relfile_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "sub");
+    std::ofstream(root / "sub" / "f.txt", std::ios::binary) << "REL";
+
+    std::filesystem::current_path(root);
+    try {
+        pagecore::CurlResourceLoader loader("pagecore-test");
+        const auto resp = loader.load(pagecore::ResourceRequest{
+            "file://sub/f.txt", pagecore::ResourceKind::Other});
+        require(resp.body == "REL",
+                "relative file:// path must resolve relative to the working directory");
+    } catch (...) {
+        std::filesystem::current_path(saved);
+        std::filesystem::remove_all(root);
+        throw;
+    }
+    std::filesystem::current_path(saved);
+    std::filesystem::remove_all(root);
+}
+
+void test_resource_blocks_file_from_network_origin()
+{
+    const std::filesystem::path file = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_local_secret.txt";
+    std::ofstream(file, std::ios::binary) << "SECRET";
+    const std::string url = "file://" + file.string();
+
+    pagecore::CurlResourceLoader loader("pagecore-test"); // allow_file_from_network = false
+    require_resource_error(
+        pagecore::ResourceErrorCode::FileDisabled,
+        [&] {
+            (void) loader.load(pagecore::ResourceRequest{
+                url, pagecore::ResourceKind::Other, "https://evil.test/page.html", "https://evil.test/page.html"});
+        },
+        "remote page must not read local files via file://");
+
+    const auto top_level = loader.load(pagecore::ResourceRequest{url, pagecore::ResourceKind::Document});
+    require(top_level.body == "SECRET", "top-level file:// load (no network initiator) should succeed");
+
+    pagecore::ResourcePolicy permissive;
+    permissive.allow_file_from_network = true;
+    pagecore::CurlResourceLoader permissive_loader("pagecore-test", permissive);
+    const auto allowed = permissive_loader.load(pagecore::ResourceRequest{
+        url, pagecore::ResourceKind::Other, "https://evil.test/page.html", "https://evil.test/page.html"});
+    require(allowed.body == "SECRET", "allow_file_from_network should re-enable file:// from network origin");
+
+    std::filesystem::remove(file);
+}
+
+void test_caching_loader_bounds_and_skips_errors()
+{
+    auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
+    memory->add("https://example.test/a", "A", "text/plain");
+    memory->add("https://example.test/b", "B", "text/plain");
+    memory->add("https://example.test/c", "C", "text/plain");
+
+    pagecore::CachingResourceLoader cache(memory, 2);
+    (void) cache.load(pagecore::ResourceRequest{"https://example.test/a"});
+    (void) cache.load(pagecore::ResourceRequest{"https://example.test/b"});
+    (void) cache.load(pagecore::ResourceRequest{"https://example.test/c"});
+    require(cache.size() <= 2, "caching loader should bound its cache size");
+
+    // Missing resources throw (transport-style); the failure must not be cached.
+    require_resource_error(
+        pagecore::ResourceErrorCode::NotFound,
+        [&] { (void) cache.load(pagecore::ResourceRequest{"https://example.test/missing"}); },
+        "missing resource should surface NotFound");
+    bool second_throws = false;
+    try {
+        (void) cache.load(pagecore::ResourceRequest{"https://example.test/missing"});
+    } catch (const pagecore::ResourceError&) {
+        second_throws = true;
+    }
+    require(second_throws, "thrown errors must not be cached as success");
+}
+
+void test_native_bridge_not_exposed_to_page()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!doctype html>
+<html><body><div id="x"></div><script>document.getElementById('x').textContent='ok';</script></body></html>
+)HTML");
+    require(page.eval("typeof window.__host") == "undefined",
+            "native host bridge must not be reachable from page script");
+    require(page.eval("typeof window.__dom") == "undefined",
+            "native dom bridge must not be reachable from page script");
+    require(page.eval("typeof document") == "object",
+            "document shim should still be available to page script");
+    auto text = page.text_content("#x");
+    require(text && *text == "ok", "shim should still mediate DOM access after bridge removal");
 }
 
 #if defined(PAGECORE_ENABLE_RENDERING)
@@ -2409,7 +2618,180 @@ void test_svg_decoder_rgba()
     require(path->rgba[4 * (static_cast<std::size_t>(4) * 8 + 4) + 1] > 120,
             "SVG decoder should rasterize basic path data");
 }
+
+void test_svg_path_parser_terminates_on_malformed_input()
+{
+    // Each of these previously caused an infinite loop in the path parser
+    // (no forward progress on unrecognized tokens). They must now terminate
+    // and still yield a placeholder image of the declared dimensions.
+    const char* malformed[] = {
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><path d="z@" fill="#0a0"/></svg>)SVG",
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><path d="M0 0;" fill="#0a0"/></svg>)SVG",
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><path d="M1 1 ? L 2 2 @ # z !!!" fill="#0a0"/></svg>)SVG",
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><path d="ZZZ@@@(((" fill="#0a0"/></svg>)SVG",
+    };
+    for (const char* svg : malformed) {
+        const auto decoded = pagecore::decode_image_rgba(svg);
+        require(decoded != nullptr && decoded->width == 8 && decoded->height == 8,
+                "malformed SVG path data must terminate and produce a placeholder image");
+    }
+}
+
+void test_svg_decoder_rejects_huge_dimensions()
+{
+    require_runtime_error_contains(
+        [&] {
+            (void) pagecore::decode_svg_rgba(
+                R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="100000"></svg>)SVG");
+        },
+        "too large",
+        "SVG decoder should enforce the decode byte budget before allocating the cairo surface");
+}
+
+void test_cairo_raster_handles_nonfinite_coordinates()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{32, 32, 1.0f};
+    const float nan_value = std::numeric_limits<float>::quiet_NaN();
+    const float inf_value = std::numeric_limits<float>::infinity();
+
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{nan_value, inf_value, 1e30f, -inf_value},
+        pagecore::Color{10, 20, 30, 255},
+        false,
+    });
+    pagecore::LinearGradientCommand gradient;
+    gradient.rect = pagecore::Rect{0, 0, 32, 32};
+    gradient.start = pagecore::Point{nan_value, 0};
+    gradient.end = pagecore::Point{inf_value, 10};
+    gradient.stops.push_back(pagecore::GradientStop{0.0f, pagecore::Color{0, 0, 0, 255}});
+    gradient.stops.push_back(pagecore::GradientStop{1.0f, pagecore::Color{255, 255, 255, 255}});
+    display_list.commands.emplace_back(gradient);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list); // must not crash or invoke UB
+    require(image.width == 32 && image.height == 32,
+            "raster must survive NaN/Inf coordinates without UB");
+
+    const std::string json = pagecore::display_list_to_json(display_list);
+    require(json.find("nan") == std::string::npos
+                && json.find("inf") == std::string::npos
+                && json.find("NaN") == std::string::npos,
+            "display-list JSON must not emit non-finite tokens");
+}
+
+void test_background_tiling_is_bounded()
+{
+    auto tile_image = std::make_shared<pagecore::DecodedImage>();
+    tile_image->width = 1;
+    tile_image->height = 1;
+    tile_image->rgba = {0, 128, 255, 255};
+
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{64, 64, 1.0f};
+    pagecore::ImageCommand command;
+    command.rect = pagecore::Rect{0, 0, 2000.0f, 2000000.0f}; // enormous element box
+    command.tile = pagecore::Rect{0, 0, 1.0f, 1.0f};          // 1px tile
+    command.repeat = pagecore::ImageRepeat::Repeat;
+    command.image = tile_image;
+    display_list.commands.emplace_back(command);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list); // ~4e9 tiles before the fix; bounded now
+    require(image.width == 64 && image.height == 64,
+            "tiling must be bounded by the surface, not the element box");
+    require(pixel_matches(image, 10, 10, pagecore::Color{0, 128, 255, 255}),
+            "bounded tiling should still fill the visible area");
+}
+
+void test_image_decoder_rejects_malformed_input()
+{
+    const auto expect_throws = [](std::string_view bytes, const char* what) {
+        bool threw = false;
+        try {
+            (void) pagecore::decode_image_rgba(bytes);
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        require(threw, std::string("decode_image_rgba must reject malformed input without crashing: ") + what);
+    };
+
+    expect_throws("", "empty input");
+    expect_throws("this is definitely not an image at all", "non-image bytes");
+
+    const auto png = png_body(pagecore::Color{10, 20, 30, 255});
+    expect_throws(std::string_view(png).substr(0, png.size() / 3), "truncated PNG");
+    const auto jpeg = jpeg_body(pagecore::Color{10, 20, 30, 255});
+    expect_throws(std::string_view(jpeg).substr(0, jpeg.size() / 3), "truncated JPEG");
+    const auto gif = gif_body();
+    expect_throws(std::string_view(gif).substr(0, gif.size() / 3), "truncated GIF");
+    const auto webp = webp_body(pagecore::Color{10, 20, 30, 255});
+    expect_throws(std::string_view(webp).substr(0, webp.size() / 3), "truncated WebP");
+}
+
+void test_cairo_raster_and_io_error_paths()
+{
+    // An oversized surface (beyond Cairo's dimension limit) must fail cleanly
+    // rather than proceed with an error-state surface.
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{100000, 100000, 1.0f};
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{0, 0, 10, 10}, pagecore::Color{0, 0, 0, 255}, false});
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    bool render_threw = false;
+    try {
+        (void) raster->render(display_list);
+    } catch (const std::exception&) {
+        render_threw = true;
+    }
+    require(render_threw, "rendering an oversized surface must throw, not read an error-state surface");
+
+    // Writing a PNG to an unwritable path must throw cleanly.
+    pagecore::RenderedImage image;
+    image.width = 2;
+    image.height = 2;
+    image.rgba.assign(static_cast<std::size_t>(2 * 2 * 4), 255);
+    bool write_threw = false;
+    try {
+        pagecore::write_png_rgba(image, "/pagecore-nonexistent-directory/out.png");
+    } catch (const std::exception&) {
+        write_threw = true;
+    }
+    require(write_threw, "writing a PNG to an unwritable path must throw");
+}
 #endif
+
+void test_deep_dom_traversal_is_iterative()
+{
+    // Build a deep tree directly through the DOM API (no JS / HTML parse
+    // overhead) to exercise the now-iterative traversals. Lexbor's own deep-tree
+    // operations are super-linear, so the depth is kept moderate; the iterative
+    // rewrite removes the native-stack depth limit regardless of this value.
+    pagecore::DomDocument doc;
+    doc.parse("<html><body></body></html>");
+    const pagecore::NodeId body = doc.body();
+    const pagecore::NodeId root = doc.create_element("div");
+    doc.append_child(body, root);
+
+    const int depth = 15000;
+    pagecore::NodeId cur = root;
+    for (int i = 0; i < depth; ++i) {
+        const pagecore::NodeId child = doc.create_element("div");
+        doc.append_child(cur, child);
+        cur = child;
+    }
+    doc.append_child(cur, doc.create_text_node("deep"));
+
+    // append_descendant_text over a 200000-deep subtree (was recursive).
+    const std::string content = doc.text_content(root);
+    require(content.find("deep") != std::string::npos,
+            "text_content over a deeply nested tree must not overflow the native stack");
+
+    // collect_subtree via set_inner_html over the deep subtree (was recursive).
+    doc.set_inner_html(root, "<span>x</span>");
+    require(doc.query_selector(root, "span") != pagecore::kInvalidNodeId,
+            "set_inner_html over a deep subtree must not overflow the native stack");
+}
 
 void test_eval_api()
 {
@@ -2417,6 +2799,193 @@ void test_eval_api()
     page.load_html("<html><body><main id='m'>x</main></body></html>");
     const auto result = page.eval("document.getElementById('m').textContent");
     require(result == "x", "Page::eval should return stringified JS values");
+}
+
+void test_event_capture_bubble_phases()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(<html><body>
+      <div id="root"><div id="mid"><div id="leaf"></div></div></div>
+    </body></html>)HTML");
+
+    const auto order = page.eval(R"JS((() => {
+      const log = [];
+      const root = document.getElementById('root');
+      const mid = document.getElementById('mid');
+      const leaf = document.getElementById('leaf');
+      root.addEventListener('x', () => log.push('root-capture'), true);
+      root.addEventListener('x', () => log.push('root-bubble'), false);
+      mid.addEventListener('x', () => log.push('mid-capture'), true);
+      leaf.addEventListener('x', () => log.push('leaf-target'));
+      leaf.dispatchEvent(new CustomEvent('x', { bubbles: true }));
+      return log.join(',');
+    })())JS");
+    require(order == "root-capture,mid-capture,leaf-target,root-bubble",
+            "event must run capture (root->target), then target, then bubble");
+
+    const auto non_bubbling = page.eval(R"JS((() => {
+      const log = [];
+      document.getElementById('root').addEventListener('y', () => log.push('root-capture'), true);
+      document.getElementById('leaf').addEventListener('y', () => log.push('leaf'));
+      document.getElementById('leaf').dispatchEvent(new Event('y'));
+      return log.join(',');
+    })())JS");
+    require(non_bubbling == "root-capture,leaf",
+            "capture phase must reach ancestor listeners even for non-bubbling events");
+
+    const auto detached = page.eval(R"JS((() => {
+      let reached = false;
+      window.addEventListener('z', () => { reached = true; });
+      const d = document.createElement('div');
+      d.dispatchEvent(new CustomEvent('z', { bubbles: true }));
+      return reached ? 'reached' : 'not-reached';
+    })())JS");
+    require(detached == "not-reached",
+            "a detached node's event must not propagate to window");
+
+    const auto redispatch = page.eval(R"JS((() => {
+      let count = 0;
+      let first = true;
+      const e = new CustomEvent('r', { bubbles: true });
+      const root = document.getElementById('root');
+      const leaf = document.getElementById('leaf');
+      leaf.addEventListener('r', (ev) => { if (first) ev.stopPropagation(); });
+      root.addEventListener('r', () => { count++; });
+      leaf.dispatchEvent(e); first = false; // root blocked -> 0
+      leaf.dispatchEvent(e);                 // re-dispatch, not stopped -> 1
+      return String(count);
+    })())JS");
+    require(redispatch == "1",
+            "re-dispatching an Event must reset stop-propagation state");
+}
+
+void test_mutation_observer_old_value()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(<html><body><div id="t" data-x="old"></div></body></html>)HTML");
+
+    const auto with_old = page.eval(R"JS((() => {
+      const el = document.getElementById('t');
+      const obs = new MutationObserver(() => {});
+      obs.observe(el, { attributes: true, attributeOldValue: true });
+      el.setAttribute('data-x', 'new');
+      const recs = obs.takeRecords();
+      return recs.length === 1 && recs[0].type === 'attributes'
+        && recs[0].attributeName === 'data-x' && recs[0].oldValue === 'old'
+        ? 'ok' : JSON.stringify(recs.map(r => r.oldValue));
+    })())JS");
+    require(with_old == "ok",
+            "MutationObserver should report attribute oldValue when requested");
+
+    const auto without_old = page.eval(R"JS((() => {
+      const el = document.getElementById('t');
+      const obs = new MutationObserver(() => {});
+      obs.observe(el, { attributes: true });
+      el.setAttribute('data-x', 'newer');
+      const recs = obs.takeRecords();
+      return recs.length === 1 && recs[0].oldValue === null ? 'ok' : 'bad';
+    })())JS");
+    require(without_old == "ok",
+            "MutationObserver must null oldValue when attributeOldValue was not requested");
+}
+
+void test_js_runtime_robust_exception_paths()
+{
+    pagecore::Page page;
+    page.load_html("<html><body></body></html>");
+    // A throwing toString must not leave a dangling pending exception.
+    const auto bad = page.eval("({ toString() { throw new Error('boom'); } })");
+    require(bad.empty(), "evaluate should return empty string when stringification throws");
+    const auto ok = page.eval("1 + 1");
+    require(ok == "2", "a prior stringification failure must not corrupt later evaluation");
+
+    // Throwing a non-object must surface cleanly (no crash from reading .stack).
+    pagecore::Page page2;
+    bool threw = false;
+    try {
+        page2.load_html("<html><body><script>throw null;</script></body></html>");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    require(threw, "throwing a non-object should surface as an error, not crash");
+}
+
+void test_web_shim_crypto_url_input()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(<html><body>
+      <form id="f"><input id="inp" value="default"></form>
+    </body></html>)HTML");
+
+    // crypto must be CSPRNG-backed (host.randomBytes), producing valid, unique
+    // v4 UUIDs rather than Math.random output.
+    const auto uuid = page.eval(R"JS((() => {
+      const re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      const a = crypto.randomUUID();
+      const b = crypto.randomUUID();
+      const arr = new Uint8Array(16);
+      crypto.getRandomValues(arr);
+      return re.test(a) && re.test(b) && a !== b && arr.length === 16 ? 'ok' : 'bad';
+    })())JS");
+    require(uuid == "ok", "crypto.randomUUID/getRandomValues must use the host CSPRNG");
+
+    // url.searchParams must be live: mutations reflect back into search/href.
+    const auto sp = page.eval(R"JS((() => {
+      const u = new URL('https://a.test/?x=1');
+      u.searchParams.append('y', '2');
+      u.searchParams.set('x', '3');
+      return u.search === '?x=3&y=2' && u.href === 'https://a.test/?x=3&y=2'
+        ? 'ok' : ('search=' + u.search + ' href=' + u.href);
+    })())JS");
+    require(sp == "ok", "URL.searchParams must stay synced with search/href");
+
+    // input value uses the dirty-value flag, separate from the content attribute.
+    const auto input = page.eval(R"JS((() => {
+      const inp = document.getElementById('inp');
+      const before = inp.value;
+      inp.value = 'typed';
+      const after = inp.value;
+      const dv = inp.defaultValue;
+      const serialized = inp.outerHTML;
+      document.getElementById('f').reset();
+      const reset = inp.value;
+      return (before === 'default' && after === 'typed' && dv === 'default'
+        && !serialized.includes('typed') && reset === 'default') ? 'ok'
+        : JSON.stringify({ before, after, dv, serialized, reset });
+    })())JS");
+    require(input == "ok",
+            "input value must be separate from defaultValue and restored by reset");
+}
+
+void test_streams_writable_controller_and_tee()
+{
+    pagecore::Page page;
+    page.load_html("<html><body></body></html>");
+
+    const auto controller = page.eval(R"JS((() => {
+      let ok = false;
+      new WritableStream({ start(c) { ok = c && typeof c.error === 'function'; } });
+      return ok ? 'ok' : 'bad';
+    })())JS");
+    require(controller == "ok", "WritableStream must pass a controller to sink.start");
+
+    // tee both branches; reading one fully should yield the source chunks and
+    // must not throw or leave an unhandled rejection.
+    page.eval(R"JS((() => {
+      window.__tee = '';
+      const rs = new ReadableStream({ start(c) { c.enqueue('a'); c.enqueue('b'); c.close(); } });
+      const [b1, b2] = rs.tee();
+      (async () => {
+        const reader = b1.getReader();
+        let out = '';
+        for (;;) { const r = await reader.read(); if (r.done) break; out += r.value; }
+        window.__tee = out;
+      })();
+      return 'started';
+    })())JS");
+    page.run_until_idle();
+    const auto tee = page.eval("window.__tee");
+    require(tee == "ab", "ReadableStream.tee must deliver source chunks to a branch");
 }
 
 void test_js_exception_message_includes_source_name()
@@ -3149,6 +3718,13 @@ int main()
         test_curl_resource_loader_decodes_gzip_content_encoding();
         test_resource_policy_errors();
         test_curl_resource_loader_revalidates_redirect_policy();
+        test_resource_policy_blocks_private_hosts();
+        test_resource_scheme_not_allowed();
+        test_resource_file_sandbox();
+        test_resource_relative_file_url();
+        test_resource_blocks_file_from_network_origin();
+        test_caching_loader_bounds_and_skips_errors();
+        test_native_bridge_not_exposed_to_page();
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_cairo_raster_backend();
         test_cairo_raster_rounded_border_uses_inner_curve();
@@ -3164,8 +3740,20 @@ int main()
         test_webp_decoder_rejects_huge_dimensions();
         test_gif_decoder_rgba();
         test_svg_decoder_rgba();
+        test_svg_path_parser_terminates_on_malformed_input();
+        test_svg_decoder_rejects_huge_dimensions();
+        test_cairo_raster_handles_nonfinite_coordinates();
+        test_background_tiling_is_bounded();
+        test_image_decoder_rejects_malformed_input();
+        test_cairo_raster_and_io_error_paths();
 #endif
+        test_deep_dom_traversal_is_iterative();
         test_eval_api();
+        test_event_capture_bubble_phases();
+        test_mutation_observer_old_value();
+        test_js_runtime_robust_exception_paths();
+        test_web_shim_crypto_url_input();
+        test_streams_writable_controller_and_tee();
         test_js_exception_message_includes_source_name();
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_page_display_list_pipeline_with_external_css();

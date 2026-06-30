@@ -124,29 +124,57 @@
 
         tee() {
           const reader = this.getReader();
+          const source = this;
           const branches = [null, null];
+          const cancelled = [false, false];
+          const reasons = [undefined, undefined];
 
-          branches[0] = new ReadableStream({
-            start(controller) { this._controller = controller; }
+          const cancelSource = (reason) => {
+            source._queue.length = 0;
+            closeReadableStream(source);
+            if (source._cancelAlgorithm) {
+              try { resolvePromise(source._cancelAlgorithm(reason)); } catch (_cancelError) {}
+            }
+          };
+
+          const makeUnderlyingSource = (index) => ({
+            cancel(reason) {
+              cancelled[index] = true;
+              reasons[index] = reason;
+              if (cancelled[0] && cancelled[1]) {
+                cancelSource(reasons[0]);
+              }
+              return Promise.resolve();
+            }
           });
-          branches[1] = new ReadableStream({
-            start(controller) { this._controller = controller; }
-          });
+
+          branches[0] = new ReadableStream(makeUnderlyingSource(0));
+          branches[1] = new ReadableStream(makeUnderlyingSource(1));
+
+          // Only act on a branch whose controller is still readable; a cancelled
+          // branch's controller would throw on enqueue/close.
+          const toReadable = (branch, fn) => {
+            if (branch._state === 'readable') {
+              try { fn(branch._controller); } catch (_branchError) {}
+            }
+          };
 
           const pump = () => reader.read().then((result) => {
             if (result.done) {
-              branches[0]._controller.close();
-              branches[1]._controller.close();
+              toReadable(branches[0], (c) => c.close());
+              toReadable(branches[1], (c) => c.close());
               return undefined;
             }
-            branches[0]._controller.enqueue(result.value);
-            branches[1]._controller.enqueue(result.value);
+            toReadable(branches[0], (c) => c.enqueue(result.value));
+            toReadable(branches[1], (c) => c.enqueue(result.value));
+            if (cancelled[0] && cancelled[1]) return undefined;
             return pump();
           }, (error) => {
-            branches[0]._controller.error(error);
-            branches[1]._controller.error(error);
+            toReadable(branches[0], (c) => c.error(error));
+            toReadable(branches[1], (c) => c.error(error));
           });
-          pump();
+          // Avoid an unhandled rejection if the pump chain rejects.
+          pump().catch(() => {});
           return branches;
         }
 
@@ -253,9 +281,20 @@
           this._sink = underlyingSink || {};
           this._state = 'writable';
           this._writer = null;
+          this._storedError = undefined;
+          // Provide a controller so sinks that call controller.error(...) work.
+          this._controller = {
+            error: (reason) => {
+              if (this._state === 'writable') {
+                this._state = 'errored';
+                this._storedError = reason;
+              }
+            }
+          };
           if (typeof this._sink.start === 'function') {
-            resolvePromise(this._sink.start(this._controller)).catch(() => {
+            resolvePromise(this._sink.start(this._controller)).catch((reason) => {
               this._state = 'errored';
+              this._storedError = reason;
             });
           }
         }

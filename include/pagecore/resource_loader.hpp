@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstddef>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,6 +28,7 @@ enum class ResourceErrorCode {
     FileDisabled,
     SchemeNotAllowed,
     SameOriginViolation,
+    BlockedHost,
     NotFound,
     TooLarge,
     Timeout,
@@ -52,9 +55,23 @@ struct ResourcePolicy {
     bool allow_network = true;
     bool allow_file = true;
     bool same_origin_only = false;
+    // Reject network requests whose target resolves to a loopback, private,
+    // link-local, or cloud-metadata address. Enforced both on literal-IP URLs
+    // and (via a connect-time socket callback) on the post-DNS address, which
+    // closes DNS-rebinding and redirect-to-internal SSRF vectors.
+    bool block_private_hosts = true;
+    // Forbid file:// sub-resources whose initiator (referrer/base) is a network
+    // origin, so a remote page cannot read local files. Top-level file:// loads
+    // (empty initiator) are unaffected.
+    bool allow_file_from_network = false;
     std::size_t max_response_bytes = 10 * 1024 * 1024;
     std::chrono::milliseconds timeout{10000};
     std::vector<std::string> allowed_schemes{"http", "https", "file"};
+    // Additional host names or literal IPs to reject (case-insensitive).
+    std::vector<std::string> blocked_hosts{};
+    // When non-empty, confine file:// reads to this directory (symlink escapes
+    // are rejected after canonicalization).
+    std::string file_root{};
 };
 
 class ResourceError final : public std::runtime_error {
@@ -113,7 +130,7 @@ class CachingResourceLoader final : public ResourceLoader {
 public:
     using ResourceLoader::load;
 
-    explicit CachingResourceLoader(std::shared_ptr<ResourceLoader> inner);
+    explicit CachingResourceLoader(std::shared_ptr<ResourceLoader> inner, std::size_t max_entries = 256);
 
     ResourceResponse load(const ResourceRequest& request) override;
     void clear();
@@ -121,7 +138,10 @@ public:
 
 private:
     std::shared_ptr<ResourceLoader> inner_;
+    std::size_t max_entries_;
+    mutable std::mutex mutex_;
     std::unordered_map<std::string, ResourceResponse> cache_;
+    std::deque<std::string> order_;
 };
 
 std::string resolve_url(std::string_view base_url, std::string_view candidate);

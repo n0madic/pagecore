@@ -1,5 +1,6 @@
 #include "pagecore/render.hpp"
 
+#include <cmath>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
@@ -8,6 +9,17 @@
 
 namespace pagecore {
 namespace {
+
+// Emit a JSON-safe number: NaN/Inf are not valid JSON tokens, so map any
+// non-finite value to 0 to keep the document parseable.
+void write_number(std::ostream& out, double value)
+{
+    if (std::isfinite(value)) {
+        out << value;
+    } else {
+        out << 0;
+    }
+}
 
 std::string escaped(std::string_view value)
 {
@@ -78,16 +90,24 @@ const char* border_style_name(BorderStyle style)
 
 void write_rect(std::ostream& out, const Rect& rect)
 {
-    out << "{\"x\":" << rect.x
-        << ",\"y\":" << rect.y
-        << ",\"width\":" << rect.width
-        << ",\"height\":" << rect.height
-        << '}';
+    out << "{\"x\":";
+    write_number(out, rect.x);
+    out << ",\"y\":";
+    write_number(out, rect.y);
+    out << ",\"width\":";
+    write_number(out, rect.width);
+    out << ",\"height\":";
+    write_number(out, rect.height);
+    out << '}';
 }
 
 void write_point(std::ostream& out, const Point& point)
 {
-    out << "{\"x\":" << point.x << ",\"y\":" << point.y << '}';
+    out << "{\"x\":";
+    write_number(out, point.x);
+    out << ",\"y\":";
+    write_number(out, point.y);
+    out << '}';
 }
 
 void write_color(std::ostream& out, const Color& color)
@@ -101,7 +121,11 @@ void write_color(std::ostream& out, const Color& color)
 
 void write_corner(std::ostream& out, const CornerRadii& radii)
 {
-    out << "{\"x\":" << radii.x << ",\"y\":" << radii.y << '}';
+    out << "{\"x\":";
+    write_number(out, radii.x);
+    out << ",\"y\":";
+    write_number(out, radii.y);
+    out << '}';
 }
 
 void write_radii(std::ostream& out, const BorderRadii& radii)
@@ -119,8 +143,9 @@ void write_radii(std::ostream& out, const BorderRadii& radii)
 
 void write_border_side(std::ostream& out, const BorderSide& side)
 {
-    out << "{\"width\":" << side.width
-        << ",\"style\":\"" << border_style_name(side.style)
+    out << "{\"width\":";
+    write_number(out, side.width);
+    out << ",\"style\":\"" << border_style_name(side.style)
         << "\",\"color\":";
     write_color(out, side.color);
     out << '}';
@@ -132,9 +157,9 @@ void write_command(std::ostream& out, const TextCommand& command)
     write_rect(out, command.rect);
     out << ",\"color\":";
     write_color(out, command.color);
-    out << ",\"font\":{\"family\":\"" << escaped(command.font.family)
-        << "\",\"sizePx\":" << command.font.size_px
-        << ",\"weight\":" << command.font.weight
+    out << ",\"font\":{\"family\":\"" << escaped(command.font.family) << "\",\"sizePx\":";
+    write_number(out, command.font.size_px);
+    out << ",\"weight\":" << command.font.weight
         << ",\"italic\":" << (command.font.italic ? "true" : "false")
         << "}}";
 }
@@ -204,7 +229,9 @@ void write_command(std::ostream& out, const LinearGradientCommand& command)
         if (index != 0) {
             out << ',';
         }
-        out << "{\"offset\":" << command.stops[index].offset << ",\"color\":";
+        out << "{\"offset\":";
+        write_number(out, command.stops[index].offset);
+        out << ",\"color\":";
         write_color(out, command.stops[index].color);
         out << '}';
     }
@@ -230,10 +257,13 @@ std::string display_list_to_json(const DisplayList& display_list)
     out << std::setprecision(6);
     out << "{\"viewport\":{\"width\":" << display_list.viewport.width
         << ",\"height\":" << display_list.viewport.height
-        << ",\"deviceScaleFactor\":" << display_list.viewport.device_scale_factor
-        << "},\"contentWidth\":" << display_list.content_width
-        << ",\"contentHeight\":" << display_list.content_height
-        << ",\"commands\":[";
+        << ",\"deviceScaleFactor\":";
+    write_number(out, display_list.viewport.device_scale_factor);
+    out << "},\"contentWidth\":";
+    write_number(out, display_list.content_width);
+    out << ",\"contentHeight\":";
+    write_number(out, display_list.content_height);
+    out << ",\"commands\":[";
     for (std::size_t index = 0; index < display_list.commands.size(); ++index) {
         if (index != 0) {
             out << ',';

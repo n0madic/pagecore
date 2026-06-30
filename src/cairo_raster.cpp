@@ -35,12 +35,34 @@ struct ScaledRadii {
     double bl_y = 0.0;
 };
 
+// Layout coordinates originate from CSS and may be NaN, infinite, or far
+// outside the int range. Converting such a double to int is undefined behavior,
+// so clamp to a finite, representable window first.
+constexpr double kCoordLimit = 1.0e7;
+
+int to_pixel_floor(double value)
+{
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    return static_cast<int>(std::floor(std::clamp(value, -kCoordLimit, kCoordLimit)));
+}
+
+int to_pixel_ceil(double value)
+{
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    return static_cast<int>(std::ceil(std::clamp(value, -kCoordLimit, kCoordLimit)));
+}
+
 IntRect scale_rect(Rect rect, float scale)
 {
-    const int x0 = static_cast<int>(std::floor(rect.x * scale));
-    const int y0 = static_cast<int>(std::floor(rect.y * scale));
-    const int x1 = static_cast<int>(std::ceil((rect.x + rect.width) * scale));
-    const int y1 = static_cast<int>(std::ceil((rect.y + rect.height) * scale));
+    const double s = static_cast<double>(scale);
+    const int x0 = to_pixel_floor(static_cast<double>(rect.x) * s);
+    const int y0 = to_pixel_floor(static_cast<double>(rect.y) * s);
+    const int x1 = to_pixel_ceil((static_cast<double>(rect.x) + rect.width) * s);
+    const int y1 = to_pixel_ceil((static_cast<double>(rect.y) + rect.height) * s);
     return IntRect{x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0)};
 }
 
@@ -467,33 +489,52 @@ void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale)
 
     const bool repeat_x = command.repeat == ImageRepeat::Repeat || command.repeat == ImageRepeat::RepeatX;
     const bool repeat_y = command.repeat == ImageRepeat::Repeat || command.repeat == ImageRepeat::RepeatY;
-    const IntRect area = empty(clip) ? bounds : clip;
+    IntRect area = empty(clip) ? bounds : clip;
+
+    // Clamp the tiling area to the actual surface so a huge element box with a
+    // tiny tile size cannot generate millions of off-screen tiles (DoS/OOM).
+    if (cairo_surface_t* target = cairo_get_target(cr)) {
+        const int surface_w = cairo_image_surface_get_width(target);
+        const int surface_h = cairo_image_surface_get_height(target);
+        if (surface_w > 0 && surface_h > 0) {
+            const int ax0 = std::max(area.x, 0);
+            const int ay0 = std::max(area.y, 0);
+            const int ax1 = std::min(area.x + area.width, surface_w);
+            const int ay1 = std::min(area.y + area.height, surface_h);
+            area = IntRect{ax0, ay0, std::max(0, ax1 - ax0), std::max(0, ay1 - ay0)};
+        }
+    }
 
     int start_x = tile.x;
     int start_y = tile.y;
     int count_x = 1;
     int count_y = 1;
 
-    if (repeat_x && !empty(area)) {
-        if (tile.x > area.x) {
-            const int left = (tile.x - area.x + tile.width - 1) / tile.width;
-            start_x = tile.x - left * tile.width;
-            count_x += left;
+    // Align the first tile to the tile grid at or before the area start, then
+    // count exactly enough tiles to cover the area. Using 64-bit intermediates
+    // and area-relative counts bounds the work to area_size / tile_size and
+    // avoids the int overflow the previous incremental formula could hit.
+    const auto floor_div = [](long long a, long long b) {
+        long long q = a / b;
+        const long long r = a % b;
+        if (r != 0 && ((r < 0) != (b < 0))) {
+            --q;
         }
-        if (tile.x + tile.width < area.x + area.width) {
-            count_x += (area.x + area.width - (tile.x + tile.width) + tile.width - 1) / tile.width;
-        }
+        return q;
+    };
+
+    if (repeat_x && !empty(area) && tile.width > 0) {
+        const long long first = floor_div(static_cast<long long>(area.x) - tile.x, tile.width);
+        start_x = static_cast<int>(tile.x + first * tile.width);
+        const long long span = static_cast<long long>(area.x) + area.width - start_x;
+        count_x = static_cast<int>(std::max<long long>(1, (span + tile.width - 1) / tile.width));
     }
 
-    if (repeat_y && !empty(area)) {
-        if (tile.y > area.y) {
-            const int top = (tile.y - area.y + tile.height - 1) / tile.height;
-            start_y = tile.y - top * tile.height;
-            count_y += top;
-        }
-        if (tile.y + tile.height < area.y + area.height) {
-            count_y += (area.y + area.height - (tile.y + tile.height) + tile.height - 1) / tile.height;
-        }
+    if (repeat_y && !empty(area) && tile.height > 0) {
+        const long long first = floor_div(static_cast<long long>(area.y) - tile.y, tile.height);
+        start_y = static_cast<int>(tile.y + first * tile.height);
+        const long long span = static_cast<long long>(area.y) + area.height - start_y;
+        count_y = static_cast<int>(std::max<long long>(1, (span + tile.height - 1) / tile.height));
     }
 
     const auto draw_tile = [&](int x, int y) {
@@ -528,11 +569,17 @@ void draw_linear_gradient(cairo_t* cr, const LinearGradientCommand& command, flo
         return;
     }
 
-    cairo_pattern_t* raw_pattern = cairo_pattern_create_linear(
-        command.start.x * scale,
-        command.start.y * scale,
-        command.end.x * scale,
-        command.end.y * scale);
+    // Non-finite endpoints would push the pattern (and then the context) into an
+    // error state; skip the gradient instead of throwing out of the render loop.
+    const double sx = static_cast<double>(command.start.x) * scale;
+    const double sy = static_cast<double>(command.start.y) * scale;
+    const double ex = static_cast<double>(command.end.x) * scale;
+    const double ey = static_cast<double>(command.end.y) * scale;
+    if (!std::isfinite(sx) || !std::isfinite(sy) || !std::isfinite(ex) || !std::isfinite(ey)) {
+        return;
+    }
+
+    cairo_pattern_t* raw_pattern = cairo_pattern_create_linear(sx, sy, ex, ey);
     check_status(cairo_pattern_status(raw_pattern), "create Cairo linear gradient");
     std::unique_ptr<cairo_pattern_t, decltype(&cairo_pattern_destroy)> pattern(raw_pattern, cairo_pattern_destroy);
 
@@ -572,8 +619,8 @@ public:
     RenderedImage render(const DisplayList& display_list) override
     {
         const float scale = std::max(0.01f, display_list.viewport.device_scale_factor);
-        const int width = std::max(1, static_cast<int>(std::round(display_list.viewport.width * scale)));
-        const int height = std::max(1, static_cast<int>(std::round(display_list.viewport.height * scale)));
+        const int width = std::max(1, to_pixel_ceil(static_cast<double>(display_list.viewport.width) * scale));
+        const int height = std::max(1, to_pixel_ceil(static_cast<double>(display_list.viewport.height) * scale));
 
         cairo_surface_t* raw_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
         check_status(cairo_surface_status(raw_surface), "create Cairo image surface");

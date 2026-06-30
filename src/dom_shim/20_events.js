@@ -197,7 +197,12 @@
           for (let node = start; node; node = node.parentNode || null) {
             path.push(node);
           }
-          if (start !== global && path[path.length - 1] !== global) {
+          // Only escalate to window when the node is actually rooted in the
+          // document; a detached node must not reach window.
+          const rooted = start === global
+            || start === global.document
+            || (typeof start.isConnected === 'boolean' ? start.isConnected : true);
+          if (rooted && path[path.length - 1] !== global) {
             path.push(global);
           }
           return path;
@@ -261,15 +266,21 @@
           }
         }
 
-        function dispatchAtTarget(target, event) {
+        // Invoke listeners on one target for one phase. mode:
+        //  'capture' -> only capture listeners (no on<type> handler),
+        //  'bubble'  -> only non-capture listeners (+ on<type> handler),
+        //  'target'  -> all listeners in registration order (+ on<type> handler).
+        function invokeTargetListeners(target, event, mode) {
           const listeners = [...(ensureListeners(target).get(event.type) || [])];
           for (const entry of listeners) {
+            if (mode === 'capture' && !entry.capture) continue;
+            if (mode === 'bubble' && entry.capture) continue;
             callEventListener(target, entry, event);
             if (entry.once) target.removeEventListener(event.type, entry.callback, { capture: entry.capture });
-            if (event._immediateStopped) break;
+            if (event._immediateStopped) return;
           }
 
-          if (!event._immediateStopped) {
+          if (mode !== 'capture' && !event._immediateStopped) {
             const handler = target['on' + event.type];
             if (typeof handler === 'function') {
               try {
@@ -311,25 +322,65 @@
             const opts = listenerOptions(options);
             const listeners = ensureListeners(this);
             const list = listeners.get(key) || [];
-            listeners.set(key, list.filter((entry) => entry.callback !== callback || entry.capture !== opts.capture));
+            const kept = [];
+            for (const entry of list) {
+              if (entry.callback === callback && entry.capture === opts.capture) {
+                // Detach the abort listener so a long-lived signal does not
+                // accumulate closures across add/remove cycles.
+                if (entry.signal && entry.abortRemove
+                    && typeof entry.signal.removeEventListener === 'function') {
+                  try {
+                    entry.signal.removeEventListener('abort', entry.abortRemove);
+                  } catch (_abortCleanupError) {
+                  }
+                }
+              } else {
+                kept.push(entry);
+              }
+            }
+            listeners.set(key, kept);
           }
 
           dispatchEvent(event) {
             if (!(event instanceof Event)) {
               throw new TypeError('dispatchEvent expects Event');
             }
-            if (!event.target) event.target = this;
-            event._path = event.bubbles ? eventPath(this) : [this];
+            // Reset propagation state so an Event object can be re-dispatched.
+            event.target = this;
+            event.currentTarget = null;
+            event.cancelBubble = false;
+            event._immediateStopped = false;
+            event._path = eventPath(this);
 
-            for (let i = 0; i < event._path.length; ++i) {
-              event.currentTarget = event._path[i];
-              event.eventPhase = i === 0 ? Event.AT_TARGET : Event.BUBBLING_PHASE;
-              dispatchAtTarget(event.currentTarget, event);
-              if (event.cancelBubble) break;
+            const path = event._path; // [target, ...ancestors, window]
+
+            // Capture phase: root -> just above the target.
+            event.eventPhase = Event.CAPTURING_PHASE;
+            for (let i = path.length - 1; i >= 1 && !event.cancelBubble; --i) {
+              event.currentTarget = path[i];
+              invokeTargetListeners(path[i], event, 'capture');
+            }
+
+            // Target phase: capture and bubble listeners in registration order.
+            if (!event.cancelBubble) {
+              event.eventPhase = Event.AT_TARGET;
+              event.currentTarget = this;
+              invokeTargetListeners(this, event, 'target');
+            }
+
+            // Bubble phase: just above the target -> root (only if bubbling).
+            if (event.bubbles) {
+              event.eventPhase = Event.BUBBLING_PHASE;
+              for (let i = 1; i < path.length && !event.cancelBubble; ++i) {
+                event.currentTarget = path[i];
+                invokeTargetListeners(path[i], event, 'bubble');
+              }
             }
 
             event.currentTarget = null;
             event.eventPhase = Event.NONE;
+            event.cancelBubble = false;
+            event._immediateStopped = false;
             return !event.defaultPrevented;
           }
         }
@@ -447,7 +498,13 @@
           if (mutationObservers.size === 0) return;
 
           for (const observer of mutationObservers) {
-            if (observer._matches(record)) observer._records.push(record);
+            const wantsOldValue = observer._matchWithOldValue(record);
+            if (wantsOldValue === null) continue;
+            // Each observer gets its own record; oldValue is exposed only when
+            // that observer asked for it (attributeOldValue/characterDataOldValue).
+            const delivered = Object.assign({}, record);
+            delivered.oldValue = wantsOldValue && record.oldValue !== undefined ? record.oldValue : null;
+            observer._records.push(delivered);
           }
 
           if (mutationFlushQueued) return;
@@ -509,14 +566,29 @@
           }
 
           _matches(record) {
-            return this._observations.some(({ target, options }) => {
-              if (record.type === 'childList' && !options.childList) return false;
-              if (record.type === 'attributes' && !options.attributes) return false;
-              if (record.type === 'characterData' && !options.characterData) return false;
-              if (record.type === 'attributes' && options.attributeFilter && !options.attributeFilter.includes(record.attributeName)) return false;
-              if (target === record.target) return true;
-              return Boolean(options.subtree && target.contains && target.contains(record.target));
-            });
+            return this._matchWithOldValue(record) !== null;
+          }
+
+          // Returns null when the record matches no observation, otherwise a
+          // boolean indicating whether any matching observation requested the
+          // record's oldValue.
+          _matchWithOldValue(record) {
+            let matched = false;
+            let wantsOldValue = false;
+            for (const { target, options } of this._observations) {
+              if (record.type === 'childList' && !options.childList) continue;
+              if (record.type === 'attributes' && !options.attributes) continue;
+              if (record.type === 'characterData' && !options.characterData) continue;
+              if (record.type === 'attributes' && options.attributeFilter
+                  && !options.attributeFilter.includes(record.attributeName)) continue;
+              const isTarget = target === record.target
+                || Boolean(options.subtree && target.contains && target.contains(record.target));
+              if (!isTarget) continue;
+              matched = true;
+              if (record.type === 'attributes' && options.attributeOldValue) wantsOldValue = true;
+              if (record.type === 'characterData' && options.characterDataOldValue) wantsOldValue = true;
+            }
+            return matched ? wantsOldValue : null;
           }
         }
 

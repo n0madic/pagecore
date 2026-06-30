@@ -6,6 +6,7 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -45,24 +46,37 @@ void usage(const char* argv0)
         << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n";
 }
 
-int parse_positive_int(const std::string& value, const std::string& name)
+// Largest screenshot dimension we accept; well above any real viewport but
+// small enough that width*height*4 cannot exhaust memory by accident.
+constexpr int kMaxViewportDimension = 16384;
+constexpr float kMaxScale = 8.0f;
+
+int parse_int_in_range(const std::string& value, const std::string& name, int min_value, int max_value)
 {
+    int result = 0;
     std::size_t parsed = 0;
-    const int result = std::stoi(value, &parsed);
-    if (parsed != value.size() || result <= 0) {
-        throw std::runtime_error(name + " must be a positive integer");
+    try {
+        result = std::stoi(value, &parsed);
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error(name + " is out of range (max " + std::to_string(max_value) + ")");
+    } catch (const std::invalid_argument&) {
+        throw std::runtime_error(name + " must be an integer");
+    }
+    if (parsed != value.size() || result < min_value || result > max_value) {
+        throw std::runtime_error(
+            name + " must be an integer in [" + std::to_string(min_value) + ", " + std::to_string(max_value) + "]");
     }
     return result;
 }
 
+int parse_positive_int(const std::string& value, const std::string& name)
+{
+    return parse_int_in_range(value, name, 1, std::numeric_limits<int>::max());
+}
+
 int parse_nonnegative_int(const std::string& value, const std::string& name)
 {
-    std::size_t parsed = 0;
-    const int result = std::stoi(value, &parsed);
-    if (parsed != value.size() || result < 0) {
-        throw std::runtime_error(name + " must be a non-negative integer");
-    }
-    return result;
+    return parse_int_in_range(value, name, 0, std::numeric_limits<int>::max());
 }
 
 pagecore::Viewport parse_viewport(const std::string& value)
@@ -73,17 +87,24 @@ pagecore::Viewport parse_viewport(const std::string& value)
     }
 
     pagecore::Viewport viewport;
-    viewport.width = parse_positive_int(value.substr(0, separator), "viewport width");
-    viewport.height = parse_positive_int(value.substr(separator + 1), "viewport height");
+    viewport.width = parse_int_in_range(value.substr(0, separator), "viewport width", 1, kMaxViewportDimension);
+    viewport.height = parse_int_in_range(value.substr(separator + 1), "viewport height", 1, kMaxViewportDimension);
     return viewport;
 }
 
 float parse_positive_float(const std::string& value, const std::string& name)
 {
+    float result = 0.0f;
     std::size_t parsed = 0;
-    const float result = std::stof(value, &parsed);
-    if (parsed != value.size() || !std::isfinite(result) || result <= 0.0f) {
-        throw std::runtime_error(name + " must be a positive number");
+    try {
+        result = std::stof(value, &parsed);
+    } catch (const std::out_of_range&) {
+        throw std::runtime_error(name + " is out of range");
+    } catch (const std::invalid_argument&) {
+        throw std::runtime_error(name + " must be a number");
+    }
+    if (parsed != value.size() || !std::isfinite(result) || result <= 0.0f || result > kMaxScale) {
+        throw std::runtime_error(name + " must be a number in (0, " + std::to_string(kMaxScale) + "]");
     }
     return result;
 }
@@ -160,6 +181,14 @@ int main(int argc, char** argv)
             return 2;
         }
 
+        // Run --eval before rendering so eval-driven DOM mutations are reflected
+        // in the screenshot and display-list dump.
+        std::string eval_result;
+        const bool has_eval = !eval.empty();
+        if (has_eval) {
+            eval_result = page.eval(eval);
+        }
+
         if (!screenshot.empty()) {
             pagecore::write_png_rgba(page.render(render_options), screenshot);
         }
@@ -173,8 +202,8 @@ int main(int argc, char** argv)
             }
         }
 
-        if (!eval.empty()) {
-            std::cout << page.eval(eval) << "\n";
+        if (has_eval) {
+            std::cout << eval_result << "\n";
         } else if (!screenshot.empty()) {
             std::cout << screenshot << "\n";
         } else if (!display_list_dump.empty()) {

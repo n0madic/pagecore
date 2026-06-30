@@ -140,6 +140,7 @@
             const text = String(value ?? '');
             const nodeType = this.nodeType;
             if (nodeType === 3 || nodeType === 8) {
+              const oldValue = bridge.textContent(this._liveId());
               afterMutation(bridge.setTextContent(this._liveId(), text), {
                 type: 'characterData',
                 target: this,
@@ -147,7 +148,8 @@
                 removedNodes: [],
                 previousSibling: null,
                 nextSibling: null,
-                attributeName: null
+                attributeName: null,
+                oldValue
               });
               return;
             }
@@ -2402,7 +2404,8 @@
               removedNodes: [],
               previousSibling: null,
               nextSibling: null,
-              attributeName
+              attributeName,
+              oldValue
             });
             if (oldValue !== newValue) notifyCustomElementAttributeChanged(this, attributeName, oldValue, newValue);
             return result;
@@ -2417,7 +2420,8 @@
               removedNodes: [],
               previousSibling: null,
               nextSibling: null,
-              attributeName
+              attributeName,
+              oldValue
             });
             if (oldValue !== null) notifyCustomElementAttributeChanged(this, attributeName, oldValue, null);
             return result;
@@ -2719,8 +2723,16 @@
         class HTMLInputElement extends HTMLFormControlElement {
           get type() { return normalizedInputType(this); }
           set type(value) { this.setAttribute('type', String(value)); }
-          get value() { return this.getAttribute('value') || ''; }
-          set value(value) { this.setAttribute('value', String(value)); }
+          // The current value is tracked separately from the "value" content
+          // attribute (the default value), per the HTML "dirty value flag", so
+          // typing does not rewrite the attribute and form.reset() works.
+          get value() {
+            return this._dirtyValue ? this._value : (this.getAttribute('value') || '');
+          }
+          set value(value) {
+            this._value = String(value);
+            this._dirtyValue = true;
+          }
           get defaultValue() { return this.getAttribute('value') || ''; }
           set defaultValue(value) { this.setAttribute('value', String(value)); }
           get checked() { return this.hasAttribute('checked'); }

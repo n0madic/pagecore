@@ -21,10 +21,19 @@ _pagecore_import_static_dependency(PageCore::qjs "@PAGECORE_QJS_STATIC_FILE@")
 
 if(PAGECORE_ENABLE_RENDERING)
     _pagecore_import_static_dependency(PageCore::litehtml "@PAGECORE_LITEHTML_STATIC_FILE@")
-    _pagecore_import_static_dependency(PageCore::gumbo "@PAGECORE_GUMBO_STATIC_FILE@")
-    set_property(TARGET PageCore::litehtml APPEND PROPERTY
-        INTERFACE_LINK_LIBRARIES PageCore::gumbo
-    )
+    # gumbo is only bundled when litehtml provided it (the install is conditional);
+    # import and link it only if the archive was actually installed, so consumers
+    # never reference a non-existent libgumbo.a.
+    set(_pagecore_gumbo_name "@PAGECORE_GUMBO_STATIC_FILE@")
+    if(_pagecore_gumbo_name)
+        set(_pagecore_gumbo_file "${PACKAGE_PREFIX_DIR}/@PAGECORE_INSTALL_DEPSDIR@/${_pagecore_gumbo_name}")
+        if(EXISTS "${_pagecore_gumbo_file}")
+            _pagecore_import_static_dependency(PageCore::gumbo "${_pagecore_gumbo_name}")
+            set_property(TARGET PageCore::litehtml APPEND PROPERTY
+                INTERFACE_LINK_LIBRARIES PageCore::gumbo
+            )
+        endif()
+    endif()
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/PageCoreTargets.cmake")

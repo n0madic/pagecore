@@ -12,6 +12,7 @@ extern "C" {
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -91,6 +92,9 @@ JSValue bridge_call(JSContext* ctx, Func&& func)
         return func(*engine(ctx));
     } catch (const std::exception& error) {
         return JS_ThrowInternalError(ctx, "%s", error.what());
+    } catch (...) {
+        // Never let a non-std exception unwind through QuickJS's C frames.
+        return JS_ThrowInternalError(ctx, "native exception");
     }
 }
 
@@ -611,7 +615,13 @@ JSValue host_log(JSContext* ctx, JSValue, int argc, JSValue* argv)
         for (int i = 1; i < argc; ++i) {
             const char* value = JS_ToCString(ctx, argv[i]);
             std::cerr << ' ' << (value == nullptr ? "<unprintable>" : value);
-            if (value != nullptr) JS_FreeCString(ctx, value);
+            if (value != nullptr) {
+                JS_FreeCString(ctx, value);
+            } else {
+                // Stringification threw; clear the pending exception so it does
+                // not leak out of this logging helper.
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            }
         }
         std::cerr << '\n';
         return JS_UNDEFINED;
@@ -637,6 +647,38 @@ JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue host_random_bytes(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
+        int32_t count = 0;
+        if (argc > 0) {
+            JS_ToInt32(ctx, &count, argv[0]);
+        }
+        if (count < 0) {
+            count = 0;
+        }
+        if (count > 65536) {
+            count = 65536;
+        }
+
+        // std::random_device is backed by the OS CSPRNG (getentropy / urandom)
+        // on the supported platforms, unlike Math.random().
+        std::random_device device;
+        JSValue array = JS_NewArray(ctx);
+        int32_t produced = 0;
+        while (produced < count) {
+            std::uint32_t word = device();
+            for (int byte = 0; byte < 4 && produced < count; ++byte) {
+                const int value = static_cast<int>(word & 0xff);
+                word >>= 8;
+                JS_SetPropertyUint32(ctx, array, static_cast<uint32_t>(produced), JS_NewInt32(ctx, value));
+                ++produced;
+            }
+        }
+        return array;
+    });
+}
+
 char* JsRuntime::normalize_module(JSContext* ctx, const char* module_base_name, const char* module_name, void* opaque)
 {
     auto* js = static_cast<JsRuntime*>(opaque);
@@ -645,11 +687,21 @@ char* JsRuntime::normalize_module(JSContext* ctx, const char* module_base_name, 
         return nullptr;
     }
 
-    const std::string resolved = resolve_module_specifier(
-        module_base_name == nullptr ? std::string_view() : std::string_view(module_base_name),
-        module_name,
-        js == nullptr ? std::string_view() : std::string_view(js->options_.base_url));
-    return js_strdup_from_string(ctx, resolved);
+    // This is a C callback from QuickJS's module loader; contain any C++
+    // exception (e.g. std::bad_alloc) rather than unwinding through C frames.
+    try {
+        const std::string resolved = resolve_module_specifier(
+            module_base_name == nullptr ? std::string_view() : std::string_view(module_base_name),
+            module_name,
+            js == nullptr ? std::string_view() : std::string_view(js->options_.base_url));
+        return js_strdup_from_string(ctx, resolved);
+    } catch (const std::exception& error) {
+        JS_ThrowInternalError(ctx, "%s", error.what());
+        return nullptr;
+    } catch (...) {
+        JS_ThrowInternalError(ctx, "native exception while resolving module specifier");
+        return nullptr;
+    }
 }
 
 JSModuleDef* JsRuntime::load_module(JSContext* ctx, const char* module_name, void* opaque)
@@ -766,6 +818,7 @@ void JsRuntime::install()
     set_function(context_, dom, "getElementById", bridge_get_element_by_id, 1);
     set_function(context_, host, "log", host_log, 1);
     set_function(context_, host, "loadResource", host_load_resource, 2);
+    set_function(context_, host, "randomBytes", host_random_bytes, 1);
     JS_SetPropertyStr(context_, host, "baseURL", js_string(context_, options_.base_url));
     JS_SetPropertyStr(context_, host, "userAgent", js_string(context_, options_.user_agent));
 
@@ -827,12 +880,25 @@ std::string JsRuntime::evaluate(std::string_view script, std::string_view filena
         filename_string.c_str(),
         JS_EVAL_TYPE_GLOBAL);
     check_exception(value, filename_string);
-    drain_jobs();
+
+    // value holds a live reference; if draining a pending job throws, free it
+    // (and clear the deadline) before propagating so it does not leak.
+    try {
+        drain_jobs();
+    } catch (...) {
+        JS_FreeValue(context_, value);
+        clear_deadline();
+        throw;
+    }
 
     const char* cstr = JS_ToCString(context_, value);
     std::string result = cstr == nullptr ? "" : cstr;
     if (cstr != nullptr) {
         JS_FreeCString(context_, cstr);
+    } else {
+        // Stringification failed (e.g. a throwing toString); discard the
+        // pending exception so it cannot surface on a later operation.
+        JS_FreeValue(context_, JS_GetException(context_));
     }
     JS_FreeValue(context_, value);
     clear_deadline();
@@ -935,7 +1001,11 @@ void JsRuntime::check_exception(JSValue value, std::string_view source_name)
     }
 
     JSValue exception = JS_GetException(context_);
-    JSValue stack = JS_GetPropertyStr(context_, exception, "stack");
+    // Reading ".stack" off a thrown non-object (e.g. `throw null`) would set a
+    // secondary pending exception; only do it when the thrown value is an object.
+    JSValue stack = JS_IsObject(exception)
+        ? JS_GetPropertyStr(context_, exception, "stack")
+        : JS_UNDEFINED;
     const char* stack_cstr = JS_IsUndefined(stack) ? nullptr : JS_ToCString(context_, stack);
     const char* exception_cstr = JS_ToCString(context_, exception);
 

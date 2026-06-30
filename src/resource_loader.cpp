@@ -3,12 +3,21 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <mutex>
 #include <utility>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 
 namespace pagecore {
 namespace {
@@ -94,6 +103,169 @@ bool scheme_allowed(std::string_view scheme, const ResourcePolicy& policy)
     return std::find(policy.allowed_schemes.begin(), policy.allowed_schemes.end(), scheme) != policy.allowed_schemes.end();
 }
 
+// Extract the lowercased host from a URL authority, stripping any userinfo,
+// port, and IPv6 brackets. Returns empty for opaque/relative URLs.
+std::string host_of(std::string_view url)
+{
+    const auto scheme_pos = url.find("://");
+    if (scheme_pos == std::string_view::npos) {
+        return {};
+    }
+    auto authority = url.substr(scheme_pos + 3);
+    const auto authority_end = authority.find_first_of("/?#");
+    if (authority_end != std::string_view::npos) {
+        authority = authority.substr(0, authority_end);
+    }
+    const auto at = authority.find_last_of('@');
+    if (at != std::string_view::npos) {
+        authority = authority.substr(at + 1);
+    }
+    if (!authority.empty() && authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close != std::string_view::npos) {
+            return to_lower(authority.substr(1, close - 1));
+        }
+        return to_lower(authority.substr(1));
+    }
+    const auto colon = authority.find(':');
+    if (colon != std::string_view::npos) {
+        authority = authority.substr(0, colon);
+    }
+    return to_lower(authority);
+}
+
+// IPv4 host order. Loopback, private, link-local (incl. 169.254.169.254 cloud
+// metadata), CGNAT, unspecified, and multicast/reserved are treated as internal.
+bool is_blocked_ipv4(std::uint32_t addr)
+{
+    const std::uint8_t a = (addr >> 24) & 0xff;
+    const std::uint8_t b = (addr >> 16) & 0xff;
+    if (a == 127) return true;                       // loopback
+    if (a == 10) return true;                        // private
+    if (a == 172 && b >= 16 && b <= 31) return true; // private
+    if (a == 192 && b == 168) return true;           // private
+    if (a == 169 && b == 254) return true;           // link-local + metadata
+    if (a == 100 && (b & 0xc0) == 64) return true;   // 100.64/10 CGNAT
+    if (a == 0) return true;                         // "this" network
+    if (a >= 224) return true;                       // multicast / reserved
+    return false;
+}
+
+bool is_blocked_ipv6(const std::uint8_t* b)
+{
+    bool all_zero = true;
+    for (int i = 0; i < 16; ++i) {
+        if (b[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) return true;                                    // ::
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0
+        && b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0
+        && b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0
+        && b[12] == 0 && b[13] == 0 && b[14] == 0 && b[15] == 1) {
+        return true;                                             // ::1 loopback
+    }
+    if ((b[0] & 0xfe) == 0xfc) return true;                       // fc00::/7 ULA
+    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true;       // fe80::/10 link-local
+    if (b[0] == 0xff) return true;                               // multicast
+    // IPv4-mapped ::ffff:a.b.c.d
+    bool mapped = true;
+    for (int i = 0; i < 10; ++i) {
+        if (b[i] != 0) { mapped = false; break; }
+    }
+    if (mapped && b[10] == 0xff && b[11] == 0xff) {
+        const std::uint32_t v4 = (static_cast<std::uint32_t>(b[12]) << 24)
+            | (static_cast<std::uint32_t>(b[13]) << 16)
+            | (static_cast<std::uint32_t>(b[14]) << 8)
+            | static_cast<std::uint32_t>(b[15]);
+        return is_blocked_ipv4(v4);
+    }
+    return false;
+}
+
+// Block literal-IP and well-known-local hosts before any DNS lookup. DNS names
+// that resolve to internal addresses are caught later by the socket callback.
+bool is_blocked_literal_host(const std::string& host, const ResourcePolicy& policy)
+{
+    if (host.empty()) {
+        return false;
+    }
+    for (const auto& blocked : policy.blocked_hosts) {
+        if (to_lower(blocked) == host) {
+            return true;
+        }
+    }
+    if (!policy.block_private_hosts) {
+        return false;
+    }
+    if (host == "localhost" || (host.size() > 10 && host.compare(host.size() - 10, 10, ".localhost") == 0)) {
+        return true;
+    }
+    if (host.find(':') != std::string::npos) {
+        std::array<std::uint8_t, 16> bytes{};
+        if (inet_pton(AF_INET6, host.c_str(), bytes.data()) == 1) {
+            return is_blocked_ipv6(bytes.data());
+        }
+        return false;
+    }
+    in_addr v4{};
+    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        return is_blocked_ipv4(ntohl(v4.s_addr));
+    }
+    return false;
+}
+
+#if !defined(_WIN32)
+struct OpenSocketContext {
+    const ResourcePolicy* policy = nullptr;
+    bool blocked = false;
+};
+
+bool is_blocked_sockaddr(const sockaddr* sa)
+{
+    if (sa == nullptr) {
+        return true;
+    }
+    if (sa->sa_family == AF_INET) {
+        const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
+        return is_blocked_ipv4(ntohl(in->sin_addr.s_addr));
+    }
+    if (sa->sa_family == AF_INET6) {
+        const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+        return is_blocked_ipv6(in6->sin6_addr.s6_addr);
+    }
+    return true; // Unknown families (e.g. AF_UNIX) are not legitimate web targets.
+}
+
+curl_socket_t guarded_open_socket(void* clientp, curlsocktype purpose, curl_sockaddr* address)
+{
+    (void) purpose;
+    auto* context = static_cast<OpenSocketContext*>(clientp);
+    if (context != nullptr && context->policy != nullptr && context->policy->block_private_hosts
+        && is_blocked_sockaddr(&address->addr)) {
+        context->blocked = true;
+        return CURL_SOCKET_BAD;
+    }
+    return ::socket(address->family, address->socktype, address->protocol);
+}
+#endif
+
+#if LIBCURL_VERSION_NUM >= 0x075500
+std::string curl_request_protocols_string(const ResourcePolicy& policy)
+{
+    std::string protocols;
+    if (scheme_allowed("http", policy)) {
+        protocols += "http";
+    }
+    if (scheme_allowed("https", policy)) {
+        if (!protocols.empty()) {
+            protocols += ",";
+        }
+        protocols += "https";
+    }
+    return protocols;
+}
+#endif
+
 #if LIBCURL_VERSION_NUM >= 0x075500
 std::string curl_redirect_protocols_string(const ResourcePolicy& policy)
 {
@@ -129,13 +301,41 @@ std::string origin_of(std::string_view url)
     if (scheme_pos == std::string_view::npos) {
         return {};
     }
+    const std::string scheme = to_lower(url.substr(0, scheme_pos));
+    const std::string host = host_of(url);
 
-    const auto authority_start = scheme_pos + 3;
-    const auto authority_end = url.find('/', authority_start);
-    if (authority_end == std::string_view::npos) {
-        return to_lower(url);
+    // Authority between "://" and the first path/query/fragment separator.
+    auto authority = url.substr(scheme_pos + 3);
+    const auto authority_end = authority.find_first_of("/?#");
+    if (authority_end != std::string_view::npos) {
+        authority = authority.substr(0, authority_end);
     }
-    return to_lower(url.substr(0, authority_end));
+    const auto at = authority.find_last_of('@');
+    if (at != std::string_view::npos) {
+        authority = authority.substr(at + 1);
+    }
+
+    std::string port;
+    if (!authority.empty() && authority.front() == '[') {
+        const auto close = authority.find(']');
+        if (close != std::string_view::npos && close + 1 < authority.size() && authority[close + 1] == ':') {
+            port = std::string(authority.substr(close + 2));
+        }
+    } else {
+        const auto colon = authority.find(':');
+        if (colon != std::string_view::npos) {
+            port = std::string(authority.substr(colon + 1));
+        }
+    }
+    if ((scheme == "http" && port == "80") || (scheme == "https" && port == "443")) {
+        port.clear();
+    }
+
+    std::string origin = scheme + "://" + host;
+    if (!port.empty()) {
+        origin += ":" + port;
+    }
+    return origin;
 }
 
 void enforce_request_policy(const ResourceRequest& request, const ResourcePolicy& policy)
@@ -155,6 +355,27 @@ void enforce_request_policy(const ResourceRequest& request, const ResourcePolicy
 
     if (is_file_scheme(scheme) && !policy.allow_file) {
         throw ResourceError(ResourceErrorCode::FileDisabled, request.url, "file resource loading is disabled");
+    }
+
+    // A network-origin document must not be able to read local files via a
+    // file:// sub-resource unless explicitly allowed.
+    if (is_file_scheme(scheme) && !policy.allow_file_from_network) {
+        const std::string initiator = request.referrer.empty() ? request.base_url : request.referrer;
+        if (is_network_scheme(scheme_of(initiator))) {
+            throw ResourceError(
+                ResourceErrorCode::FileDisabled,
+                request.url,
+                "file resource loading from a network origin is disabled");
+        }
+    }
+
+    // Block loopback/private/link-local/metadata literal hosts (and any
+    // explicitly blocked host) before the request leaves the process.
+    if (is_network_scheme(scheme) && is_blocked_literal_host(host_of(request.url), policy)) {
+        throw ResourceError(
+            ResourceErrorCode::BlockedHost,
+            request.url,
+            "resource host is blocked: " + host_of(request.url));
     }
 
     if (policy.same_origin_only && !request.referrer.empty()) {
@@ -213,21 +434,97 @@ std::string infer_mime_type(std::string_view url, ResourceKind kind)
     return "application/octet-stream";
 }
 
-std::string read_file(std::string_view path)
+// Decode "file:" / "file://" URLs into a filesystem path. Strips an optional
+// (empty or "localhost") authority and the URL fragment/query.
+std::filesystem::path file_path_of(std::string_view url)
 {
-    std::filesystem::path fs_path(path);
-    if (starts_with(path, "file://")) {
-        fs_path = std::filesystem::path(std::string(path.substr(7)));
+    std::string_view rest = url;
+    if (starts_with(rest, "file://")) {
+        rest = rest.substr(7);
+        // PageCore builds file URLs as "file://" + path, where the path may be
+        // relative ("file://examples/x") or absolute ("file:///abs/x"). Keep the
+        // remainder as the path; only strip an explicit "localhost" authority.
+        if (starts_with(rest, "localhost/")) {
+            rest = rest.substr(std::string_view("localhost").size());
+        } else if (rest == "localhost") {
+            rest = std::string_view{};
+        }
+    } else if (starts_with(rest, "file:")) {
+        rest = rest.substr(5);
+    }
+    const auto cut = rest.find_first_of("?#");
+    if (cut != std::string_view::npos) {
+        rest = rest.substr(0, cut);
+    }
+    return std::filesystem::path(std::string(rest));
+}
+
+std::string read_file(std::string_view url, const ResourcePolicy& policy)
+{
+    std::filesystem::path fs_path = file_path_of(url);
+
+    std::error_code ec;
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(fs_path, ec);
+    if (ec) {
+        canonical = std::filesystem::absolute(fs_path, ec);
     }
 
-    std::ifstream in(fs_path, std::ios::binary);
+    // Confine reads to the configured sandbox root, if any. weakly_canonical
+    // resolves "../" and symlink targets, so escapes are rejected here.
+    if (!policy.file_root.empty()) {
+        std::filesystem::path root = std::filesystem::weakly_canonical(policy.file_root, ec);
+        if (ec) {
+            root = std::filesystem::absolute(policy.file_root, ec);
+        }
+        const std::string root_str = root.lexically_normal().string();
+        const std::string target_str = canonical.lexically_normal().string();
+        const bool contained = target_str == root_str
+            || (target_str.size() > root_str.size()
+                && target_str.compare(0, root_str.size(), root_str) == 0
+                && (root_str.back() == std::filesystem::path::preferred_separator
+                    || target_str[root_str.size()] == std::filesystem::path::preferred_separator));
+        if (!contained) {
+            throw ResourceError(
+                ResourceErrorCode::FileDisabled,
+                std::string(url),
+                "file resource escapes the sandbox root: " + fs_path.string());
+        }
+    }
+
+    // Reject directories, devices, FIFOs, sockets — only regular files are
+    // served, which also prevents /dev/zero and named-pipe hangs.
+    if (!std::filesystem::is_regular_file(canonical, ec)) {
+        throw ResourceError(
+            ResourceErrorCode::NotFound,
+            std::string(url),
+            "file resource is not a regular file: " + fs_path.string());
+    }
+
+    std::ifstream in(canonical, std::ios::binary);
     if (!in) {
-        throw std::runtime_error("failed to open file resource: " + fs_path.string());
+        throw ResourceError(
+            ResourceErrorCode::NotFound,
+            std::string(url),
+            "failed to open file resource: " + fs_path.string());
     }
 
-    std::ostringstream out;
-    out << in.rdbuf();
-    return out.str();
+    std::string out;
+    char buffer[64 * 1024];
+    while (in) {
+        in.read(buffer, sizeof(buffer));
+        const std::streamsize got = in.gcount();
+        if (got <= 0) {
+            break;
+        }
+        if (policy.max_response_bytes > 0 && out.size() + static_cast<std::size_t>(got) > policy.max_response_bytes) {
+            throw ResourceError(
+                ResourceErrorCode::TooLarge,
+                std::string(url),
+                "file resource exceeds max response size");
+        }
+        out.append(buffer, static_cast<std::size_t>(got));
+    }
+    return out;
 }
 
 std::string without_query_or_fragment(std::string_view url)
@@ -402,6 +699,12 @@ CurlResourceLoader::CurlResourceLoader(std::string user_agent, ResourcePolicy po
 {
 }
 
+void ensure_curl_global_init()
+{
+    static std::once_flag once;
+    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+}
+
 ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
 {
     enforce_request_policy(request, policy_);
@@ -412,7 +715,7 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     if (!is_network_scheme(scheme)) {
         ResourceResponse response{
             url_string,
-            read_file(url_string),
+            read_file(url_string, policy_),
             200,
             infer_mime_type(url_string, request.kind),
             request.kind,
@@ -422,7 +725,9 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
         return response;
     }
 
-    CURL* curl = curl_easy_init();
+    ensure_curl_global_init();
+
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
     if (curl == nullptr) {
         throw ResourceError(ResourceErrorCode::Transport, request.url, "failed to initialize libcurl");
     }
@@ -433,41 +738,59 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     char* content_type = nullptr;
     char* effective_url = nullptr;
 
-    curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl.get(), CURLOPT_URL, url_string.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 10L);
+    // Pin the protocol set for the initial transfer too (not just redirects);
+    // otherwise curl's build-dependent default enables file/scp/gopher/etc.
 #if LIBCURL_VERSION_NUM >= 0x075500
+    const std::string request_protocols = curl_request_protocols_string(policy_);
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, request_protocols.empty() ? "" : request_protocols.c_str());
     const std::string redirect_protocols = curl_redirect_protocols_string(policy_);
-    if (!redirect_protocols.empty()) {
-        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, redirect_protocols.c_str());
-    }
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, redirect_protocols.empty() ? "" : redirect_protocols.c_str());
 #else
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, curl_redirect_protocols_mask(policy_));
+    curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS, curl_redirect_protocols_mask(policy_));
+    curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS, curl_redirect_protocols_mask(policy_));
 #endif
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent_.c_str());
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(policy_.timeout.count()));
+#if !defined(_WIN32)
+    OpenSocketContext socket_context{&policy_, false};
+    curl_easy_setopt(curl.get(), CURLOPT_OPENSOCKETFUNCTION, guarded_open_socket);
+    curl_easy_setopt(curl.get(), CURLOPT_OPENSOCKETDATA, &socket_context);
+#endif
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, user_agent_.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, write_body);
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, static_cast<long>(policy_.timeout.count()));
 
-    const CURLcode code = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
-    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+    const CURLcode code = curl_easy_perform(curl.get());
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_getinfo(curl.get(), CURLINFO_CONTENT_TYPE, &content_type);
+    curl_easy_getinfo(curl.get(), CURLINFO_EFFECTIVE_URL, &effective_url);
     const std::string response_url = effective_url == nullptr ? url_string : std::string(effective_url);
     const std::string response_mime_type =
         content_type == nullptr ? infer_mime_type(url_string, request.kind) : std::string(content_type);
-    curl_easy_cleanup(curl);
 
     if (body.too_large) {
         throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
     }
+
+#if !defined(_WIN32)
+    if (socket_context.blocked) {
+        throw ResourceError(
+            ResourceErrorCode::BlockedHost,
+            request.url,
+            "resource resolved to a blocked (private/loopback/link-local) address");
+    }
+#endif
 
     if (code != CURLE_OK) {
         const auto error_code = code == CURLE_OPERATION_TIMEDOUT ? ResourceErrorCode::Timeout : ResourceErrorCode::Transport;
         throw ResourceError(error_code, request.url, std::string("resource load failed: ") + curl_easy_strerror(code));
     }
 
+    // Re-validate the effective URL after any redirects (scheme, host, origin).
     enforce_request_policy(
         ResourceRequest{response_url, request.kind, request.referrer, request.base_url},
         policy_);
@@ -547,8 +870,9 @@ void MemoryResourceLoader::set_policy(ResourcePolicy policy)
     policy_ = std::move(policy);
 }
 
-CachingResourceLoader::CachingResourceLoader(std::shared_ptr<ResourceLoader> inner)
+CachingResourceLoader::CachingResourceLoader(std::shared_ptr<ResourceLoader> inner, std::size_t max_entries)
     : inner_(std::move(inner))
+    , max_entries_(max_entries == 0 ? 1 : max_entries)
 {
     if (!inner_) {
         throw ResourceError(ResourceErrorCode::InvalidRequest, {}, "caching resource loader requires inner loader");
@@ -558,26 +882,46 @@ CachingResourceLoader::CachingResourceLoader(std::shared_ptr<ResourceLoader> inn
 ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
 {
     const std::string key = resource_kind_name(request.kind) + "\n" + request.url + "\n" + request.referrer;
-    auto cached = cache_.find(key);
-    if (cached != cache_.end()) {
-        ResourceResponse response = cached->second;
-        response.from_cache = true;
-        return response;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto cached = cache_.find(key);
+        if (cached != cache_.end()) {
+            ResourceResponse response = cached->second;
+            response.from_cache = true;
+            return response;
+        }
     }
 
+    // The inner load runs without the lock so concurrent loads of different
+    // resources do not serialize.
     ResourceResponse response = inner_->load(request);
     response.from_cache = false;
-    cache_[key] = response;
+
+    // Do not pin error responses (4xx/5xx) — they are often transient.
+    if (response.status < 400) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (cache_.find(key) == cache_.end()) {
+            order_.push_back(key);
+            while (order_.size() > max_entries_) {
+                cache_.erase(order_.front());
+                order_.pop_front();
+            }
+        }
+        cache_[key] = response;
+    }
     return response;
 }
 
 void CachingResourceLoader::clear()
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     cache_.clear();
+    order_.clear();
 }
 
 std::size_t CachingResourceLoader::size() const noexcept
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     return cache_.size();
 }
 
@@ -648,6 +992,8 @@ std::string resource_error_code_name(ResourceErrorCode code)
         return "scheme_not_allowed";
     case ResourceErrorCode::SameOriginViolation:
         return "same_origin_violation";
+    case ResourceErrorCode::BlockedHost:
+        return "blocked_host";
     case ResourceErrorCode::NotFound:
         return "not_found";
     case ResourceErrorCode::TooLarge:

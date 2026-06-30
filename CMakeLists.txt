@@ -274,6 +274,8 @@ pagecore_fetchcontent_make_available_excluded(quickjs_ng)
 
 find_package(CURL REQUIRED)
 
+find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
+
 set(PAGECORE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(PAGECORE_DOM_SHIM_PARTS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/00_runtime.js"
@@ -315,6 +317,19 @@ if(PAGECORE_MINIFY_DOM_SHIM)
     )
 endif()
 
+# Strip comments from the concatenated shim before embedding it. Requires node
+# (a tokenizer-aware strip; a regex would corrupt strings/regex literals). When
+# node is absent the shim is embedded with comments intact.
+set(PAGECORE_DOM_SHIM_STRIPPER "${CMAKE_CURRENT_SOURCE_DIR}/cmake/strip_js_comments.js")
+option(PAGECORE_STRIP_DOM_SHIM_COMMENTS "Strip comments from the generated DOM shim" ON)
+if(PAGECORE_STRIP_DOM_SHIM_COMMENTS AND PAGECORE_NODE_EXECUTABLE)
+    list(APPEND PAGECORE_DOM_SHIM_BUILD_ARGS
+        -DSTRIP_COMMENTS=ON
+        "-DNODE_EXECUTABLE=${PAGECORE_NODE_EXECUTABLE}"
+        "-DCOMMENT_STRIPPER=${PAGECORE_DOM_SHIM_STRIPPER}"
+    )
+endif()
+
 add_custom_command(
     OUTPUT ${PAGECORE_DOM_SHIM_BUILD_OUTPUTS}
     COMMAND
@@ -327,6 +342,7 @@ add_custom_command(
     DEPENDS
         ${PAGECORE_DOM_SHIM_PARTS}
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_dom_shim.cmake"
+        "${PAGECORE_DOM_SHIM_STRIPPER}"
     VERBATIM
 )
 
@@ -345,7 +361,6 @@ add_custom_command(
 )
 add_custom_target(pagecore_dom_shim DEPENDS "${PAGECORE_DOM_SHIM_HEADER}")
 
-find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
 if(PAGECORE_NODE_EXECUTABLE)
     add_custom_target(pagecore_dom_shim_check
         COMMAND
@@ -490,6 +505,31 @@ if(PAGECORE_BUILD_TESTS)
                 --html "<html><body><div style='width:20px;height:10px;background:#f00'></div></body></html>"
                 --dump-display-list "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_display_list_test.json"
                 --viewport 64x48
+        )
+
+        # Negative argument-parsing cases must exit non-zero with a clear error.
+        add_test(
+            NAME pagecore_cli_rejects_viewport_overflow
+            COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --viewport 99999999999x10
+        )
+        add_test(
+            NAME pagecore_cli_rejects_viewport_over_max
+            COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --viewport 200000x200000
+        )
+        add_test(
+            NAME pagecore_cli_rejects_bad_scale
+            COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --scale 1e30
+        )
+        add_test(
+            NAME pagecore_cli_rejects_missing_value
+            COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --viewport
+        )
+        set_tests_properties(
+            pagecore_cli_rejects_viewport_overflow
+            pagecore_cli_rejects_viewport_over_max
+            pagecore_cli_rejects_bad_scale
+            pagecore_cli_rejects_missing_value
+            PROPERTIES WILL_FAIL TRUE
         )
     endif()
 endif()

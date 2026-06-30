@@ -230,6 +230,9 @@
         class URLSearchParams {
           constructor(init = undefined) {
             this._entries = [];
+            // Optional callback invoked after mutations so an owning URL can keep
+            // its search/href in sync with a live searchParams object.
+            this._onChange = null;
             if (init == null) return;
             if (init instanceof URLSearchParams) {
               this._entries = init._entries.map((entry) => [entry[0], entry[1]]);
@@ -252,10 +255,12 @@
             }
           }
 
-          append(name, value) { this._entries.push([String(name), String(value)]); }
+          _notify() { if (typeof this._onChange === 'function') this._onChange(this.toString()); }
+          append(name, value) { this._entries.push([String(name), String(value)]); this._notify(); }
           delete(name) {
             name = String(name);
             this._entries = this._entries.filter((entry) => entry[0] !== name);
+            this._notify();
           }
           get(name) {
             name = String(name);
@@ -287,8 +292,9 @@
             }
             if (!replaced) out.push([name, value]);
             this._entries = out;
+            this._notify();
           }
-          sort() { this._entries.sort((left, right) => left[0].localeCompare(right[0])); }
+          sort() { this._entries.sort((left, right) => left[0].localeCompare(right[0])); this._notify(); }
           forEach(callback, thisArg = undefined) {
             for (const [name, value] of this._entries) callback.call(thisArg, value, name, this);
           }
@@ -400,7 +406,13 @@
             this._parts.hash = text && !text.startsWith('#') ? `#${text}` : text;
           }
           get searchParams() {
-            if (!this._searchParams) this._searchParams = new URLSearchParams(this.search);
+            if (!this._searchParams) {
+              this._searchParams = new URLSearchParams(this.search);
+              // Keep the URL's search/href in sync with live mutations.
+              this._searchParams._onChange = (serialized) => {
+                this._parts.search = serialized ? `?${serialized}` : '';
+              };
+            }
             return this._searchParams;
           }
           toString() { return this.href; }
@@ -894,7 +906,9 @@
 
         function callTimerCallback(timer) {
           if (typeof timer.callback === 'function') {
-            timer.callback(...timer.args);
+            // Timer callbacks run with the global object as `this`, per spec,
+            // so non-strict callbacks relying on `this === window` work.
+            timer.callback.call(global, ...timer.args);
           }
         }
 
@@ -947,9 +961,13 @@
           if (array.byteLength > 65536) {
             throw new DOMException('Quota exceeded.', 'QuotaExceededError');
           }
+          if (!host || typeof host.randomBytes !== 'function') {
+            throw new DOMException('A secure random source is not available', 'NotSupportedError');
+          }
+          const random = host.randomBytes(array.byteLength);
           const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
           for (let index = 0; index < bytes.length; index++) {
-            bytes[index] = Math.floor(Math.random() * 256);
+            bytes[index] = random[index] & 0xff;
           }
           return array;
         }

@@ -25,8 +25,14 @@ std::string to_string(const lxb_char_t* data, size_t len)
 
 lxb_status_t append_serialized(const lxb_char_t* data, size_t len, void* ctx)
 {
-    auto* out = static_cast<std::string*>(ctx);
-    out->append(reinterpret_cast<const char*>(data), len);
+    // C callback from Lexbor serialization — contain any C++ exception (e.g.
+    // std::bad_alloc from append) so it cannot unwind through the C frame.
+    try {
+        auto* out = static_cast<std::string*>(ctx);
+        out->append(reinterpret_cast<const char*>(data), len);
+    } catch (...) {
+        return LXB_STATUS_ERROR;
+    }
     return LXB_STATUS_OK;
 }
 
@@ -55,17 +61,27 @@ std::string character_data(lxb_dom_node_t* node)
     return to_string(data->data.data, data->data.length);
 }
 
+// Iterative pre-order traversal — recursion here would overflow the native
+// stack on deeply nested DOM trees (attacker-controlled via HTML or JS).
 void append_descendant_text(lxb_dom_node_t* node, std::string& out)
 {
     if (node == nullptr) {
         return;
     }
 
-    for (auto* child = node->first_child; child != nullptr; child = child->next) {
-        if (is_text_content_descendant(child)) {
-            out += character_data(child);
+    std::vector<lxb_dom_node_t*> stack;
+    for (auto* child = node->last_child; child != nullptr; child = child->prev) {
+        stack.push_back(child);
+    }
+    while (!stack.empty()) {
+        auto* current = stack.back();
+        stack.pop_back();
+        if (is_text_content_descendant(current)) {
+            out += character_data(current);
         } else {
-            append_descendant_text(child, out);
+            for (auto* child = current->last_child; child != nullptr; child = child->prev) {
+                stack.push_back(child);
+            }
         }
     }
 }
@@ -76,9 +92,15 @@ void collect_subtree(lxb_dom_node_t* node, std::vector<lxb_dom_node_t*>& out)
         return;
     }
 
-    out.push_back(node);
-    for (auto* child = node->first_child; child != nullptr; child = child->next) {
-        collect_subtree(child, out);
+    std::vector<lxb_dom_node_t*> stack;
+    stack.push_back(node);
+    while (!stack.empty()) {
+        auto* current = stack.back();
+        stack.pop_back();
+        out.push_back(current);
+        for (auto* child = current->last_child; child != nullptr; child = child->prev) {
+            stack.push_back(child);
+        }
     }
 }
 
@@ -89,8 +111,14 @@ struct SelectorResults {
 
 lxb_status_t selector_callback(lxb_dom_node_t* node, lxb_css_selector_specificity_t, void* ctx)
 {
-    auto* results = static_cast<SelectorResults*>(ctx);
-    results->ids.push_back(results->impl->id_for(node));
+    // This runs as a C callback from Lexbor; a C++ exception unwinding through
+    // the C frame would be undefined behavior, so contain it here.
+    try {
+        auto* results = static_cast<SelectorResults*>(ctx);
+        results->ids.push_back(results->impl->id_for(node));
+    } catch (...) {
+        return LXB_STATUS_ERROR;
+    }
     return LXB_STATUS_OK;
 }
 
@@ -168,13 +196,16 @@ void DomDocument::Impl::forget_subtree(lxb_dom_node_t* node)
         return;
     }
 
-    for (auto* child = node->first_child; child != nullptr;) {
-        auto* next = child->next;
-        forget_subtree(child);
-        child = next;
+    std::vector<lxb_dom_node_t*> stack;
+    stack.push_back(node);
+    while (!stack.empty()) {
+        auto* current = stack.back();
+        stack.pop_back();
+        for (auto* child = current->first_child; child != nullptr; child = child->next) {
+            stack.push_back(child);
+        }
+        forget_node(current);
     }
-
-    forget_node(node);
 }
 
 void DomDocument::Impl::mark_mutated()
@@ -208,8 +239,20 @@ DomDocument& DomDocument::operator=(DomDocument&& other) noexcept
 
 void DomDocument::parse(std::string_view html)
 {
+    // Carry the id counter and mutation version forward across reparse so node
+    // ids from a previous document are never reused and the monotonic mutation
+    // version keeps invalidating any stale wrappers held elsewhere.
+    NodeId carried_next_id = 1;
+    std::uint64_t carried_mutation_version = 1;
+    if (impl_ != nullptr) {
+        carried_next_id = impl_->next_id;
+        carried_mutation_version = impl_->mutation_version;
+    }
+
     delete impl_;
     impl_ = new Impl();
+    impl_->next_id = carried_next_id;
+    impl_->mutation_version = carried_mutation_version + 1;
 
     const auto status = lxb_html_document_parse(
         impl_->document,

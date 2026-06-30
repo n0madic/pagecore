@@ -584,6 +584,15 @@ public:
         return true;
     }
 
+    // Consume a single byte. Used to skip an unrecognized token so the parser
+    // is guaranteed to make forward progress on malformed input.
+    void advance_one()
+    {
+        if (current_ < end_) {
+            ++current_;
+        }
+    }
+
 private:
     void skip_separators()
     {
@@ -725,10 +734,19 @@ void add_path_data(cairo_t* cr, std::string_view path)
             x = subpath_x;
             y = subpath_y;
             previous_command = command;
+            // Skip any unrecognized token so a stuck 'z' + junk cannot loop.
+            if (!parser.done() && !parser.next_is_command() && !parser.next_is_number()) {
+                parser.advance_one();
+            }
             continue;
         }
 
         if (!parser.next_is_number()) {
+            // The token is neither a number for this command nor a new command;
+            // consume one byte to guarantee forward progress on malformed paths.
+            if (!parser.done() && !parser.next_is_command()) {
+                parser.advance_one();
+            }
             previous_command = command;
             continue;
         }
@@ -1092,15 +1110,23 @@ SvgViewport parse_svg_viewport(std::string_view bytes)
         }
     }
 
+    // Clamp the (attacker-controlled) length to a safe range as a double before
+    // narrowing to int — casting an out-of-range double to int is UB.
+    const auto to_dimension = [](double value) {
+        if (!std::isfinite(value)) {
+            return 1;
+        }
+        return static_cast<int>(std::round(std::clamp(value, 1.0, 8192.0)));
+    };
     if (auto width = attr(root.attributes, "width")) {
-        viewport.width = static_cast<int>(std::round(parse_length(*width, viewport.width)));
+        viewport.width = to_dimension(parse_length(*width, viewport.width));
     } else if (viewport.has_viewbox) {
-        viewport.width = static_cast<int>(std::round(viewport.viewbox_width));
+        viewport.width = to_dimension(viewport.viewbox_width);
     }
     if (auto height = attr(root.attributes, "height")) {
-        viewport.height = static_cast<int>(std::round(parse_length(*height, viewport.height)));
+        viewport.height = to_dimension(parse_length(*height, viewport.height));
     } else if (viewport.has_viewbox) {
-        viewport.height = static_cast<int>(std::round(viewport.viewbox_height));
+        viewport.height = to_dimension(viewport.viewbox_height);
     }
 
     viewport.width = std::clamp(viewport.width, 1, 8192);
@@ -1455,6 +1481,10 @@ std::shared_ptr<const DecodedImage> decode_svg_rgba(std::string_view bytes)
     }
 
     const SvgViewport viewport = parse_svg_viewport(bytes);
+    // Enforce the decoded-image byte budget before allocating the cairo surface,
+    // so a large viewport cannot force a multi-hundred-MB transient allocation
+    // that the post-decode check would only reject after the fact.
+    (void) checked_rgba_size(viewport.width, viewport.height, "decode SVG");
     cairo_surface_t* raw_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, viewport.width, viewport.height);
     std::unique_ptr<cairo_surface_t, decltype(&cairo_surface_destroy)> surface(raw_surface, cairo_surface_destroy);
     const cairo_status_t surface_status = cairo_surface_status(surface.get());

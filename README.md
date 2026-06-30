@@ -10,7 +10,9 @@ Small modular web engine for headless automation, embedding, offscreen rendering
 - `dom_bridge` exposes primitive DOM operations to JS and keeps Lexbor as the only DOM source of truth.
 - `src/dom_shim/` contains standalone `install(ctx, api)` JavaScript modules for the browser-like `window`, `document`, `Node`, `Element`, `HTMLElement`, events, DOM traversal, constraint validation, forms, timers, CSSOM, streams, fetch/XHR, and related shims. Each module declares explicit dependencies and exports; CMake concatenates them into `generated/dom_shim.js` at build time and embeds that generated artifact into the binary.
 - DOM wrappers are hardened with a Lexbor-backed `mutationVersion`/`hasNode` contract so stale wrappers after destructive mutations fail cleanly instead of dereferencing removed nodes.
-- Resources flow through `ResourceRequest`/`ResourceResponse` with request kinds (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `Other`), typed `ResourceError`s, `ResourcePolicy`, and an optional `CachingResourceLoader` decorator.
+- Resources flow through `ResourceRequest`/`ResourceResponse` with request kinds (`Document`, `Script`, `Stylesheet`, `Image`, `Font`, `Other`), typed `ResourceError`s, `ResourcePolicy`, and an optional bounded, thread-safe `CachingResourceLoader` decorator (LRU-capped; error responses are not cached).
+- `ResourcePolicy` is secure by default: `block_private_hosts` rejects loopback/private/link-local/cloud-metadata targets (enforced on literal-IP URLs and, via a connect-time socket callback, on the post-DNS address, closing DNS-rebinding and redirect-to-internal SSRF), `allow_file_from_network` is off so a network-origin document cannot read local files, and `file_root` optionally sandboxes `file://` reads (symlink/`..` escapes are rejected; only regular files within the size limit are served). The initial transfer and redirects are pinned to the allowed scheme set.
+- The DOM shim removes the raw native `__dom`/`__host` bridges from the page-visible global after install, so page script must go through the wrapper layer instead of the C++ API directly. `crypto.getRandomValues`/`randomUUID` are backed by the host OS CSPRNG, not `Math.random`.
 - `Page`, JS script loading, litehtml stylesheet imports, and image placeholders use the same resource pipeline.
 - Rendering is adapter-shaped. `include/pagecore/render.hpp` defines a backend-neutral `DisplayList` boundary between layout engines and raster backends.
 - `Page::display_list(RenderOptions)` serializes the JS-mutated Lexbor DOM, runs the configured layout engine, and returns backend-neutral commands.
@@ -88,6 +90,8 @@ cmake -S . -B build-size \
 ```
 
 When enabled, CMake still writes the readable concatenated shim to `generated/dom_shim.js`, then embeds `generated/dom_shim.min.js`.
+
+By default the concatenated shim has its comments stripped before embedding (via a tokenizer-aware `cmake/strip_js_comments.js` run with `node`, which preserves strings and regex literals). This requires `node`; when it is unavailable the shim is embedded with comments intact. Disable with `-DPAGECORE_STRIP_DOM_SHIM_COMMENTS=OFF`.
 
 If `node` is available, `pagecore_dom_shim_check` and the `pagecore_dom_shim_modules` CTest verify that each DOM shim module can be syntax-checked, executed standalone, and loaded as a module definition with the expected dependency contract. The `pagecore_dom_shim_unit_tests` target and CTest run focused Node tests from `tests/dom_shim/` for core URL/resource helpers, event dispatch/abort behavior, DOMException constants, DOM traversal, form validation, FormData, web utility shims, timers, streams, compat helpers, and runtime dependency errors. Worker and ServiceWorker surfaces are intentionally explicit `NotSupportedError` paths until PageCore has a real worker runtime.
 
