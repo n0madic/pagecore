@@ -516,6 +516,16 @@ if(PAGECORE_BUILD_TESTS)
                 --dump-display-list "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_display_list_test.json"
                 --viewport 64x48
         )
+        add_test(
+            NAME pagecore_cli_full_page
+            COMMAND
+                $<TARGET_FILE:pagecore_cli>
+                --html "<html><body style='margin:0'><div style='width:40px;height:300px;background:#f00'></div></body></html>"
+                --format png
+                --output "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_full_page_test.png"
+                --viewport 40x10
+                --full-page
+        )
 
         # Negative argument-parsing cases must exit non-zero with a clear error.
         add_test(

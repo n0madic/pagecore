@@ -128,6 +128,17 @@ build/pagecore_cli \
   --scale 1
 ```
 
+`--full-page` expands the viewport height to the page's actual content height before rendering, so the PNG/PDF/display-list output covers the whole page instead of being cropped to `--viewport`'s height (the requested width is kept as-is, since layout reflows on width, not height):
+
+```sh
+build/pagecore_cli \
+  --file ./page.html \
+  --format png \
+  --output /tmp/pagecore-fullpage.png \
+  --viewport 1280x720 \
+  --full-page
+```
+
 Display-list debugging is available in the default top-level build:
 
 ```sh

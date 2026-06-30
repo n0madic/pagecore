@@ -2,6 +2,7 @@
 #include "pagecore/image_io.hpp"
 #include "pagecore/render.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <fstream>
@@ -49,8 +50,10 @@ void usage(const char* argv0)
         << "  --format FORMAT          output format: html, png, or pdf; default html\n"
         << "  --output PATH            output path; required for png/pdf, optional for html\n"
         << "  --viewport WIDTHxHEIGHT  render viewport, default 1280x720\n"
+        << "  --full-page              expand the viewport height to the full page content height before rendering\n"
         << "  --scale NUMBER           render scale factor, default 1\n"
         << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 5000\n"
+        << "  --js-timeout-ms NUMBER   per-script execution deadline, default 5000\n"
         << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n";
 }
 
@@ -171,6 +174,7 @@ int main(int argc, char** argv)
         pagecore::RenderOptions render_options;
         pagecore::LoadOptions load_options;
         bool stdin_input = false;
+        bool full_page = false;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -199,10 +203,12 @@ int main(int argc, char** argv)
             }
             else if (arg == "--scale") render_options.viewport.device_scale_factor = parse_positive_float(next(), "scale");
             else if (arg == "--wait-ms") load_options.wait_time = std::chrono::milliseconds(parse_nonnegative_int(next(), "wait-ms"));
+            else if (arg == "--js-timeout-ms") load_options.js_timeout = std::chrono::milliseconds(parse_positive_int(next(), "js-timeout-ms"));
             else if (arg == "--js-memory-mb") {
                 load_options.js_memory_limit_bytes = static_cast<std::size_t>(parse_positive_int(next(), "js-memory-mb")) * 1024 * 1024;
             }
             else if (arg == "--stdin") stdin_input = true;
+            else if (arg == "--full-page") full_page = true;
             else if (arg == "--help" || arg == "-h") {
                 usage(argv[0]);
                 return 0;
@@ -231,6 +237,23 @@ int main(int argc, char** argv)
         const bool has_eval = !eval.empty();
         if (has_eval) {
             eval_result = page.eval(eval);
+        }
+
+        if (full_page) {
+            // The raster/PDF backends size their canvas strictly off
+            // render_options.viewport (not content_width/content_height), so
+            // expanding the viewport to the real content height up front
+            // makes every later display_list()/render()/write_pdf() call
+            // (and the --dump-display-list path below) capture the whole
+            // page in a single, cached layout pass instead of cropping it
+            // to the originally requested viewport height.
+            const int content_height = page.display_list(render_options).content_height;
+            if (content_height > kMaxViewportDimension) {
+                throw std::runtime_error(
+                    "--full-page content height (" + std::to_string(content_height)
+                    + ") exceeds max viewport dimension (" + std::to_string(kMaxViewportDimension) + ")");
+            }
+            render_options.viewport.height = std::max(1, content_height);
         }
 
         if (output_format == OutputFormat::Html) {
