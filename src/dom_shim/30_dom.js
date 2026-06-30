@@ -377,6 +377,253 @@
           [Symbol.iterator]() { return this._tokens()[Symbol.iterator](); }
         }
 
+        const NodeFilter = Object.freeze({
+          FILTER_ACCEPT: 1,
+          FILTER_REJECT: 2,
+          FILTER_SKIP: 3,
+          SHOW_ALL: 0xFFFFFFFF,
+          SHOW_ELEMENT: 0x1,
+          SHOW_ATTRIBUTE: 0x2,
+          SHOW_TEXT: 0x4,
+          SHOW_CDATA_SECTION: 0x8,
+          SHOW_ENTITY_REFERENCE: 0x10,
+          SHOW_ENTITY: 0x20,
+          SHOW_PROCESSING_INSTRUCTION: 0x40,
+          SHOW_COMMENT: 0x80,
+          SHOW_DOCUMENT: 0x100,
+          SHOW_DOCUMENT_TYPE: 0x200,
+          SHOW_DOCUMENT_FRAGMENT: 0x400,
+          SHOW_NOTATION: 0x800
+        });
+
+        const nodeTypeShowMask = {
+          1: NodeFilter.SHOW_ELEMENT,
+          2: NodeFilter.SHOW_ATTRIBUTE,
+          3: NodeFilter.SHOW_TEXT,
+          4: NodeFilter.SHOW_CDATA_SECTION,
+          5: NodeFilter.SHOW_ENTITY_REFERENCE,
+          6: NodeFilter.SHOW_ENTITY,
+          7: NodeFilter.SHOW_PROCESSING_INSTRUCTION,
+          8: NodeFilter.SHOW_COMMENT,
+          9: NodeFilter.SHOW_DOCUMENT,
+          10: NodeFilter.SHOW_DOCUMENT_TYPE,
+          11: NodeFilter.SHOW_DOCUMENT_FRAGMENT,
+          12: NodeFilter.SHOW_NOTATION
+        };
+
+        function childNodesArray(node) {
+          if (!node || !node.childNodes) return [];
+          return Array.from(node.childNodes);
+        }
+
+        function firstChildNode(node) {
+          return childNodesArray(node)[0] || null;
+        }
+
+        function lastChildNode(node) {
+          const children = childNodesArray(node);
+          return children[children.length - 1] || null;
+        }
+
+        function nextTreeNode(node, root, skipChildren = false) {
+          if (!skipChildren) {
+            const child = firstChildNode(node);
+            if (child) return child;
+          }
+
+          for (let current = node; current && current !== root; current = current.parentNode || null) {
+            if (current.nextSibling) return current.nextSibling;
+          }
+          return null;
+        }
+
+        function previousTreeNode(node, root) {
+          if (!node || node === root) return null;
+
+          let previous = node.previousSibling;
+          if (previous) {
+            for (;;) {
+              const child = lastChildNode(previous);
+              if (!child) return previous;
+              previous = child;
+            }
+          }
+
+          return node.parentNode || null;
+        }
+
+        function traversalFilterResult(filter, node) {
+          if (!filter) return NodeFilter.FILTER_ACCEPT;
+          const callback = typeof filter === 'function' ? filter : filter.acceptNode;
+          if (typeof callback !== 'function') return NodeFilter.FILTER_ACCEPT;
+          const result = Number(callback.call(filter, node));
+          if (result === NodeFilter.FILTER_REJECT || result === NodeFilter.FILTER_SKIP) return result;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+
+        function traversalAccept(whatToShow, filter, node) {
+          const mask = nodeTypeShowMask[node && node.nodeType] || 0;
+          if ((whatToShow & mask) === 0) return NodeFilter.FILTER_SKIP;
+          return traversalFilterResult(filter, node);
+        }
+
+        class TreeWalker {
+          constructor(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+            if (!root) throw new TypeError('TreeWalker root must be a Node');
+            this.root = root;
+            this.whatToShow = Number(whatToShow) >>> 0;
+            this.filter = filter || null;
+            this.currentNode = root;
+          }
+
+          _accept(node) {
+            return traversalAccept(this.whatToShow, this.filter, node);
+          }
+
+          _firstAcceptedInSubtree(node) {
+            for (let current = node; current;) {
+              const result = this._accept(current);
+              if (result === NodeFilter.FILTER_ACCEPT) return current;
+              current = nextTreeNode(current, node, result === NodeFilter.FILTER_REJECT);
+            }
+            return null;
+          }
+
+          _lastAcceptedInSubtree(node) {
+            let last = null;
+            for (let current = node; current;) {
+              const result = this._accept(current);
+              if (result === NodeFilter.FILTER_ACCEPT) last = current;
+              current = nextTreeNode(current, node, result === NodeFilter.FILTER_REJECT);
+            }
+            return last;
+          }
+
+          parentNode() {
+            for (let node = this.currentNode && this.currentNode.parentNode; node && node !== this.root; node = node.parentNode) {
+              if (this._accept(node) === NodeFilter.FILTER_ACCEPT) {
+                this.currentNode = node;
+                return node;
+              }
+            }
+            return null;
+          }
+
+          firstChild() {
+            for (let node = firstChildNode(this.currentNode); node;) {
+              const found = this._firstAcceptedInSubtree(node);
+              if (found) {
+                this.currentNode = found;
+                return found;
+              }
+              node = node.nextSibling;
+            }
+            return null;
+          }
+
+          lastChild() {
+            for (let node = lastChildNode(this.currentNode); node;) {
+              const found = this._lastAcceptedInSubtree(node);
+              if (found) {
+                this.currentNode = found;
+                return found;
+              }
+              node = node.previousSibling;
+            }
+            return null;
+          }
+
+          nextSibling() {
+            for (let node = this.currentNode && this.currentNode.nextSibling; node; node = node.nextSibling) {
+              const found = this._firstAcceptedInSubtree(node);
+              if (found) {
+                this.currentNode = found;
+                return found;
+              }
+            }
+            return null;
+          }
+
+          previousSibling() {
+            for (let node = this.currentNode && this.currentNode.previousSibling; node; node = node.previousSibling) {
+              const found = this._lastAcceptedInSubtree(node);
+              if (found) {
+                this.currentNode = found;
+                return found;
+              }
+            }
+            return null;
+          }
+
+          nextNode() {
+            for (let node = nextTreeNode(this.currentNode, this.root); node;) {
+              const result = this._accept(node);
+              if (result === NodeFilter.FILTER_ACCEPT) {
+                this.currentNode = node;
+                return node;
+              }
+              node = nextTreeNode(node, this.root, result === NodeFilter.FILTER_REJECT);
+            }
+            return null;
+          }
+
+          previousNode() {
+            for (let node = previousTreeNode(this.currentNode, this.root); node && node !== this.root; node = previousTreeNode(node, this.root)) {
+              if (this._accept(node) === NodeFilter.FILTER_ACCEPT) {
+                this.currentNode = node;
+                return node;
+              }
+            }
+            return null;
+          }
+        }
+
+        class NodeIterator {
+          constructor(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+            if (!root) throw new TypeError('NodeIterator root must be a Node');
+            this.root = root;
+            this.whatToShow = Number(whatToShow) >>> 0;
+            this.filter = filter || null;
+            this.referenceNode = root;
+            this.pointerBeforeReferenceNode = true;
+          }
+
+          _accept(node) {
+            return traversalAccept(this.whatToShow, this.filter, node) === NodeFilter.FILTER_ACCEPT;
+          }
+
+          nextNode() {
+            let node = this.pointerBeforeReferenceNode
+              ? this.referenceNode
+              : nextTreeNode(this.referenceNode, this.root);
+            for (; node; node = nextTreeNode(node, this.root)) {
+              if (this._accept(node)) {
+                this.referenceNode = node;
+                this.pointerBeforeReferenceNode = false;
+                return node;
+              }
+            }
+            return null;
+          }
+
+          previousNode() {
+            let node = this.pointerBeforeReferenceNode
+              ? previousTreeNode(this.referenceNode, this.root)
+              : this.referenceNode;
+            for (; node; node = previousTreeNode(node, this.root)) {
+              if (this._accept(node)) {
+                this.referenceNode = node;
+                this.pointerBeforeReferenceNode = true;
+                return node;
+              }
+              if (node === this.root) break;
+            }
+            return null;
+          }
+
+          detach() {}
+        }
+
         class DocumentFragment extends EventTarget {
           constructor() {
             super();
@@ -507,6 +754,176 @@
           reportValidity() { return true; }
           setFormValue() {}
           setValidity() {}
+        }
+
+        const validityFlagNames = [
+          'valueMissing',
+          'typeMismatch',
+          'patternMismatch',
+          'tooLong',
+          'tooShort',
+          'rangeUnderflow',
+          'rangeOverflow',
+          'stepMismatch',
+          'badInput',
+          'customError'
+        ];
+
+        class ValidityState {
+          constructor(flags = {}) {
+            for (const name of validityFlagNames) {
+              defineValue(this, name, Boolean(flags[name]), true);
+            }
+          }
+
+          get valid() {
+            return !validityFlagNames.some((name) => this[name]);
+          }
+        }
+
+        function formOwner(element) {
+          const id = element.getAttribute && element.getAttribute('form');
+          if (id) {
+            const owned = document.getElementById(id);
+            if (owned && owned.localName === 'form') return owned;
+          }
+          for (let node = element.parentElement; node; node = node.parentElement) {
+            if (node.localName === 'form') return node;
+          }
+          return null;
+        }
+
+        function normalizedInputType(element) {
+          return String(element.getAttribute('type') || 'text').toLowerCase();
+        }
+
+        function validationValue(element) {
+          if (element.localName === 'select') return element.value || '';
+          if (element.localName === 'textarea') return element.value || '';
+          if (element.localName === 'input') {
+            const type = normalizedInputType(element);
+            if (type === 'checkbox' || type === 'radio') return element.checked ? (element.getAttribute('value') || 'on') : '';
+            return element.value || '';
+          }
+          return element.getAttribute('value') || '';
+        }
+
+        function isValidationCandidate(element) {
+          if (!element || typeof element.localName !== 'string') return false;
+          if (element.hasAttribute && element.hasAttribute('disabled')) return false;
+          if (element.localName === 'select' || element.localName === 'textarea') return true;
+          if (element.localName !== 'input') return false;
+          return !['hidden', 'button', 'submit', 'reset', 'image'].includes(normalizedInputType(element));
+        }
+
+        function radioGroupRequiredMissing(element) {
+          const name = element.getAttribute('name') || '';
+          const form = formOwner(element);
+          const root = form || document;
+          const selector = name
+            ? `input[type="radio"][name="${String(name).replace(/"/g, '\\"')}"]`
+            : 'input[type="radio"]';
+          const radios = root.querySelectorAll ? root.querySelectorAll(selector) : [element];
+          for (const radio of radios) {
+            if (radio.checked) return false;
+          }
+          return true;
+        }
+
+        function numericAttribute(element, name) {
+          const raw = element.getAttribute(name);
+          if (raw == null || raw === '') return null;
+          const value = Number(raw);
+          return Number.isFinite(value) ? value : null;
+        }
+
+        function validationFlags(element) {
+          const flags = Object.create(null);
+          for (const name of validityFlagNames) flags[name] = false;
+          if (!isValidationCandidate(element)) return flags;
+
+          const value = validationValue(element);
+          const type = element.localName === 'input' ? normalizedInputType(element) : element.localName;
+
+          if (element.hasAttribute('required')) {
+            if (type === 'checkbox') flags.valueMissing = !element.checked;
+            else if (type === 'radio') flags.valueMissing = radioGroupRequiredMissing(element);
+            else flags.valueMissing = value === '';
+          }
+
+          if (value !== '') {
+            if (type === 'email') {
+              flags.typeMismatch = !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+            } else if (type === 'url') {
+              try {
+                const URLConstructor = global.URL || globalThis.URL;
+                if (!URLConstructor) throw new TypeError('URL is not available');
+                new URLConstructor(value, global.location && global.location.href ? global.location.href : undefined);
+              } catch (_error) {
+                flags.typeMismatch = true;
+              }
+            }
+
+            const pattern = element.getAttribute('pattern');
+            if (pattern != null) {
+              try {
+                flags.patternMismatch = !(new RegExp(`^(?:${pattern})$`)).test(value);
+              } catch (_error) {
+                flags.patternMismatch = false;
+              }
+            }
+
+            const minLength = numericAttribute(element, 'minlength');
+            const maxLength = numericAttribute(element, 'maxlength');
+            if (minLength != null && value.length < minLength) flags.tooShort = true;
+            if (maxLength != null && value.length > maxLength) flags.tooLong = true;
+
+            if (type === 'number' || type === 'range') {
+              const number = Number(value);
+              if (!Number.isFinite(number)) {
+                flags.badInput = true;
+              } else {
+                const min = numericAttribute(element, 'min');
+                const max = numericAttribute(element, 'max');
+                if (min != null && number < min) flags.rangeUnderflow = true;
+                if (max != null && number > max) flags.rangeOverflow = true;
+
+                const stepAttr = element.getAttribute('step');
+                if (stepAttr !== 'any') {
+                  const step = stepAttr == null || stepAttr === '' ? 1 : Number(stepAttr);
+                  if (Number.isFinite(step) && step > 0) {
+                    const base = min != null ? min : 0;
+                    const remainder = Math.abs((number - base) % step);
+                    if (remainder > 1e-9 && Math.abs(remainder - step) > 1e-9) flags.stepMismatch = true;
+                  }
+                }
+              }
+            }
+          }
+
+          flags.customError = Boolean(element.__customValidityMessage);
+          return flags;
+        }
+
+        function validationMessageFor(element) {
+          const validity = element.validity;
+          if (validity.valid) return '';
+          if (validity.customError) return element.__customValidityMessage || '';
+          if (validity.valueMissing) return 'Please fill out this field.';
+          if (validity.typeMismatch) return 'Please enter a valid value.';
+          if (validity.patternMismatch) return 'Please match the requested format.';
+          if (validity.tooShort) return 'Please lengthen this text.';
+          if (validity.tooLong) return 'Please shorten this text.';
+          if (validity.rangeUnderflow) return 'Value must be greater than or equal to the minimum.';
+          if (validity.rangeOverflow) return 'Value must be less than or equal to the maximum.';
+          if (validity.stepMismatch) return 'Please enter a valid value.';
+          if (validity.badInput) return 'Please enter a number.';
+          return 'Please enter a valid value.';
+        }
+
+        function listedFormControls(root) {
+          if (!root || typeof root.querySelectorAll !== 'function') return [];
+          return root.querySelectorAll('button,input,select,textarea');
         }
 
         function isDocumentFragment(value) {
@@ -2150,13 +2567,63 @@
             return this.parentElement || (root instanceof ShadowRoot ? root.host : null) || document.body || null;
           }
         }
+        class HTMLFormControlElement extends HTMLElement {
+          get form() { return formOwner(this); }
+          get name() { return this.getAttribute('name') || ''; }
+          set name(value) { this.setAttribute('name', String(value)); }
+          get disabled() { return this.hasAttribute('disabled'); }
+          set disabled(value) { this.toggleAttribute('disabled', Boolean(value)); }
+          get required() { return this.hasAttribute('required'); }
+          set required(value) { this.toggleAttribute('required', Boolean(value)); }
+          get willValidate() { return isValidationCandidate(this); }
+          get validity() { return new ValidityState(validationFlags(this)); }
+          get validationMessage() { return validationMessageFor(this); }
+          setCustomValidity(message) {
+            const text = String(message ?? '');
+            if (text) defineValue(this, '__customValidityMessage', text);
+            else if (Object.prototype.hasOwnProperty.call(this, '__customValidityMessage')) {
+              delete this.__customValidityMessage;
+            }
+          }
+          checkValidity() {
+            if (!this.willValidate || this.validity.valid) return true;
+            this.dispatchEvent(new Event('invalid', { cancelable: true }));
+            return false;
+          }
+          reportValidity() { return this.checkValidity(); }
+        }
         class HTMLAnchorElement extends HTMLElement {}
         class HTMLAreaElement extends HTMLElement {}
-        class HTMLAudioElement extends HTMLElement {}
+        class HTMLMediaElement extends HTMLElement {
+          get muted() { return this.hasAttribute('muted'); }
+          set muted(value) { this.toggleAttribute('muted', Boolean(value)); }
+          get paused() { return !this.__playing; }
+          get currentTime() { return Number(this.__currentTime || 0); }
+          set currentTime(value) {
+            const next = Number(value);
+            defineValue(this, '__currentTime', Number.isFinite(next) && next >= 0 ? next : 0);
+          }
+          canPlayType() { return ''; }
+          load() {}
+          play() {
+            defineValue(this, '__playing', true);
+            return Promise.resolve();
+          }
+          pause() { defineValue(this, '__playing', false); }
+          addTextTrack() { return {}; }
+        }
+        class HTMLAudioElement extends HTMLMediaElement {}
         class HTMLBaseElement extends HTMLElement {}
         class HTMLBodyElement extends HTMLElement {}
         class HTMLBRElement extends HTMLElement {}
-        class HTMLButtonElement extends HTMLElement {}
+        class HTMLButtonElement extends HTMLFormControlElement {
+          get type() {
+            const type = String(this.getAttribute('type') || 'submit').toLowerCase();
+            return ['submit', 'reset', 'button'].includes(type) ? type : 'submit';
+          }
+          set type(value) { this.setAttribute('type', String(value)); }
+          get willValidate() { return false; }
+        }
         class HTMLCanvasElement extends HTMLElement {
           getContext() { return null; }
           toDataURL() { return 'data:,'; }
@@ -2177,7 +2644,41 @@
         class HTMLDListElement extends HTMLElement {}
         class HTMLEmbedElement extends HTMLElement {}
         class HTMLFieldSetElement extends HTMLElement {}
-        class HTMLFormElement extends HTMLElement {}
+        class HTMLFormElement extends HTMLElement {
+          get elements() {
+            const controls = listedFormControls(this);
+            defineValue(controls, 'item', function(index) { return this[Number(index)] || null; });
+            defineValue(controls, 'namedItem', function(name) {
+              const key = String(name);
+              return this.find((control) => control.name === key || control.id === key) || null;
+            });
+            return controls;
+          }
+          get length() { return this.elements.length; }
+          checkValidity() {
+            let valid = true;
+            for (const control of this.elements) {
+              if (control.willValidate && !control.checkValidity()) valid = false;
+            }
+            return valid;
+          }
+          reportValidity() { return this.checkValidity(); }
+          reset() {
+            for (const control of this.elements) {
+              if ('defaultValue' in control) control.value = control.defaultValue;
+              if ('defaultChecked' in control) control.checked = control.defaultChecked;
+            }
+            this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true }));
+          }
+          submit() {}
+          requestSubmit(submitter = null) {
+            if (submitter != null && submitter.form !== this) {
+              throw new DOMException('Submitter does not belong to this form.', 'NotFoundError');
+            }
+            if (!this.reportValidity()) return;
+            this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          }
+        }
         class HTMLHeadElement extends HTMLElement {}
         class HTMLHeadingElement extends HTMLElement {}
         class HTMLHRElement extends HTMLElement {}
@@ -2215,13 +2716,21 @@
           get contentDocument() { return this.contentWindow.document; }
         }
         class HTMLImageElement extends HTMLElement {}
-        class HTMLInputElement extends HTMLElement {
+        class HTMLInputElement extends HTMLFormControlElement {
+          get type() { return normalizedInputType(this); }
+          set type(value) { this.setAttribute('type', String(value)); }
           get value() { return this.getAttribute('value') || ''; }
           set value(value) { this.setAttribute('value', String(value)); }
+          get defaultValue() { return this.getAttribute('value') || ''; }
+          set defaultValue(value) { this.setAttribute('value', String(value)); }
           get checked() { return this.hasAttribute('checked'); }
           set checked(value) { this.toggleAttribute('checked', Boolean(value)); }
-          get disabled() { return this.hasAttribute('disabled'); }
-          set disabled(value) { this.toggleAttribute('disabled', Boolean(value)); }
+          get defaultChecked() { return this.hasAttribute('checked'); }
+          set defaultChecked(value) { this.toggleAttribute('checked', Boolean(value)); }
+          get minLength() { return Number(this.getAttribute('minlength') || -1); }
+          set minLength(value) { this.setAttribute('minlength', String(value)); }
+          get maxLength() { return Number(this.getAttribute('maxlength') || -1); }
+          set maxLength(value) { this.setAttribute('maxlength', String(value)); }
         }
         class HTMLLabelElement extends HTMLElement {}
         class HTMLLegendElement extends HTMLElement {}
@@ -2239,17 +2748,24 @@
           }
         }
         class HTMLMapElement extends HTMLElement {}
-        class HTMLMediaElement extends HTMLElement {
-          play() { return Promise.resolve(); }
-          pause() {}
-        }
         class HTMLMetaElement extends HTMLElement {}
         class HTMLMeterElement extends HTMLElement {}
         class HTMLModElement extends HTMLElement {}
         class HTMLObjectElement extends HTMLElement {}
         class HTMLOListElement extends HTMLElement {}
         class HTMLOptGroupElement extends HTMLElement {}
-        class HTMLOptionElement extends HTMLElement {}
+        class HTMLOptionElement extends HTMLElement {
+          get value() { return this.getAttribute('value') || this.textContent || ''; }
+          set value(value) { this.setAttribute('value', String(value)); }
+          get selected() { return this.hasAttribute('selected'); }
+          set selected(value) { this.toggleAttribute('selected', Boolean(value)); }
+          get defaultSelected() { return this.hasAttribute('selected'); }
+          set defaultSelected(value) { this.toggleAttribute('selected', Boolean(value)); }
+          get disabled() { return this.hasAttribute('disabled'); }
+          set disabled(value) { this.toggleAttribute('disabled', Boolean(value)); }
+          get text() { return this.textContent || ''; }
+          set text(value) { this.textContent = String(value ?? ''); }
+        }
         class HTMLOutputElement extends HTMLElement {}
         class HTMLParagraphElement extends HTMLElement {}
         class HTMLParamElement extends HTMLElement {}
@@ -2258,17 +2774,25 @@
         class HTMLProgressElement extends HTMLElement {}
         class HTMLQuoteElement extends HTMLElement {}
         class HTMLScriptElement extends HTMLElement {}
-        class HTMLSelectElement extends HTMLElement {
+        class HTMLSelectElement extends HTMLFormControlElement {
+          get options() { return this.querySelectorAll('option'); }
           get value() {
             const selected = this.querySelector('option[selected]');
             const option = selected || this.querySelector('option');
-            return option ? option.getAttribute('value') || option.textContent : '';
+            return option ? option.value : '';
           }
           set value(value) {
             const text = String(value);
             for (const option of this.querySelectorAll('option')) {
-              option.toggleAttribute('selected', (option.getAttribute('value') || option.textContent) === text);
+              option.selected = option.value === text;
             }
+          }
+          get selectedIndex() {
+            return this.options.findIndex((option) => option.selected);
+          }
+          set selectedIndex(value) {
+            const index = Number(value);
+            this.options.forEach((option, optionIndex) => { option.selected = optionIndex === index; });
           }
         }
         class HTMLSlotElement extends HTMLElement {
@@ -2295,9 +2819,11 @@
         class HTMLTemplateElement extends HTMLElement {
           get content() { return memo(this, '__templateContent', () => new DocumentFragment()); }
         }
-        class HTMLTextAreaElement extends HTMLElement {
+        class HTMLTextAreaElement extends HTMLFormControlElement {
           get value() { return this.getAttribute('value') || this.textContent || ''; }
           set value(value) { this.textContent = String(value); }
+          get defaultValue() { return this.textContent || ''; }
+          set defaultValue(value) { this.textContent = String(value ?? ''); }
         }
         class HTMLTimeElement extends HTMLElement {}
         class HTMLTitleElement extends HTMLElement {}
@@ -2609,6 +3135,12 @@
             if (/keyboard/i.test(type)) return new KeyboardEvent('');
             return new Event('');
           }
+          createTreeWalker(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+            return new TreeWalker(root, whatToShow, filter);
+          }
+          createNodeIterator(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+            return new NodeIterator(root, whatToShow, filter);
+          }
           createRange() { return new Range(this); }
           getSelection() { return selection; }
           hasFocus() { return true; }
@@ -2687,6 +3219,12 @@
           createComment(text) { return document.createComment(text); }
           createDocumentFragment() { return new DocumentFragment(); }
           createEvent(type) { return document.createEvent(type); }
+          createTreeWalker(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+            return new TreeWalker(root, whatToShow, filter);
+          }
+          createNodeIterator(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+            return new NodeIterator(root, whatToShow, filter);
+          }
           createRange() { return document.createRange(); }
           getSelection() { return selection; }
           hasFocus() { return false; }
@@ -2941,10 +3479,14 @@
         Document,
         DocumentFragment,
         ShadowRoot,
-        DOMImplementation,
-        ElementInternals,
-        DOMTokenList,
-        CustomElementRegistry,
+	        DOMImplementation,
+	        ElementInternals,
+	        ValidityState,
+	        DOMTokenList,
+	        NodeFilter,
+	        TreeWalker,
+	        NodeIterator,
+	        CustomElementRegistry,
         CSSRule,
         CSSStyleRule,
         CSSMediaRule,

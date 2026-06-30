@@ -882,20 +882,6 @@
           }
         }
 
-        const NodeFilter = {
-          SHOW_ALL: 0xFFFFFFFF,
-          SHOW_ELEMENT: 0x1,
-          SHOW_ATTRIBUTE: 0x2,
-          SHOW_TEXT: 0x4,
-          SHOW_COMMENT: 0x80,
-          SHOW_DOCUMENT: 0x100,
-          SHOW_DOCUMENT_TYPE: 0x200,
-          SHOW_DOCUMENT_FRAGMENT: 0x400,
-          FILTER_ACCEPT: 1,
-          FILTER_REJECT: 2,
-          FILTER_SKIP: 3
-        };
-
         const timers = new Map();
         let nextTimerId = 1;
         let timerNow = 0;
@@ -1144,7 +1130,6 @@
         Storage,
         XMLSerializer,
         DOMParser,
-        NodeFilter,
         locationFromURL,
         makeMediaQueryList,
         getRandomValues,

@@ -14,7 +14,10 @@ const expected = new Map([
   ['20_events.js', { name: 'events', deps: ['core'] }],
   ['30_dom.js', { name: 'dom', deps: ['core', 'events'] }],
   ['40_web.js', { name: 'web', deps: ['core', 'events', 'dom'] }],
-  ['90_install.js', { name: 'install', deps: ['core', 'events', 'dom', 'web'] }]
+  ['45_forms.js', { name: 'forms', deps: ['dom', 'web'] }],
+  ['50_streams.js', { name: 'streams', deps: ['events', 'web'] }],
+  ['60_compat.js', { name: 'compat', deps: ['events', 'dom'] }],
+  ['90_install.js', { name: 'install', deps: ['core', 'events', 'dom', 'web', 'forms', 'streams', 'compat'] }]
 ]);
 
 function runNode(args) {

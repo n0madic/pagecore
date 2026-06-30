@@ -13,7 +13,7 @@
 
   return {
     name: 'install',
-    deps: ['core', 'events', 'dom', 'web'],
+    deps: ['core', 'events', 'dom', 'web', 'forms', 'streams', 'compat'],
     install(ctx, api) {
       const { global, host } = ctx;
       const { defineValue, setDocumentReadyState } = api.core;
@@ -128,7 +128,11 @@
         ShadowRoot,
         DOMImplementation,
         ElementInternals,
+        ValidityState,
         DOMTokenList,
+        NodeFilter,
+        TreeWalker,
+        NodeIterator,
         CustomElementRegistry,
         CSSRule,
         CSSStyleRule,
@@ -157,7 +161,6 @@
         Storage,
         XMLSerializer,
         DOMParser,
-        NodeFilter,
         locationFromURL,
         makeMediaQueryList,
         getRandomValues,
@@ -172,6 +175,35 @@
         performanceNow,
         runTimers
       } = api.web;
+      const {
+        FormData
+      } = api.forms;
+      const {
+        ReadableStream,
+        ReadableStreamDefaultController,
+        ReadableStreamDefaultReader,
+        ReadableByteStreamController,
+        ReadableStreamBYOBReader,
+        ReadableStreamBYOBRequest,
+        WritableStream,
+        WritableStreamDefaultWriter,
+        WritableStreamDefaultController,
+        TransformStream,
+        TransformStreamDefaultController,
+        ByteLengthQueuingStrategy,
+        CountQueuingStrategy
+      } = api.streams;
+      const {
+        CSS,
+        btoa,
+        atob,
+        Audio,
+        Option,
+        Worker,
+        SharedWorker,
+        ServiceWorkerContainer,
+        createIntlFallback
+      } = api.compat;
 
         installWindowIdentity(global);
         global.top = global;
@@ -283,7 +315,11 @@
         global.ShadowRoot = ShadowRoot;
         global.DOMImplementation = DOMImplementation;
         global.ElementInternals = ElementInternals;
+        global.ValidityState = ValidityState;
         global.DOMTokenList = DOMTokenList;
+        global.NodeFilter = NodeFilter;
+        global.TreeWalker = TreeWalker;
+        global.NodeIterator = NodeIterator;
         global.Range = Range;
         global.Selection = Selection;
         global.DOMRectReadOnly = DOMRectReadOnly;
@@ -295,8 +331,22 @@
         global.Headers = Headers;
         global.Blob = Blob;
         global.File = File;
+        global.FormData = FormData;
         global.Request = Request;
         global.Response = Response;
+        global.ReadableStream = ReadableStream;
+        global.ReadableStreamDefaultController = ReadableStreamDefaultController;
+        global.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
+        global.ReadableByteStreamController = ReadableByteStreamController;
+        global.ReadableStreamBYOBReader = ReadableStreamBYOBReader;
+        global.ReadableStreamBYOBRequest = ReadableStreamBYOBRequest;
+        global.WritableStream = WritableStream;
+        global.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
+        global.WritableStreamDefaultController = WritableStreamDefaultController;
+        global.TransformStream = TransformStream;
+        global.TransformStreamDefaultController = TransformStreamDefaultController;
+        global.ByteLengthQueuingStrategy = ByteLengthQueuingStrategy;
+        global.CountQueuingStrategy = CountQueuingStrategy;
         global.XMLHttpRequest = XMLHttpRequest;
         global.Storage = Storage;
         global.CSSRule = CSSRule;
@@ -306,7 +356,9 @@
         global.CSSStyleDeclaration = CSSStyleDeclaration;
         global.XMLSerializer = XMLSerializer;
         global.DOMParser = DOMParser;
-        global.NodeFilter = NodeFilter;
+        global.CSS = Object.assign(global.CSS || {}, CSS);
+        global.btoa = btoa;
+        global.atob = atob;
         ctx.customElementsRegistry = new CustomElementRegistry();
         global.CustomElementRegistry = CustomElementRegistry;
         global.customElements = ctx.customElementsRegistry;
@@ -319,8 +371,10 @@
           javaEnabled: () => false,
           mediaDevices: {
             getSupportedConstraints: () => ({})
-          }
+          },
+          serviceWorker: new ServiceWorkerContainer()
         };
+        global.Intl = createIntlFallback(global.Intl);
         global.location = locationFromURL(host.baseURL || '');
         global.history = {
           length: 1,
@@ -371,6 +425,8 @@
         global.scroll = () => {};
         global.open = () => null;
         global.close = () => {};
+        global.Worker = Worker;
+        global.SharedWorker = SharedWorker;
         global.postMessage = (message) => {
           global.dispatchEvent(new MessageEvent('message', { data: message, origin: global.location.origin, source: global }));
         };
@@ -428,6 +484,8 @@
           image.decode = () => image.getAttribute('src') ? Promise.resolve() : Promise.reject(new DOMException('The source image cannot be decoded.', 'EncodingError'));
           return image;
         };
+        global.Audio = Audio;
+        global.Option = Option;
         global.fetch = (input, init = {}) => Promise.resolve().then(() => {
           const request = new Request(input, init);
           const loaded = loadHostResource(request.url, 'other');

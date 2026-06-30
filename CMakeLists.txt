@@ -281,6 +281,9 @@ set(PAGECORE_DOM_SHIM_PARTS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/20_events.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/30_dom.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/40_web.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/45_forms.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/50_streams.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/60_compat.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/90_install.js"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dom_shim/99_boot.js"
 )

@@ -16,7 +16,12 @@
     deps: ['core'],
     install(ctx, api) {
       const { global, host } = ctx;
-      const { DOM_EXCEPTION_CODES, defineValue, isNodeWrapper } = api.core;
+      const {
+        DOM_EXCEPTION_CODES,
+        DOM_EXCEPTION_LEGACY_CONSTANTS,
+        defineValue,
+        isNodeWrapper
+      } = api.core;
 
 
         class DOMException extends Error {
@@ -29,6 +34,10 @@
 
         for (const [name, code] of Object.entries(DOM_EXCEPTION_CODES)) {
           defineValue(DOMException, `${name}_CODE`, code, true);
+        }
+        for (const [name, code] of Object.entries(DOM_EXCEPTION_LEGACY_CONSTANTS)) {
+          defineValue(DOMException, name, code, true);
+          defineValue(DOMException.prototype, name, code, true);
         }
 
         class Event {
