@@ -848,12 +848,20 @@ ResourceResponse ResourceLoader::load(std::string_view url)
     return load(ResourceRequest{std::string(url)});
 }
 
-std::vector<ResourceResponse> ResourceLoader::load_all(const std::vector<ResourceRequest>& requests)
+std::vector<ResourceResponse> ResourceLoader::load_all(const std::vector<ResourceRequest>& requests, BatchErrorMode mode)
 {
     std::vector<ResourceResponse> responses;
     responses.reserve(requests.size());
     for (const auto& request : requests) {
-        responses.push_back(load(request));
+        if (mode == BatchErrorMode::FailFast) {
+            responses.push_back(load(request));
+            continue;
+        }
+        try {
+            responses.push_back(load(request));
+        } catch (const ResourceError&) {
+            responses.push_back(ResourceResponse{request.url, {}, 0, {}, request.kind, false});
+        }
     }
     return responses;
 }
@@ -909,13 +917,20 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     return build_network_response(curl.get(), request, policy_, body, socket_context, code);
 }
 
-std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<ResourceRequest>& requests)
+std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<ResourceRequest>& requests, BatchErrorMode mode)
 {
     if (requests.empty()) {
         return {};
     }
     if (requests.size() == 1) {
-        return {load(requests.front())};
+        if (mode == BatchErrorMode::FailFast) {
+            return {load(requests.front())};
+        }
+        try {
+            return {load(requests.front())};
+        } catch (const ResourceError&) {
+            return {ResourceResponse{requests.front().url, {}, 0, {}, requests.front().kind, false}};
+        }
     }
 
     ensure_curl_global_init();
@@ -1017,11 +1032,16 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
 
     curl_multi_cleanup(multi);
 
-    // Match load(): surface the first request-order failure.
     for (std::size_t i = 0; i < count; ++i) {
-        if (errors[i]) {
+        if (!errors[i]) {
+            continue;
+        }
+        if (mode == BatchErrorMode::FailFast) {
+            // Match load(): surface the first request-order failure.
             std::rethrow_exception(errors[i]);
         }
+        // Lenient: a failed transfer becomes a status-0 placeholder.
+        responses[i] = ResourceResponse{requests[i].url, {}, 0, {}, requests[i].kind, false};
     }
     return responses;
 }
@@ -1131,7 +1151,7 @@ ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
     return response;
 }
 
-std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<ResourceRequest>& requests)
+std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<ResourceRequest>& requests, BatchErrorMode mode)
 {
     const std::size_t count = requests.size();
     std::vector<ResourceResponse> responses(count);
@@ -1156,9 +1176,9 @@ std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<
 
     if (!misses.empty()) {
         // Misses keep their original relative order, so the inner loader still
-        // surfaces the first request-order failure. Cache hits never fail, so the
-        // first thrown error is also the first overall failure, matching load().
-        std::vector<ResourceResponse> fetched = inner_->load_all(misses);
+        // surfaces the first request-order failure (FailFast). Cache hits never
+        // fail, so the first thrown error is also the first overall failure.
+        std::vector<ResourceResponse> fetched = inner_->load_all(misses, mode);
 
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t m = 0; m < fetched.size(); ++m) {
@@ -1166,7 +1186,9 @@ std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<
             fetched[m].from_cache = false;
             responses[i] = std::move(fetched[m]);
 
-            if (responses[i].status < 400) {
+            // Cache real successes only; a Lenient failure placeholder (status 0)
+            // must stay uncached so an on-demand retry can still fetch it.
+            if (responses[i].status >= 200 && responses[i].status < 400) {
                 if (cache_.find(keys[i]) == cache_.end()) {
                     order_.push_back(keys[i]);
                     while (order_.size() > max_entries_) {

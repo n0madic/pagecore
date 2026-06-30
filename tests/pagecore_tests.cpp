@@ -2209,6 +2209,27 @@ void test_resource_load_all_propagates_first_error()
         "load_all surfaces the first request-order failure");
 }
 
+void test_resource_load_all_lenient_tolerates_failures()
+{
+    auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
+    memory->add("https://example.test/a", "A");
+    memory->add("https://example.test/c", "C");
+
+    const std::vector<pagecore::ResourceRequest> requests{
+        {"https://example.test/a", pagecore::ResourceKind::Image},
+        {"https://example.test/missing", pagecore::ResourceKind::Image},
+        {"https://example.test/c", pagecore::ResourceKind::Image},
+    };
+
+    // Lenient must not throw; failures become status-0 placeholders in place.
+    const auto responses = memory->load_all(requests, pagecore::BatchErrorMode::Lenient);
+    require(responses.size() == 3, "lenient load_all returns one entry per request");
+    require(responses[0].body == "A" && responses[0].status == 200, "successful entries are intact");
+    require(responses[1].status == 0 && responses[1].body.empty(), "failed entries become status-0 placeholders");
+    require(responses[1].url == "https://example.test/missing", "placeholder keeps the requested URL");
+    require(responses[2].body == "C", "entries after a failure are still loaded");
+}
+
 void test_caching_loader_load_all_serves_hits_and_caches()
 {
     auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -3382,6 +3403,90 @@ void test_page_display_list_resolves_protocol_relative_and_host_like_css_urls()
         "host-like CSS image should be requested as an absolute Image resource");
 }
 
+// Records load_all() batches separately from single load() calls so a test can
+// distinguish an up-front prefetch from layout-time on-demand fetches.
+class BatchRecordingLoader final : public pagecore::ResourceLoader {
+public:
+    using ResourceLoader::load;
+
+    void add(std::string url, std::string body, std::string mime_type)
+    {
+        const std::string key = url;
+        resources_[key] = pagecore::ResourceResponse{
+            std::move(url), std::move(body), 200, std::move(mime_type), pagecore::ResourceKind::Other, false};
+    }
+
+    pagecore::ResourceResponse load(const pagecore::ResourceRequest& request) override
+    {
+        load_calls.push_back(request.url);
+        return fetch(request);
+    }
+
+    std::vector<pagecore::ResourceResponse> load_all(
+        const std::vector<pagecore::ResourceRequest>& requests,
+        pagecore::BatchErrorMode mode) override
+    {
+        batch_sizes.push_back(requests.size());
+        std::vector<pagecore::ResourceResponse> out;
+        out.reserve(requests.size());
+        for (const auto& request : requests) {
+            try {
+                out.push_back(fetch(request));
+            } catch (const pagecore::ResourceError&) {
+                if (mode == pagecore::BatchErrorMode::FailFast) {
+                    throw;
+                }
+                out.push_back(pagecore::ResourceResponse{request.url, {}, 0, {}, request.kind, false});
+            }
+        }
+        return out;
+    }
+
+    std::vector<std::string> load_calls;
+    std::vector<std::size_t> batch_sizes;
+
+private:
+    pagecore::ResourceResponse fetch(const pagecore::ResourceRequest& request)
+    {
+        auto found = resources_.find(request.url);
+        if (found == resources_.end()) {
+            throw pagecore::ResourceError(pagecore::ResourceErrorCode::NotFound, request.url, "missing test resource");
+        }
+        pagecore::ResourceResponse response = found->second;
+        response.kind = request.kind;
+        response.from_cache = false;
+        return response;
+    }
+
+    std::unordered_map<std::string, pagecore::ResourceResponse> resources_;
+};
+
+void test_render_prefetches_subresources_into_cache()
+{
+    auto loader = std::make_shared<BatchRecordingLoader>();
+    loader->add("https://example.test/style.css",
+                "#b { width: 40px; height: 20px; background-color: rgb(0, 255, 0); }", "text/css");
+    loader->add("https://example.test/pixel.png", "fake-image-bytes", "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head><link rel="stylesheet" href="/style.css"></head>
+<body><div id="b"></div><img src="/pixel.png"></body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{200, 100, 1.0f};
+    (void) page.display_list(options);
+
+    // The stylesheet and image are prefetched together in a single batch...
+    require(loader->batch_sizes.size() == 1 && loader->batch_sizes[0] == 2,
+            "render prefetches the stylesheet and image up front in one concurrent batch");
+    // ...so litehtml's synchronous layout-time requests all hit the warm cache.
+    require(loader->load_calls.empty(),
+            "layout-time sub-resource requests are served from the prefetch cache, not re-fetched");
+}
+
 void test_page_render_uses_cairo_raster_backend()
 {
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -3864,6 +3969,7 @@ int main()
         test_resource_blocks_file_from_network_origin();
         test_caching_loader_bounds_and_skips_errors();
         test_resource_load_all_returns_in_order();
+        test_resource_load_all_lenient_tolerates_failures();
         test_resource_load_all_propagates_first_error();
         test_caching_loader_load_all_serves_hits_and_caches();
         test_external_scripts_load_in_document_order();
@@ -3909,6 +4015,7 @@ int main()
         test_page_display_list_resolves_litehtml_relative_base_urls();
         test_page_display_list_resolves_relative_base_element_against_document_url();
         test_page_display_list_resolves_protocol_relative_and_host_like_css_urls();
+        test_render_prefetches_subresources_into_cache();
         test_page_render_uses_cairo_raster_backend();
         test_page_render_decodes_and_draws_png_images();
         test_page_render_decodes_and_draws_jpeg_images();

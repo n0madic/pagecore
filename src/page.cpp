@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -340,6 +341,81 @@ struct Page::Impl {
         return render_document.serialize_html();
     }
 
+    // Enumerates the external sub-resources litehtml will need for a render
+    // (<img src> and <link rel=stylesheet href>) so they can be fetched up front
+    // and concurrently, instead of one blocking request at a time during layout.
+    // URLs are resolved exactly as the litehtml container will (honouring a
+    // <base href>), so the warmed cache keys match its on-demand requests.
+    std::vector<ResourceRequest> collect_subresource_requests(const std::string& render_base)
+    {
+        const NodeId root = document.document_node();
+
+        std::string effective_base = render_base;
+        const NodeId base_node = document.query_selector(root, "base[href]");
+        if (base_node != kInvalidNodeId) {
+            const auto base_href = document.get_attribute(base_node, "href");
+            if (base_href && !base_href->empty()) {
+                effective_base = resolve_url(render_base, *base_href);
+            }
+        }
+
+        std::vector<ResourceRequest> requests;
+        std::unordered_set<std::string> seen;
+
+        const auto starts_with = [](const std::string& value, std::string_view prefix) {
+            return value.compare(0, prefix.size(), prefix) == 0;
+        };
+        const auto add = [&](const std::optional<std::string>& raw, ResourceKind kind) {
+            if (!raw || raw->empty()) {
+                return;
+            }
+            const std::string url = resolve_url(effective_base, *raw);
+            if (url.empty() || url.front() == '#' || starts_with(url, "data:") || starts_with(url, "blob:")) {
+                return;
+            }
+            const std::string key = resource_kind_name(kind) + "\n" + url;
+            if (!seen.insert(key).second) {
+                return;
+            }
+            requests.push_back(ResourceRequest{url, kind, effective_base, effective_base});
+        };
+
+        for (NodeId img : document.query_selector_all(root, "img[src]")) {
+            add(document.get_attribute(img, "src"), ResourceKind::Image);
+        }
+        for (NodeId link : document.query_selector_all(root, "link[rel='stylesheet'][href]")) {
+            add(document.get_attribute(link, "href"), ResourceKind::Stylesheet);
+        }
+
+        return requests;
+    }
+
+    // Returns the loader litehtml should use for a render. When external loading
+    // is enabled, the page's sub-resources are prefetched concurrently into a
+    // per-render cache so the layout's synchronous requests hit warm entries.
+    std::shared_ptr<ResourceLoader> prepare_render_loader(const RenderOptions& render_options)
+    {
+        if (!render_options.load_external_resources || !loader) {
+            return nullptr;
+        }
+
+        auto requests = collect_subresource_requests(render_base_url(render_options));
+        if (requests.empty()) {
+            return loader;
+        }
+
+        auto cache = std::make_shared<CachingResourceLoader>(loader, requests.size() + 16);
+        try {
+            // Lenient: a failed sub-resource must not abort the render; litehtml
+            // will fall back to its placeholder for it.
+            cache->load_all(requests, BatchErrorMode::Lenient);
+        } catch (...) {
+            // Prefetch is purely an optimization; on any failure fall back to the
+            // cache delegating each request to the inner loader on demand.
+        }
+        return cache;
+    }
+
     std::unique_ptr<LayoutEngine> build_layout(const RenderOptions& render_options)
     {
         if (!layout_factory) {
@@ -352,7 +428,7 @@ struct Page::Impl {
         }
 
         layout->set_viewport(render_options.viewport);
-        layout->set_resource_loader(render_options.load_external_resources ? loader : nullptr);
+        layout->set_resource_loader(prepare_render_loader(render_options));
         layout->load_html(serialized_html_for_render(), render_base_url(render_options));
         layout->layout();
         return layout;

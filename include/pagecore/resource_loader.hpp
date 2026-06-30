@@ -35,6 +35,16 @@ enum class ResourceErrorCode {
     Transport,
 };
 
+// Controls how load_all() reacts to a failing request.
+//   FailFast: throw the first (request-order) ResourceError, like load().
+//   Lenient:  never throw; a failed request yields a placeholder response with
+//             status 0 and an empty body, so callers warming non-critical
+//             sub-resources (images, fonts) can skip individual failures.
+enum class BatchErrorMode {
+    FailFast,
+    Lenient,
+};
+
 struct ResourceRequest {
     std::string url;
     ResourceKind kind = ResourceKind::Other;
@@ -92,11 +102,16 @@ public:
     ResourceResponse load(std::string_view url);
     virtual ResourceResponse load(const ResourceRequest& request) = 0;
 
-    // Loads multiple resources, returning responses in request order. Throws the
-    // first (request-order) ResourceError if any request fails, matching the
-    // single-resource load(). The default implementation loads serially; loaders
-    // such as CurlResourceLoader override it to fetch concurrently.
-    virtual std::vector<ResourceResponse> load_all(const std::vector<ResourceRequest>& requests);
+    // Loads multiple resources, returning responses in request order. In FailFast
+    // mode (the default) it throws the first request-order ResourceError, matching
+    // the single-resource load(); in Lenient mode it never throws and returns a
+    // status-0 placeholder for each failed request. The default implementation
+    // loads serially; loaders such as CurlResourceLoader override it to fetch
+    // concurrently. The FailFast default is kept identical across overrides so a
+    // single-argument call behaves the same regardless of static type.
+    virtual std::vector<ResourceResponse> load_all(
+        const std::vector<ResourceRequest>& requests,
+        BatchErrorMode mode = BatchErrorMode::FailFast);
 };
 
 class CurlResourceLoader final : public ResourceLoader {
@@ -105,7 +120,9 @@ public:
 
     explicit CurlResourceLoader(std::string user_agent = "PageCore/0.1", ResourcePolicy policy = {});
     ResourceResponse load(const ResourceRequest& request) override;
-    std::vector<ResourceResponse> load_all(const std::vector<ResourceRequest>& requests) override;
+    std::vector<ResourceResponse> load_all(
+        const std::vector<ResourceRequest>& requests,
+        BatchErrorMode mode = BatchErrorMode::FailFast) override;
 
     const ResourcePolicy& policy() const noexcept;
     void set_policy(ResourcePolicy policy);
@@ -144,7 +161,9 @@ public:
     explicit CachingResourceLoader(std::shared_ptr<ResourceLoader> inner, std::size_t max_entries = 256);
 
     ResourceResponse load(const ResourceRequest& request) override;
-    std::vector<ResourceResponse> load_all(const std::vector<ResourceRequest>& requests) override;
+    std::vector<ResourceResponse> load_all(
+        const std::vector<ResourceRequest>& requests,
+        BatchErrorMode mode = BatchErrorMode::FailFast) override;
     void clear();
     std::size_t size() const noexcept;
 
