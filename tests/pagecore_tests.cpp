@@ -1,0 +1,3196 @@
+#include "pagecore/image_io.hpp"
+#include "pagecore/image_decoder.hpp"
+#include "pagecore/page.hpp"
+#include "pagecore/render.hpp"
+#include "pagecore/resource_loader.hpp"
+
+#if defined(PAGECORE_ENABLE_RENDERING)
+#include <turbojpeg.h>
+#include <webp/encode.h>
+#endif
+
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <filesystem>
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace {
+
+void require(bool condition, const std::string& message)
+{
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+class RecordingResourceLoader final : public pagecore::ResourceLoader {
+public:
+    using ResourceLoader::load;
+
+    void add(std::string url, std::string body, std::string mime_type = {})
+    {
+        const std::string key = url;
+        resources_[key] = pagecore::ResourceResponse{
+            std::move(url),
+            std::move(body),
+            200,
+            std::move(mime_type),
+            pagecore::ResourceKind::Other,
+            false,
+        };
+    }
+
+    pagecore::ResourceResponse load(const pagecore::ResourceRequest& request) override
+    {
+        requests.push_back(request);
+        auto found = resources_.find(request.url);
+        if (found == resources_.end()) {
+            throw pagecore::ResourceError(pagecore::ResourceErrorCode::NotFound, request.url, "missing test resource");
+        }
+
+        pagecore::ResourceResponse response = found->second;
+        response.kind = request.kind;
+        response.from_cache = false;
+        return response;
+    }
+
+    std::vector<pagecore::ResourceRequest> requests;
+
+private:
+    std::unordered_map<std::string, pagecore::ResourceResponse> resources_;
+};
+
+void close_fd(int fd)
+{
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+class SingleResponseHttpServer final {
+public:
+    SingleResponseHttpServer(
+        std::string body,
+        std::vector<std::pair<std::string, std::string>> headers,
+        int status = 200,
+        std::string reason = "OK")
+        : body_(std::move(body))
+        , headers_(std::move(headers))
+        , status_(status)
+        , reason_(std::move(reason))
+    {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
+            throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+        }
+
+        int reuse = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            const std::string message = std::string("bind failed: ") + std::strerror(errno);
+            close_fd(listen_fd_);
+            listen_fd_ = -1;
+            throw std::runtime_error(message);
+        }
+
+        socklen_t address_len = sizeof(address);
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &address_len) != 0) {
+            const std::string message = std::string("getsockname failed: ") + std::strerror(errno);
+            close_fd(listen_fd_);
+            listen_fd_ = -1;
+            throw std::runtime_error(message);
+        }
+        port_ = ntohs(address.sin_port);
+
+        if (listen(listen_fd_, 1) != 0) {
+            const std::string message = std::string("listen failed: ") + std::strerror(errno);
+            close_fd(listen_fd_);
+            listen_fd_ = -1;
+            throw std::runtime_error(message);
+        }
+
+        worker_ = std::thread([this] {
+            serve_once();
+        });
+    }
+
+    ~SingleResponseHttpServer()
+    {
+        close_fd(listen_fd_);
+        listen_fd_ = -1;
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    std::string url(std::string_view path = "/resource.js") const
+    {
+        return "http://127.0.0.1:" + std::to_string(port_) + std::string(path);
+    }
+
+private:
+    void serve_once()
+    {
+        const int client_fd = accept(listen_fd_, nullptr, nullptr);
+        if (client_fd < 0) {
+            return;
+        }
+
+        char buffer[1024];
+        std::string request;
+        while (request.find("\r\n\r\n") == std::string::npos) {
+            const ssize_t received = recv(client_fd, buffer, sizeof(buffer), 0);
+            if (received <= 0) {
+                break;
+            }
+            request.append(buffer, static_cast<std::size_t>(received));
+        }
+
+        std::string response =
+            "HTTP/1.1 " + std::to_string(status_) + " " + reason_ + "\r\n"
+            "Connection: close\r\n"
+            "Content-Length: "
+            + std::to_string(body_.size()) + "\r\n";
+        for (const auto& [name, value] : headers_) {
+            response += name + ": " + value + "\r\n";
+        }
+        response += "\r\n";
+        response += body_;
+
+        const char* data = response.data();
+        std::size_t remaining = response.size();
+        while (remaining > 0) {
+            const ssize_t sent = send(client_fd, data, remaining, 0);
+            if (sent <= 0) {
+                break;
+            }
+            data += sent;
+            remaining -= static_cast<std::size_t>(sent);
+        }
+        close_fd(client_fd);
+    }
+
+    int listen_fd_ = -1;
+    std::uint16_t port_ = 0;
+    std::string body_;
+    std::vector<std::pair<std::string, std::string>> headers_;
+    int status_ = 200;
+    std::string reason_ = "OK";
+    std::thread worker_;
+};
+
+bool has_request_kind(
+    const RecordingResourceLoader& loader,
+    std::string_view url,
+    pagecore::ResourceKind kind)
+{
+    for (const auto& request : loader.requests) {
+        if (request.url == url && request.kind == kind) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const std::uint8_t* pixel_at(const pagecore::RenderedImage& image, int x, int y)
+{
+    return &image.rgba[(static_cast<std::size_t>(y) * image.width + x) * 4];
+}
+
+bool pixel_matches(const pagecore::RenderedImage& image, int x, int y, pagecore::Color color)
+{
+    const auto* pixel = pixel_at(image, x, y);
+    return pixel[0] == color.r && pixel[1] == color.g && pixel[2] == color.b && pixel[3] == color.a;
+}
+
+bool pixel_close(const pagecore::RenderedImage& image, int x, int y, pagecore::Color color, int tolerance)
+{
+    const auto* pixel = pixel_at(image, x, y);
+    return std::abs(static_cast<int>(pixel[0]) - color.r) <= tolerance
+        && std::abs(static_cast<int>(pixel[1]) - color.g) <= tolerance
+        && std::abs(static_cast<int>(pixel[2]) - color.b) <= tolerance
+        && std::abs(static_cast<int>(pixel[3]) - color.a) <= tolerance;
+}
+
+bool pixel_is_dark(const pagecore::RenderedImage& image, int x, int y)
+{
+    const auto* pixel = pixel_at(image, x, y);
+    return pixel[0] < 80 && pixel[1] < 80 && pixel[2] < 80 && pixel[3] == 255;
+}
+
+bool image_has_pixel(const pagecore::RenderedImage& image, pagecore::Color color)
+{
+    for (std::size_t offset = 0; offset + 3 < image.rgba.size(); offset += 4) {
+        if (image.rgba[offset] == color.r
+            && image.rgba[offset + 1] == color.g
+            && image.rgba[offset + 2] == color.b
+            && image.rgba[offset + 3] == color.a) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool image_has_close_pixel(const pagecore::RenderedImage& image, pagecore::Color color, int tolerance)
+{
+    for (std::size_t offset = 0; offset + 3 < image.rgba.size(); offset += 4) {
+        const bool matches =
+            std::abs(static_cast<int>(image.rgba[offset]) - color.r) <= tolerance
+            && std::abs(static_cast<int>(image.rgba[offset + 1]) - color.g) <= tolerance
+            && std::abs(static_cast<int>(image.rgba[offset + 2]) - color.b) <= tolerance
+            && std::abs(static_cast<int>(image.rgba[offset + 3]) - color.a) <= tolerance;
+        if (matches) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool region_has_close_pixel(
+    const pagecore::RenderedImage& image,
+    int x,
+    int y,
+    int width,
+    int height,
+    pagecore::Color color,
+    int tolerance)
+{
+    for (int row = std::max(0, y); row < std::min(image.height, y + height); ++row) {
+        for (int col = std::max(0, x); col < std::min(image.width, x + width); ++col) {
+            if (pixel_close(image, col, row, color, tolerance)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool region_has_saturated_pixel(
+    const pagecore::RenderedImage& image,
+    int x,
+    int y,
+    int width,
+    int height)
+{
+    for (int row = std::max(0, y); row < std::min(image.height, y + height); ++row) {
+        for (int col = std::max(0, x); col < std::min(image.width, x + width); ++col) {
+            const auto* pixel = pixel_at(image, col, row);
+            const int max_channel = std::max({pixel[0], pixel[1], pixel[2]});
+            const int min_channel = std::min({pixel[0], pixel[1], pixel[2]});
+            if (pixel[3] == 255 && max_channel - min_channel > 45) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool image_has_non_solid_text_pixel(const pagecore::RenderedImage& image)
+{
+    for (std::size_t offset = 0; offset + 3 < image.rgba.size(); offset += 4) {
+        const bool white = image.rgba[offset] == 255
+            && image.rgba[offset + 1] == 255
+            && image.rgba[offset + 2] == 255
+            && image.rgba[offset + 3] == 255;
+        const bool black = image.rgba[offset] == 0
+            && image.rgba[offset + 1] == 0
+            && image.rgba[offset + 2] == 0
+            && image.rgba[offset + 3] == 255;
+        if (!white && !black) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string png_body(pagecore::Color color, int width = 2, int height = 2)
+{
+    pagecore::RenderedImage image;
+    image.width = width;
+    image.height = height;
+    image.rgba.resize(static_cast<std::size_t>(width) * height * 4);
+    for (std::size_t offset = 0; offset + 3 < image.rgba.size(); offset += 4) {
+        image.rgba[offset] = color.r;
+        image.rgba[offset + 1] = color.g;
+        image.rgba[offset + 2] = color.b;
+        image.rgba[offset + 3] = color.a;
+    }
+
+    const auto png = pagecore::encode_png_rgba(image);
+    return std::string(reinterpret_cast<const char*>(png.data()), png.size());
+}
+
+#if defined(PAGECORE_ENABLE_RENDERING)
+std::string jpeg_body(pagecore::Color color, int width = 4, int height = 4)
+{
+    std::vector<unsigned char> rgb(static_cast<std::size_t>(width) * height * 3);
+    for (std::size_t offset = 0; offset + 2 < rgb.size(); offset += 3) {
+        rgb[offset] = color.r;
+        rgb[offset + 1] = color.g;
+        rgb[offset + 2] = color.b;
+    }
+
+    tjhandle handle = tjInitCompress();
+    require(handle != nullptr, "TurboJPEG compressor should initialize");
+
+    unsigned char* encoded = nullptr;
+    unsigned long encoded_size = 0;
+    const int result = tjCompress2(
+        handle,
+        rgb.data(),
+        width,
+        0,
+        height,
+        TJPF_RGB,
+        &encoded,
+        &encoded_size,
+        TJSAMP_444,
+        100,
+        TJFLAG_ACCURATEDCT);
+    const std::string body(
+        reinterpret_cast<const char*>(encoded),
+        result == 0 ? static_cast<std::size_t>(encoded_size) : 0);
+    if (encoded != nullptr) {
+        tjFree(encoded);
+    }
+    tjDestroy(handle);
+
+    require(result == 0, "TurboJPEG should encode test JPEG");
+    return body;
+}
+
+std::string webp_body(pagecore::Color color, int width = 4, int height = 4)
+{
+    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4);
+    for (std::size_t offset = 0; offset + 3 < rgba.size(); offset += 4) {
+        rgba[offset] = color.r;
+        rgba[offset + 1] = color.g;
+        rgba[offset + 2] = color.b;
+        rgba[offset + 3] = color.a;
+    }
+
+    std::uint8_t* encoded = nullptr;
+    const std::size_t encoded_size = WebPEncodeLosslessRGBA(
+        rgba.data(),
+        width,
+        height,
+        width * 4,
+        &encoded);
+    require(encoded_size > 0, "WebP should encode test image");
+    const std::string body(reinterpret_cast<const char*>(encoded), encoded_size);
+    WebPFree(encoded);
+    return body;
+}
+#endif
+
+std::string gif_body()
+{
+    const unsigned char bytes[] = {
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0xf0, 0x00,
+        0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+    };
+    return std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+}
+
+std::string svg_body(pagecore::Color color = pagecore::Color{240, 20, 30, 255})
+{
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"3\" viewBox=\"0 0 4 3\">"
+           "<rect width=\"4\" height=\"3\" fill=\"rgb("
+        + std::to_string(color.r) + "," + std::to_string(color.g) + "," + std::to_string(color.b) + ")\"/>"
+          "</svg>";
+}
+
+bool color_close(const std::vector<std::uint8_t>& rgba, pagecore::Color color, int tolerance)
+{
+    if (rgba.size() < 4) {
+        return false;
+    }
+
+    return std::abs(static_cast<int>(rgba[0]) - color.r) <= tolerance
+        && std::abs(static_cast<int>(rgba[1]) - color.g) <= tolerance
+        && std::abs(static_cast<int>(rgba[2]) - color.b) <= tolerance
+        && std::abs(static_cast<int>(rgba[3]) - color.a) <= tolerance;
+}
+
+std::uint32_t read_be32(const std::vector<std::uint8_t>& bytes, std::size_t offset)
+{
+    require(offset + 4 <= bytes.size(), "unexpected end of binary data");
+    return (static_cast<std::uint32_t>(bytes[offset]) << 24)
+        | (static_cast<std::uint32_t>(bytes[offset + 1]) << 16)
+        | (static_cast<std::uint32_t>(bytes[offset + 2]) << 8)
+        | static_cast<std::uint32_t>(bytes[offset + 3]);
+}
+
+void require_resource_error(
+    pagecore::ResourceErrorCode expected,
+    const std::function<void()>& action,
+    const std::string& message)
+{
+    try {
+        action();
+    } catch (const pagecore::ResourceError& error) {
+        require(error.code() == expected, message + ": wrong error code");
+        return;
+    }
+
+    throw std::runtime_error(message + ": expected ResourceError");
+}
+
+void require_runtime_error_contains(
+    const std::function<void()>& action,
+    std::string_view expected,
+    const std::string& message)
+{
+    try {
+        action();
+    } catch (const std::runtime_error& error) {
+        const std::string text = error.what();
+        require(text.find(expected) != std::string::npos, message + ": wrong error message: " + text);
+        return;
+    }
+
+    throw std::runtime_error(message + ": expected runtime_error");
+}
+
+void test_inline_script_mutates_lexbor_dom()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!doctype html>
+<html>
+  <body>
+    <div id="app"></div>
+    <script>
+      const app = document.getElementById('app');
+      app.textContent = 'Hello';
+      app.classList.add('ready');
+      const span = document.createElement('span');
+      span.setAttribute('data-x', '1');
+      span.textContent = '!';
+      app.appendChild(span);
+    </script>
+  </body>
+</html>
+)HTML");
+
+    auto text = page.text_content("#app.ready");
+    require(text && *text == "Hello!", "script mutation should update textContent");
+    auto span = page.outer_html("#app.ready span[data-x='1']");
+    require(span && span->find("<span data-x=\"1\">!</span>") != std::string::npos,
+            "script-created span should be queryable and serializable");
+}
+
+void test_timers_and_events()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <button id="b"></button>
+  <script>
+    const b = document.getElementById('b');
+    b.addEventListener('done', () => { throw new Error('listener boom'); });
+    b.addEventListener('done', (event) => b.setAttribute('data-hit', event.detail));
+    b.ondone = () => { throw new Error('handler boom'); };
+    setTimeout(() => b.dispatchEvent(new CustomEvent('done', { detail: 'ok' })), 10);
+  </script>
+</body></html>
+)HTML");
+
+    auto button = page.outer_html("#b[data-hit='ok']");
+    require(button.has_value(), "setTimeout and CustomEvent should mutate DOM even when another listener throws");
+}
+
+void test_inner_html_fragment_parsing()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <section id="target"></section>
+  <script>
+    document.getElementById('target').innerHTML = '<p class="x">A</p><p>B</p>';
+  </script>
+</body></html>
+)HTML");
+
+    auto html = page.outer_html("#target");
+    require(html && html->find("<p class=\"x\">A</p><p>B</p>") != std::string::npos,
+            "innerHTML should parse an HTML fragment through Lexbor");
+}
+
+void test_tree_operations_and_clone()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <ul id="list"><li id="a">A</li><li id="c">C</li></ul>
+  <script>
+    const list = document.getElementById('list');
+    const c = document.getElementById('c');
+
+    const b = document.createElement('li');
+    b.id = 'b';
+    b.textContent = 'B';
+    list.insertBefore(b, c);
+
+    const replacement = document.createElement('li');
+    replacement.id = 'x';
+    replacement.textContent = 'X';
+    const old = list.replaceChild(replacement, document.getElementById('a'));
+
+    const clone = replacement.cloneNode(true);
+    clone.id = 'x2';
+    list.appendChild(clone);
+    c.remove();
+
+    list.setAttribute('data-returned', old.id);
+    list.setAttribute('data-order', list.children.map((node) => node.textContent).join(''));
+    list.setAttribute('data-contains', String(list.contains(clone)));
+    list.setAttribute('data-connected', String(clone.isConnected));
+  </script>
+</body></html>
+)HTML");
+
+    auto list = page.outer_html("#list[data-returned='a'][data-order='XBX'][data-contains='true'][data-connected='true']");
+    require(list && list->find("<li id=\"x2\">X</li>") != std::string::npos,
+            "insertBefore, replaceChild, cloneNode and remove should mutate Lexbor DOM");
+}
+
+void test_dataset_attributes_and_cached_facades()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="target" class="a" data-user-id="42" style="color: red"></div>
+  <script>
+    const el = document.getElementById('target');
+    const sameClassList = el.classList === el.classList;
+    const sameStyle = el.style === el.style;
+    const sameAttributes = el.attributes === el.attributes;
+
+    el.classList.add('b');
+    el.style.backgroundColor = 'blue';
+    el.dataset.userId = '7';
+    el.dataset.newFlag = 'yes';
+    el.setAttribute('title', 'ok');
+
+    const attrByIndex = el.attributes[0] && el.attributes[0].name ? 'indexed' : 'missing';
+    const datasetKeys = Object.keys(el.dataset).sort().join(',');
+    el.setAttribute('data-check', [
+      el.dataset.userId,
+      el.dataset.newFlag,
+      el.attributes.getNamedItem('title').value,
+      attrByIndex,
+      datasetKeys,
+      sameClassList,
+      sameStyle,
+      sameAttributes
+    ].join('|'));
+  </script>
+</body></html>
+)HTML");
+
+    auto div = page.outer_html("#target.a.b[data-user-id='7'][data-new-flag='yes'][title='ok']");
+    require(div && div->find("background-color: blue;") != std::string::npos,
+            "dataset, attributes, classList and style facades should reflect Lexbor attributes");
+    require(div->find("data-check=\"7|yes|ok|indexed|newFlag,userId|true|true|true\"") != std::string::npos,
+            "DOM facade objects should be cached and expose attribute snapshots");
+}
+
+void test_inner_html_invalidates_stale_wrappers()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="root"><span id="old">old</span></div>
+  <script>
+    const root = document.getElementById('root');
+    const old = document.getElementById('old');
+    root.innerHTML = '<span id="fresh">fresh</span>';
+
+    let stale = 'usable';
+    try {
+      old.textContent = 'bad';
+    } catch (error) {
+      stale = 'invalid';
+    }
+
+    root.setAttribute('data-stale', stale);
+    root.setAttribute('data-fresh', root.firstElementChild.textContent);
+  </script>
+</body></html>
+)HTML");
+
+    auto root = page.outer_html("#root[data-stale='invalid'][data-fresh='fresh']");
+    require(root && root->find("bad") == std::string::npos,
+            "innerHTML should invalidate stale JS wrappers for destroyed Lexbor nodes");
+}
+
+void test_timer_wait_budget()
+{
+    pagecore::LoadOptions options;
+    options.wait_time = std::chrono::milliseconds(5);
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html><body>
+  <div id="timer"></div>
+  <script>
+    setTimeout(() => document.getElementById('timer').setAttribute('data-fired', 'yes'), 10);
+  </script>
+</body></html>
+)HTML");
+
+    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
+            "timer should not fire before the configured wait budget");
+
+    page.run_until_idle();
+    require(page.outer_html("#timer[data-fired='yes']").has_value(),
+            "timer should fire after enough wait budget has been advanced");
+}
+
+void test_browser_like_web_api_shims()
+{
+    pagecore::LoadOptions options;
+    options.user_agent = "shim-test-agent";
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html>
+  <head><title>Old</title></head>
+  <body>
+    <script>
+      const checks = [];
+      checks.push(location.href === 'https://example.test/path/index.html');
+      checks.push(document.baseURI === 'https://example.test/path/index.html');
+      checks.push(document.referrer === '');
+      checks.push(document.referrer.indexOf(location.origin) === -1);
+      checks.push(navigator.userAgent === 'shim-test-agent');
+      checks.push(window.window === window);
+      checks.push(self === window);
+      checks.push(top === window);
+      checks.push(parent === window);
+      checks.push(typeof Window === 'function');
+      if (typeof Window === 'function') {
+        checks.push(window instanceof Window);
+        checks.push(Window.prototype instanceof EventTarget);
+        checks.push(Object.prototype.toString.call(window) === '[object Window]');
+      } else {
+        checks.push(false, false, false);
+      }
+      checks.push(navigator.javaEnabled() === false);
+      checks.push(screen.width === window.innerWidth);
+      checks.push(screen.height === window.innerHeight);
+      checks.push(screen.colorDepth === 24);
+
+      const iframe = document.createElement('iframe');
+      iframe.src = 'https://frame.test/start';
+      document.body.appendChild(iframe);
+      let frameMessage = false;
+      iframe.contentWindow.addEventListener('message', (event) => {
+        frameMessage = event.data === 'ping' &&
+          event.origin === location.origin &&
+          event.source === window;
+      });
+      iframe.contentWindow.postMessage('ping', '*');
+      checks.push(iframe.contentWindow === iframe.contentWindow);
+      checks.push(iframe.contentDocument === iframe.contentWindow.document);
+      checks.push(iframe.contentDocument.defaultView === iframe.contentWindow);
+      checks.push(typeof Window === 'function' && iframe.contentWindow instanceof Window);
+      checks.push(typeof Window === 'function' && iframe.contentWindow.Window === Window);
+      checks.push(iframe.contentWindow.parent === window);
+      checks.push(iframe.contentWindow.frameElement === iframe);
+      checks.push(iframe.contentWindow.location.href === 'https://frame.test/start');
+      checks.push(frameMessage);
+
+      const url = new URL('../asset.png?x=1#h', location.href);
+      checks.push(url.href === 'https://example.test/asset.png?x=1#h');
+      checks.push(URL.canParse('/ok', location.href));
+
+      const params = new URLSearchParams('a=1&a=2&b=hello+world');
+      checks.push(params.get('a') === '1');
+      checks.push(params.getAll('a').join(',') === '1,2');
+      checks.push(params.get('b') === 'hello world');
+
+      localStorage.setItem('k', 'v');
+      sessionStorage.setItem('s', '1');
+      checks.push(localStorage.getItem('k') === 'v');
+      checks.push(sessionStorage.length === 1);
+      checks.push(matchMedia('(min-width: 1px)').media === '(min-width: 1px)');
+
+      document.title = 'Shim Title';
+      checks.push(document.title === 'Shim Title');
+      document.body.setAttribute('data-script-ready', document.readyState);
+
+      document.addEventListener('DOMContentLoaded', () => {
+        document.body.setAttribute('data-dcl', document.readyState);
+      });
+      window.addEventListener('load', () => {
+        document.body.setAttribute('data-load', document.readyState);
+      });
+
+      document.body.setAttribute('data-api', checks.every(Boolean) ? 'ok' : 'bad');
+    </script>
+  </body>
+</html>
+)HTML", "https://example.test/path/index.html");
+
+    auto body = page.outer_html("body[data-api='ok'][data-script-ready='loading'][data-dcl='interactive'][data-load='complete']");
+    require(body.has_value(), "browser-like global APIs, base URL and lifecycle events should be available");
+
+    auto title = page.text_content("title");
+    require(title && *title == "Shim Title", "document.title should update the title element");
+}
+
+void test_event_constructor_ignores_prototype_accessors()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    Object.defineProperty(Event.prototype, 'target', {
+      configurable: true,
+      get() { return null; }
+    });
+    document.addEventListener('DOMContentLoaded', (event) => {
+      document.body.setAttribute('data-event-target', event.target === document ? 'ok' : 'bad');
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-event-target='ok']").has_value(),
+        "Event instances should own mutable dispatch fields even if Event.prototype has accessor shims");
+}
+
+void test_document_lifecycle_ignores_ready_state_overrides()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    Object.defineProperty(document, 'readyState', {
+      configurable: true,
+      get() { return 'loading'; }
+    });
+    document.addEventListener('DOMContentLoaded', () => {
+      document.body.setAttribute('data-dcl', 'ok');
+    });
+    window.addEventListener('load', () => {
+      document.body.setAttribute('data-load', 'ok');
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-dcl='ok'][data-load='ok']").has_value(),
+        "lifecycle dispatch should use internal readyState even if page code shadows document.readyState");
+}
+
+void test_get_computed_style_reads_display_from_stylesheets()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/styles.css",
+        ".wrapper { display: none; }",
+        "text/css");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html>
+  <head><link rel="stylesheet" href="/styles.css"></head>
+  <body>
+    <div class="wrapper"></div>
+    <script>
+      const wrapper = document.querySelector('.wrapper');
+      const before = getComputedStyle(wrapper).getPropertyValue('display');
+      if (before === 'none') wrapper.style.display = 'block';
+      const after = getComputedStyle(wrapper).display;
+      document.body.setAttribute('data-computed-display',
+        before === 'none' &&
+        after === 'block' &&
+        wrapper.getAttribute('style').indexOf('display: block') >= 0
+          ? 'ok'
+          : 'bad');
+    </script>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-computed-display='ok']").has_value(),
+        "getComputedStyle should expose simple display rules from linked stylesheets");
+    require(
+        has_request_kind(*loader, "https://example.test/styles.css", pagecore::ResourceKind::Stylesheet),
+        "getComputedStyle stylesheet lookup should request linked CSS as a stylesheet resource");
+}
+
+void test_cssom_stylesheets_rules_declarations_and_cascade()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/base.css",
+        ".target { color: red; display: none; }\n#target { color: blue; }",
+        "text/css");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html>
+  <head>
+    <link rel="stylesheet" href="/base.css">
+    <style>.target { color: green !important; background-color: yellow; }</style>
+  </head>
+  <body>
+    <div id="target" class="target"></div>
+    <div id="inserted" class="inserted"></div>
+    <script>
+      const target = document.getElementById('target');
+      const inserted = document.getElementById('inserted');
+      const sheets = document.styleSheets;
+      const linked = sheets[0];
+      const inline = sheets.item(1);
+      const firstRule = linked.cssRules[0];
+
+      inline.insertRule('.inserted { display: inline; color: purple; }', inline.cssRules.length);
+      const insertedDisplay = getComputedStyle(inserted).display;
+      inline.deleteRule(inline.cssRules.length - 1);
+      const insertedDisplayAfterDelete = getComputedStyle(inserted).display;
+
+      target.style.setProperty('color', 'black');
+      const authorImportant = getComputedStyle(target).color;
+      target.style.setProperty('color', 'black', 'important');
+      const inlineImportant = getComputedStyle(target).color;
+
+      const checks = [
+        sheets.length === 2,
+        sheets.item(0) === linked,
+        linked instanceof CSSStyleSheet,
+        linked.ownerNode.tagName === 'LINK',
+        linked.href === 'https://example.test/base.css',
+        inline.ownerNode.tagName === 'STYLE',
+        firstRule instanceof CSSStyleRule,
+        firstRule.type === CSSRule.STYLE_RULE,
+        firstRule.selectorText === '.target',
+        firstRule.style instanceof CSSStyleDeclaration,
+        firstRule.style.getPropertyValue('display') === 'none',
+        inline.cssRules[0].style.getPropertyPriority('color') === 'important',
+        insertedDisplay === 'inline',
+        insertedDisplayAfterDelete === 'block',
+        authorImportant === 'green',
+        inlineImportant === 'black',
+        target.style.getPropertyPriority('color') === 'important',
+        target.style.item(0) === 'color',
+        document.querySelector('style').textContent.indexOf('.target') >= 0
+      ];
+      document.body.setAttribute('data-cssom', checks.every(Boolean) ? 'ok' : 'bad');
+    </script>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-cssom='ok']").has_value(),
+        "CSSOM stylesheets, rules, declarations and cascade should behave like browser-facing APIs");
+    require(
+        has_request_kind(*loader, "https://example.test/base.css", pagecore::ResourceKind::Stylesheet),
+        "CSSOM should load linked stylesheets as stylesheet resources");
+}
+
+void test_cssom_dynamic_sheets_media_disabled_and_adopted()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <head>
+    <style id="sheet">
+      .box { display: none; color: red; }
+      @media screen { .media { color: teal; } }
+    </style>
+  </head>
+  <body>
+    <div id="box" class="box media"></div>
+    <div id="parent" style="color: lime; visibility: hidden;">
+      <span id="child" style="display: unset; opacity: unset;"></span>
+    </div>
+    <script>
+      const box = document.getElementById('box');
+      const child = document.getElementById('child');
+      const sheetElement = document.getElementById('sheet');
+      const sheet = sheetElement.sheet;
+      const checks = [];
+
+      checks.push(sheet.cssRules.item(0) === sheet.cssRules[0]);
+      checks.push(sheet.cssRules[1].type === CSSRule.MEDIA_RULE);
+      checks.push(sheet.cssRules[1].cssRules[0].style.color === 'teal');
+      checks.push(getComputedStyle(box).display === 'none');
+      checks.push(getComputedStyle(box).color === 'teal');
+
+      const childStyle = getComputedStyle(child);
+      checks.push(childStyle.color === 'lime');
+      checks.push(childStyle.visibility === 'hidden');
+      checks.push(childStyle.display === 'inline');
+      checks.push(childStyle.opacity === '1');
+      checks.push(childStyle.length > 0);
+      checks.push(childStyle.item(0) !== '');
+      checks.push(childStyle.getPropertyPriority('color') === '');
+      child.style.cssFloat = 'right';
+      checks.push(child.style.getPropertyValue('float') === 'right');
+      checks.push(getComputedStyle(child).cssFloat === 'right');
+
+      sheet.disabled = true;
+      checks.push(getComputedStyle(box).display === 'block');
+
+      sheet.disabled = false;
+      sheet.cssRules[0].style.display = 'inline-block';
+      checks.push(getComputedStyle(box).display === 'inline-block');
+
+      sheet.replaceSync('.box { color: navy; }');
+      checks.push(sheet.cssRules.length === 1);
+      checks.push(sheetElement.textContent.indexOf('navy') >= 0);
+      checks.push(getComputedStyle(box).color === 'navy');
+
+      const adopted = new CSSStyleSheet();
+      adopted.replaceSync('.box { color: maroon !important; background-color: silver; }');
+      document.adoptedStyleSheets = [adopted];
+      checks.push(document.adoptedStyleSheets.length === 1);
+      checks.push(document.styleSheets.length === 1);
+      checks.push(getComputedStyle(box).color === 'maroon');
+      checks.push(getComputedStyle(box).backgroundColor === 'silver');
+
+      adopted.replace('.box { color: olive; }').then((resolved) => {
+        checks.push(resolved === adopted);
+        checks.push(getComputedStyle(box).color === 'olive');
+        document.body.setAttribute('data-cssom-dynamic', checks.every(Boolean) ? 'ok' : 'bad');
+      });
+    </script>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-cssom-dynamic='ok']").has_value(),
+        "CSSOM dynamic rules, media rules, disabled sheets and adopted stylesheets should update computed style");
+}
+
+void test_dom_fragment_range_serializer_and_mutation_observer()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="root"></div>
+  <script>
+    const root = document.getElementById('root');
+    const seen = [];
+    new MutationObserver((records) => {
+      for (const record of records) seen.push(record.type + ':' + (record.attributeName || ''));
+      if (!root.hasAttribute('data-mut')) root.setAttribute('data-mut', seen.join(','));
+    }).observe(root, { attributes: true, childList: true, subtree: true });
+    const filtered = [];
+    new MutationObserver((records) => {
+      for (const record of records) filtered.push(record.attributeName);
+      root.setAttribute('data-filtered', filtered.join(','));
+    }).observe(root, { attributeFilter: ['data-order'] });
+
+    const range = document.createRange();
+    range.selectNodeContents(root);
+    const fragment = range.createContextualFragment('<span class="a">A</span><span>B</span>');
+    root.appendChild(fragment);
+    root.insertAdjacentHTML('afterbegin', '<em>E</em>');
+    root.querySelector('em').insertAdjacentText('afterend', 'T');
+
+    const xml = new XMLSerializer().serializeToString(root);
+    root.setAttribute('data-order', root.textContent);
+    root.setAttribute('data-xml', xml.indexOf('<span class="a">A</span>') >= 0 ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    auto root = page.outer_html("#root[data-order='ETAB'][data-xml='ok']");
+    require(root && root->find("<em>E</em>T<span class=\"a\">A</span><span>B</span>") != std::string::npos,
+            "Range fragments, insertAdjacentHTML/Text and XMLSerializer should operate on Lexbor nodes");
+    require(root->find("data-mut=\"childList:,childList:,childList:,attributes:data-order,attributes:data-xml\"") != std::string::npos,
+            "MutationObserver should receive queued childList and attribute records");
+    require(root->find("data-filtered=\"data-order\"") != std::string::npos,
+            "MutationObserver attributeFilter should imply attributes and filter attribute records");
+}
+
+void test_text_content_mutation_observer_records_nodes()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="root"><span id="old">old</span><!--marker--></div>
+  <script>
+    const root = document.getElementById('root');
+    const removedSpan = document.getElementById('old');
+    const removedComment = root.childNodes[1];
+    const records = [];
+    new MutationObserver((batch) => {
+      for (const record of batch) records.push(record);
+    }).observe(root, { childList: true, characterData: true, subtree: true });
+
+    root.textContent = 'fresh';
+    const fresh = root.firstChild;
+    fresh.textContent = 'fresh2';
+    const comment = document.createComment('before');
+    root.appendChild(comment);
+    comment.textContent = 'after';
+
+    Promise.resolve().then(() => {
+      const childRecord = records.find((record) =>
+        record.type === 'childList' &&
+        record.target === root &&
+        record.addedNodes.length === 1 &&
+        record.addedNodes[0] === fresh &&
+        record.removedNodes.length === 2 &&
+        record.removedNodes[0] === removedSpan &&
+        record.removedNodes[1] === removedComment);
+      const textRecord = records.find((record) =>
+        record.type === 'characterData' && record.target === fresh);
+      const commentRecord = records.find((record) =>
+        record.type === 'characterData' && record.target === comment);
+      root.setAttribute('data-textcontent-records',
+        childRecord && textRecord && commentRecord ? 'ok' : 'bad');
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("#root[data-textcontent-records='ok']").has_value(),
+        "textContent mutations should report removed/added child nodes and characterData records for text and comments");
+}
+
+void test_document_write_fragment_insertion()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.write('<span id="a">A</span>', '<span id="b">B</span>');
+    document.writeln('<span id="c">C</span>');
+  </script>
+  <div id="tail">T</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const auto body = page.outer_html("body");
+    require(body && body->find("<span id=\"a\">A</span><span id=\"b\">B</span><span id=\"c\">C</span>") != std::string::npos,
+            "document.write/writeln should parse HTML fragments and preserve write order");
+    require(body->find("<span id=\"c\">C</span>\n") != std::string::npos,
+            "document.writeln should append a newline after its HTML text");
+}
+
+void test_document_write_external_script_and_open_close()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/writer.js",
+        "document.write('<main id=\"external-write\"><b>external</b></main>');",
+        "text/javascript");
+
+    pagecore::Page external_page;
+    external_page.set_resource_loader(loader);
+    external_page.load_html(R"HTML(
+<html><body>
+  <script src="/writer.js"></script>
+  <div id="tail">tail</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const auto external_body = external_page.outer_html("body");
+    require(
+        external_body && external_body->find("<script src=\"/writer.js\"></script><main id=\"external-write\"><b>external</b></main>") != std::string::npos,
+        "external scripts should document.write HTML after document.currentScript");
+    require(
+        has_request_kind(*loader, "https://example.test/writer.js", pagecore::ResourceKind::Script),
+        "document.write external script test should load the writer through ResourceLoader");
+
+    pagecore::Page open_page;
+    open_page.load_html(R"HTML(
+<html><body>
+  <div id="old">old</div>
+  <script>
+    document.open();
+    document.write('<section id="new">new</section>');
+    document.close();
+  </script>
+</body></html>
+)HTML", "https://example.test/open.html");
+
+    require(open_page.outer_html("#new").has_value(), "document.open/write/close should create replacement body content");
+    require(!open_page.outer_html("#old").has_value(), "document.open should clear previous body content");
+}
+
+void test_document_write_escaped_script_text_remains_text()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.write('&lt;script&gt;document.body.setAttribute("data-ran", "bad")&lt;/script&gt;');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const auto body = page.outer_html("body");
+    require(body && body->find("&lt;script&gt;document.body.setAttribute") != std::string::npos,
+            "escaped script-like text should remain text when inserted through document.write");
+    require(!page.outer_html("body[data-ran='bad']").has_value(),
+            "escaped script-like text should not become executable HTML");
+}
+
+void test_comment_nodes_wrap_for_sibling_traversal()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="first"></div><!--marker--><div id="second"></div>
+  <script>
+    const previous = document.getElementById('second').previousSibling;
+    document.body.setAttribute('data-prev',
+      previous instanceof Comment
+        && previous.nodeType === Node.COMMENT_NODE
+        && previous.nodeValue === 'marker'
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/comments.html");
+
+    require(
+        page.outer_html("body[data-prev='ok']").has_value(),
+        "comment sibling nodes should wrap as Comment instead of being treated as Elements");
+}
+
+void test_create_comment_nodes_are_not_visible_text()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="placeholder-host"><script id="placeholder-source">document.body.setAttribute('data-ran', 'bad');</script></div>
+  <script>
+    const host = document.getElementById('placeholder-host');
+    const source = document.getElementById('placeholder-source');
+    const placeholder = document.createComment(source.outerHTML);
+    source.parentNode.replaceChild(placeholder, source);
+    document.body.setAttribute('data-comment-node',
+      placeholder instanceof Comment
+        && placeholder.nodeType === Node.COMMENT_NODE
+        && placeholder.nodeValue.indexOf('<script') === 0
+        ? 'ok'
+        : 'bad');
+    document.body.setAttribute('data-body-text',
+      host.textContent.indexOf('<script') === -1 ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/comment-placeholder.html");
+
+    const auto body = page.outer_html("body");
+    require(page.outer_html("body[data-comment-node='ok']").has_value(),
+            "document.createComment should create real Comment nodes");
+    require(page.outer_html("body[data-body-text='ok']").has_value(),
+            "comment contents should not contribute to element textContent");
+    require(body && body->find("<!--<script id=\"placeholder-source\">") != std::string::npos,
+            "comment placeholders should serialize as comments, not escaped text");
+    require(body && body->find("&lt;script id=\"placeholder-source\"") == std::string::npos,
+            "comment placeholders should not serialize as visible escaped HTML text");
+}
+
+void test_event_options_bubbling_and_wpt_driver_shim()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <button id="button"></button>
+  <script>
+    const button = document.getElementById('button');
+    const hits = [];
+
+    const controller = new AbortController();
+    button.addEventListener('click', () => hits.push('aborted'), { signal: controller.signal });
+    controller.abort();
+
+    button.addEventListener('click', { handleEvent(event) {
+      hits.push(event.composedPath().indexOf(window) >= 0 ? 'path' : 'missing');
+    }}, { once: true });
+    window.addEventListener('click', () => hits.push('window'), { once: true });
+
+    button.click();
+    button.click();
+
+    test_driver_internal = {};
+    test_driver_internal.click(button).then(() => {
+      button.setAttribute('data-driver', 'ok');
+    });
+
+    button.setAttribute('data-hits', hits.join('|'));
+  </script>
+</body></html>
+)HTML");
+
+    auto button = page.outer_html("#button[data-hits='path|window'][data-driver='ok']");
+    require(button.has_value(), "event options, bubbling path and WPT test_driver click shim should work");
+}
+
+void test_custom_elements_registry_shim()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <typesense-minibar id="ce"><form></form></typesense-minibar>
+  <script>
+    window.customElements.define('typesense-minibar', class extends HTMLElement {
+      static get observedAttributes () { return ['data-mode']; }
+      connectedCallback () {
+        this.setAttribute('data-connected', this.querySelector('form') ? 'yes' : 'no');
+      }
+      attributeChangedCallback (name, oldValue, newValue) {
+        this.setAttribute('data-attr', name + ':' + oldValue + ':' + newValue);
+      }
+    });
+
+    const element = document.getElementById('ce');
+    element.setAttribute('data-mode', 'on');
+    customElements.whenDefined('typesense-minibar').then((ctor) => {
+      element.setAttribute('data-defined', customElements.get('typesense-minibar') === ctor ? 'yes' : 'no');
+    });
+  </script>
+</body></html>
+)HTML");
+
+    auto element = page.outer_html("#ce[data-connected='yes'][data-attr='data-mode:null:on'][data-defined='yes']");
+    require(element.has_value(), "customElements registry should define, upgrade and resolve custom element constructors");
+}
+
+void test_shadow_root_and_element_internals_shims()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <shadow-host id="host"></shadow-host>
+  <script>
+    customElements.define('shadow-host', class extends HTMLElement {
+      connectedCallback () {
+        const root = this.attachShadow({ mode: 'open', delegatesFocus: true });
+        const child = document.createElement('span');
+        child.id = 'inside';
+        child.className = 'shadow-child';
+        root.appendChild(child);
+        root.prepend(document.createElement('b'));
+        const prepended = root.firstChild && root.firstChild.localName === 'b';
+        root.replaceChildren(child);
+
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync('.shadow-child { color: rgb(1, 2, 3); }');
+        root.adoptedStyleSheets = [sheet];
+        child.innerText = 'Shadow text';
+
+        const slot = document.createElement('slot');
+
+        let observedShadowRoot = false;
+        new MutationObserver(() => { observedShadowRoot = true; }).observe(root, { attributeFilter: ['data-shadow'] });
+
+        const internals = this.attachInternals();
+        this.setAttribute('data-shadow',
+          root instanceof ShadowRoot &&
+          root.host === this &&
+          root.mode === 'open' &&
+          root.delegatesFocus === true &&
+          this.shadowRoot === root &&
+          root.querySelector('#inside') === child &&
+          root.adoptedStyleSheets[0] === sheet &&
+          getComputedStyle(child).color === 'rgb(1, 2, 3)' &&
+          child.innerText === 'Shadow text' &&
+          child.checkVisibility() === true &&
+          child.offsetParent === this &&
+          slot.assignedNodes().length === 0 &&
+          slot.assignedElements().length === 0 &&
+          prepended &&
+          root.firstChild === child &&
+          root.contains(child) &&
+          child.parentNode === root &&
+          child.getRootNode() === root &&
+          child.getRootNode({ composed: true }) === document &&
+          internals instanceof ElementInternals &&
+          internals.shadowRoot === root &&
+          observedShadowRoot === false
+            ? 'ok'
+            : 'bad');
+      }
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("#host[data-shadow='ok']").has_value(),
+        "attachShadow, ShadowRoot, getRootNode and ElementInternals should support browser-like custom elements");
+}
+
+void test_custom_elements_with_private_fields_construct_instances()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <private-upgrade id="existing"></private-upgrade>
+  <script>
+    class PrivateUpgrade extends HTMLElement {
+      #delegate;
+
+      constructor () {
+        super();
+        this.#delegate = { localName: this.localName };
+      }
+
+      get delegate () { return this.#delegate; }
+
+      connectedCallback () {
+        this.setAttribute('data-connected', this.delegate.localName);
+      }
+    }
+
+    customElements.define('private-upgrade', PrivateUpgrade);
+
+    const existing = document.getElementById('existing');
+    const created = document.createElement('private-upgrade');
+    document.body.appendChild(created);
+
+    document.body.setAttribute('data-private-custom-elements',
+      existing.delegate.localName === 'private-upgrade' &&
+      created.delegate.localName === 'private-upgrade' &&
+      Object.getPrototypeOf(created.delegate) === Object.prototype &&
+      existing.getAttribute('data-connected') === 'private-upgrade' &&
+      created.getAttribute('data-connected') === 'private-upgrade'
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-private-custom-elements='ok']").has_value(),
+        "custom elements should be constructed so private fields and instance properties are initialized");
+}
+
+void test_external_script_via_resource_loader()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add("https://example.test/app.js",
+                "document.body.setAttribute('data-external', 'yes');");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body><script src="/app.js"></script></body></html>
+)HTML", "https://example.test/index.html");
+
+    auto body = page.outer_html("body[data-external='yes']");
+    require(body.has_value(), "external script should load through ResourceLoader");
+}
+
+void test_current_script_and_reflected_url_attributes()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://cdn.test/assets/runtime.js",
+        R"JS(
+const current = document.currentScript;
+if (!current || current.tagName.toUpperCase() !== 'SCRIPT' || !current.src) {
+  throw new Error('Automatic publicPath is not supported in this browser');
+}
+document.body.setAttribute('data-current-script', current.src);
+document.body.setAttribute('data-public-path', current.src.replace(/\/[^\/]+$/, '/'));
+
+const created = document.createElement('script');
+created.src = '/assets/app.js';
+document.body.appendChild(created);
+document.body.setAttribute('data-created-src', created.src);
+
+const link = document.createElement('a');
+link.href = 'docs/page.html';
+document.body.appendChild(link);
+document.body.setAttribute('data-link-href', link.href);
+)JS",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body><script src="https://cdn.test/assets/runtime.js"></script></body></html>
+)HTML", "https://example.test/path/index.html");
+
+    require(
+        page.outer_html("body[data-current-script='https://cdn.test/assets/runtime.js'][data-public-path='https://cdn.test/assets/']").has_value(),
+        "external script execution should expose document.currentScript with an absolute src");
+    require(
+        page.outer_html("body[data-created-src='https://example.test/assets/app.js'][data-link-href='https://example.test/path/docs/page.html']").has_value(),
+        "reflected URL attributes should resolve against the document base URL");
+}
+
+void test_module_script_imports_relative_dependencies()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/app/modules/main.js",
+        R"JS(
+import { label, value } from './dep.js';
+document.body.setAttribute('data-module', label + ':' + value);
+document.body.setAttribute('data-current-script-module', document.currentScript === null ? 'null' : 'set');
+document.body.setAttribute('data-import-meta', import.meta.url);
+)JS",
+        "text/javascript");
+    loader->add(
+        "https://example.test/app/modules/dep.js",
+        "export const label = 'ok'; export const value = 42;",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body><script type="module" src="modules/main.js"></script></body></html>
+)HTML", "https://example.test/app/index.html");
+
+    require(
+        page.outer_html("body[data-module='ok:42'][data-current-script-module='null']").has_value(),
+        "module script should execute with imported bindings and null document.currentScript");
+    require(
+        page.eval("document.body.getAttribute('data-import-meta')") == "https://example.test/app/modules/main.js",
+        "external module should expose import.meta.url");
+    require(
+        has_request_kind(*loader, "https://example.test/app/modules/main.js", pagecore::ResourceKind::Script),
+        "external module script should be requested as script resource");
+    require(
+        has_request_kind(*loader, "https://example.test/app/modules/dep.js", pagecore::ResourceKind::Script),
+        "module dependency should be loaded through ResourceLoader as script resource");
+}
+
+void test_inline_module_uses_document_url_for_relative_imports()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/app/dep.js",
+        "export const value = 'inline-ok';",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script type="module">
+    import { value } from './dep.js';
+    document.body.setAttribute('data-inline-module', value);
+    document.body.setAttribute('data-inline-import-meta', import.meta.url);
+  </script>
+</body></html>
+)HTML", "https://example.test/app/page.html");
+
+    require(
+        page.outer_html("body[data-inline-module='inline-ok']").has_value(),
+        "inline module should resolve relative imports against document URL");
+    require(
+        page.eval("document.body.getAttribute('data-inline-import-meta')")
+            == "https://example.test/app/page.html#inline-module-0",
+        "inline module should expose a stable document-based import.meta.url");
+    require(
+        has_request_kind(*loader, "https://example.test/app/dep.js", pagecore::ResourceKind::Script),
+        "inline module dependency should be loaded through ResourceLoader as script resource");
+}
+
+void test_html_element_specific_constructors()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const button = document.createElement('button');
+    const div = document.createElement('div');
+    const image = document.createElement('img');
+    const script = document.createElement('script');
+    const unknown = document.createElement('blink');
+    document.body.append(button, div, image, script, unknown);
+
+    document.body.setAttribute('data-constructors',
+      button instanceof HTMLButtonElement &&
+      button instanceof HTMLElement &&
+      !(div instanceof HTMLButtonElement) &&
+      div instanceof HTMLDivElement &&
+      image instanceof HTMLImageElement &&
+      script instanceof HTMLScriptElement &&
+      document.body instanceof HTMLBodyElement &&
+      unknown instanceof HTMLUnknownElement
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-constructors='ok']").has_value(),
+        "HTML element wrappers should expose tag-specific constructors and instanceof behavior");
+}
+
+void test_create_element_ns_and_template_content_clone()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const template = document.createElement('template');
+    const handle = document.createElement('span');
+    const svg = document.createElementNS(svgNS, 'svg');
+    const path = document.createElementNS(svgNS, 'path');
+    handle.classList.add('handle');
+    path.setAttribute('d', 'M0 0h1v1z');
+    template.content.appendChild(handle);
+    handle.appendChild(svg);
+    svg.appendChild(path);
+
+    const clone = template.content.cloneNode(true);
+    const clonedPath = clone.querySelector('path');
+    document.body.appendChild(clone);
+
+    document.body.setAttribute('data-template-svg',
+      svg instanceof SVGSVGElement &&
+      path instanceof SVGPathElement &&
+      svg.namespaceURI === svgNS &&
+      path.namespaceURI === svgNS &&
+      clonedPath instanceof SVGPathElement &&
+      document.querySelector('.handle svg path') instanceof SVGPathElement
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-template-svg='ok']").has_value(),
+        "createElementNS and template.content.cloneNode should preserve SVG wrappers");
+}
+
+void test_global_event_listener_aliases_bind_to_window()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    addEventListener('load', () => {
+      document.body.setAttribute('data-window-load-listener', 'ok');
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-window-load-listener='ok']").has_value(),
+        "global addEventListener alias should bind to window");
+}
+
+void test_document_domain_and_cookie_jar()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.cookie = 'session=abc; path=/; domain=.example.test; samesite=lax';
+    document.cookie = 'theme=light; path=/';
+    document.cookie = 'session=gone; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+    document.body.setAttribute('data-domain', document.domain);
+    document.body.setAttribute('data-cookie', document.cookie);
+  </script>
+</body></html>
+)HTML", "https://sub.example.test/index.html");
+
+    require(
+        page.outer_html("body[data-domain='sub.example.test'][data-cookie='theme=light']").has_value(),
+        "document.domain and document.cookie should provide basic browser-compatible state");
+}
+
+void test_document_location_aliases_window_location()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.body.setAttribute('data-location',
+      document.location === window.location &&
+      document.defaultView === window &&
+      document.location.search === '?utm_source=test'
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html?utm_source=test");
+
+    require(
+        page.outer_html("body[data-location='ok']").has_value(),
+        "document.location should alias window.location");
+}
+
+void test_dom_implementation_create_html_document()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const detached = document.implementation.createHTMLDocument('Detached');
+    const base = detached.createElement('base');
+    base.href = document.location.href;
+    detached.head.appendChild(base);
+    detached.body.innerHTML = '<form></form><form></form><main id="m"><span class="x">ok</span></main>';
+
+    const parsed = new DOMParser().parseFromString('<section id="parsed">text</section>', 'text/html');
+
+    document.body.setAttribute('data-dom-implementation',
+      document.implementation instanceof DOMImplementation &&
+      detached.title === 'Detached' &&
+      detached.body.childNodes.length === 3 &&
+      detached.getElementById('m').querySelector('.x').textContent === 'ok' &&
+      detached.head.querySelector('base').href === 'https://example.test/page.html' &&
+      parsed.body.querySelector('#parsed').textContent === 'text'
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/page.html");
+
+    require(
+        page.outer_html("body[data-dom-implementation='ok']").has_value(),
+        "DOMImplementation.createHTMLDocument should provide a detached HTML document for parser libraries");
+}
+
+void test_message_channel_and_crypto_shims()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const values = new Uint8Array(8);
+    const returned = crypto.getRandomValues(values);
+    const uuid = crypto.randomUUID();
+    const channel = new MessageChannel();
+    channel.port1.onmessage = (event) => {
+      document.body.setAttribute('data-message-channel',
+        event.data === 'ready' &&
+        returned === values &&
+        values.length === 8 &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid)
+          ? 'ok'
+          : 'bad');
+    };
+    channel.port2.postMessage('ready');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-message-channel='ok']").has_value(),
+        "MessageChannel and crypto shims should provide browser-compatible basics");
+}
+
+void test_text_encoder_decoder_utf8_shims()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const source = 'hello \u043f\u0440\u0438\u0432\u0435\u0442 \u{1F680}';
+    const encoder = new TextEncoder();
+    const encoded = encoder.encode(source);
+    const decoded = new TextDecoder().decode(encoded);
+    const target = new Uint8Array(4);
+    const result = encoder.encodeInto('a\u{1F680}z', target);
+    document.body.setAttribute('data-text-codec',
+      encoder.encoding === 'utf-8' &&
+      decoded === source &&
+      result.read === 1 &&
+      result.written === 1 &&
+      target[0] === 97
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-text-codec='ok']").has_value(),
+        "TextEncoder and TextDecoder should handle UTF-8 basics");
+}
+
+void test_escaped_colon_class_selector_fallback()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="open" popover class=":popover-open"></div>
+  <div id="closed" popover></div>
+  <script>
+    const open = document.querySelector('.\\:popover-open');
+    const scopedOpen = document.querySelectorAll(':where([popover].\\:popover-open)');
+    const closed = document.querySelectorAll(':where([popover]:not(.\\:popover-open))');
+    document.body.setAttribute('data-escaped-selector',
+      open && open.id === 'open' &&
+      scopedOpen.length === 1 &&
+      scopedOpen[0].id === 'open' &&
+      closed.length === 1 &&
+      closed[0].id === 'closed' &&
+      open.matches('[popover].\\:popover-open')
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-escaped-selector='ok']").has_value(),
+        "selector fallback should support escaped colon class selectors");
+}
+
+void test_target_pseudo_class_selector_fallback()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <section id="target"></section>
+  <section id="other"></section>
+  <script>
+    const target = document.querySelector(':target');
+    const all = document.querySelectorAll('section:target');
+    document.body.setAttribute('data-target-selector',
+      target && target.id === 'target' &&
+      all.length === 1 &&
+      all[0].matches(':target') &&
+      !document.getElementById('other').matches(':target')
+        ? 'ok'
+        : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html#target");
+
+    require(
+        page.outer_html("body[data-target-selector='ok']").has_value(),
+        ":target selector fallback should match the location hash element");
+}
+
+void test_request_response_fetch_object_shims()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const request = new Request('/api/data', {
+      method: 'post',
+      headers: { 'x-test': 'yes' },
+      body: 'payload'
+    });
+    const cloned = request.clone();
+    const response = Response.json({ ok: true }, { status: 201 });
+    response.json().then((data) => {
+      document.body.setAttribute('data-fetch-objects',
+        request.url === 'https://example.test/api/data' &&
+        request.method === 'POST' &&
+        cloned.headers.get('x-test') === 'yes' &&
+        response.ok &&
+        response.status === 201 &&
+        response.headers.get('content-type') === 'application/json' &&
+        data.ok === true
+          ? 'ok'
+          : 'bad');
+    });
+  </script>
+</body></html>
+)HTML", "https://example.test/page.html");
+
+    require(
+        page.outer_html("body[data-fetch-objects='ok']").has_value(),
+        "Request and Response shims should expose basic Fetch API object behavior");
+}
+
+void test_xhr_and_fetch_load_through_resource_loader()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://api.test/data.json",
+        R"JSON({"name":"xhr-ok"})JSON",
+        "application/json");
+    loader->add(
+        "https://example.test/fetch.json",
+        R"JSON({"name":"fetch-ok"})JSON",
+        "application/json");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://api.test/data.json');
+    xhr.onload = () => {
+      const data = JSON.parse(xhr.responseText);
+      document.body.setAttribute('data-xhr',
+        xhr.status === 200 &&
+        xhr.readyState === XMLHttpRequest.DONE &&
+        xhr.getResponseHeader('content-type') === 'application/json' &&
+        data.name === 'xhr-ok'
+          ? 'ok'
+          : 'bad');
+    };
+    xhr.send();
+
+    fetch('/fetch.json').then((response) => response.json()).then((data) => {
+      document.body.setAttribute('data-fetch-loader', data.name);
+    });
+  </script>
+</body></html>
+)HTML", "https://example.test/page.html");
+
+    require(
+        page.outer_html("body[data-xhr='ok'][data-fetch-loader='fetch-ok']").has_value(),
+        "XMLHttpRequest and fetch should load resources through ResourceLoader");
+}
+
+void test_xhr_event_handler_exceptions_are_reported()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add("https://api.test/data.txt", "ok", "text/plain");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', 'https://api.test/data.txt');
+    xhr.addEventListener('load', () => {
+      throw new Error('xhr listener boom');
+    });
+    xhr.addEventListener('load', () => {
+      document.body.setAttribute('data-xhr-after-error', 'ok');
+    });
+    xhr.addEventListener('error', () => {
+      document.body.setAttribute('data-xhr-error', 'network');
+    });
+    xhr.send();
+  </script>
+</body></html>
+)HTML", "https://example.test/page.html");
+
+    require(
+        page.outer_html("body[data-xhr-after-error='ok']").has_value(),
+        "XMLHttpRequest listener exceptions should be reported without aborting later listeners");
+    require(
+        !page.outer_html("body[data-xhr-error='network']").has_value(),
+        "XMLHttpRequest listener exceptions should not be converted to network errors");
+}
+
+void test_non_javascript_script_types_are_not_executed()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script type="speculationrules">
+    {"prefetch":[{"source":"document","where":{"href_matches":"/*"}}]}
+  </script>
+  <script type="importmap">
+    {"imports":{"x":"/x.js"}}
+  </script>
+  <script type="application/ld+json">
+    {"@context":"https://schema.org"}
+  </script>
+  <script>
+    document.body.setAttribute('data-js', 'ok');
+  </script>
+</body></html>
+)HTML");
+
+    require(page.outer_html("body[data-js='ok']").has_value(),
+            "non-JavaScript script types should be skipped instead of parsed by QuickJS");
+}
+
+void test_resource_request_kind_and_cache()
+{
+    auto raw_loader = std::make_shared<RecordingResourceLoader>();
+    raw_loader->add(
+        "https://example.test/app.js",
+        "document.body.setAttribute('data-script-kind', 'ok');",
+        "text/javascript");
+
+    auto cached_loader = std::make_shared<pagecore::CachingResourceLoader>(raw_loader);
+
+    pagecore::Page page;
+    page.set_resource_loader(cached_loader);
+    page.load_html(R"HTML(
+<html><body><script src="/app.js"></script></body></html>
+)HTML", "https://example.test/index.html");
+
+    auto body = page.outer_html("body[data-script-kind='ok']");
+    require(body.has_value(), "external script should execute through cached loader");
+    require(raw_loader->requests.size() == 1, "script should be loaded once through inner loader");
+    require(raw_loader->requests[0].kind == pagecore::ResourceKind::Script, "script request should be kind=Script");
+    require(raw_loader->requests[0].referrer == "https://example.test/index.html", "script request should carry referrer");
+
+    auto response = cached_loader->load(pagecore::ResourceRequest{
+        "https://example.test/app.js",
+        pagecore::ResourceKind::Script,
+        "https://example.test/index.html",
+        "https://example.test/index.html",
+    });
+    require(response.from_cache, "second script load should be served from cache");
+    require(raw_loader->requests.size() == 1, "cache hit should not call inner loader again");
+}
+
+void test_resource_url_resolution_normalizes_dot_segments()
+{
+    require(
+        pagecore::resolve_url("https://example.test/app/page.html", "./dep.js")
+            == "https://example.test/app/dep.js",
+        "relative URL resolution should remove current-directory segments");
+    require(
+        pagecore::resolve_url("https://example.test/app/nested/page.html", "../asset.css")
+            == "https://example.test/app/asset.css",
+        "relative URL resolution should remove parent-directory segments");
+    require(
+        pagecore::resolve_url("https://example.test", "style.css")
+            == "https://example.test/style.css",
+        "relative URL resolution should handle origin URLs without a trailing slash");
+    require(
+        pagecore::resolve_url("https://example.test/app/page.html", "/styles/../main.css")
+            == "https://example.test/main.css",
+        "absolute-path URL resolution should normalize dot segments");
+    require(
+        pagecore::resolve_url("https://example.test/app/page.html", "//cdn.example.test/assets/pixel.png")
+            == "https://cdn.example.test/assets/pixel.png",
+        "protocol-relative URL resolution should inherit the base scheme");
+    require(
+        pagecore::resolve_url("https://example.test/app/page.html", "cdn.example.test/assets/pixel.png")
+            == "https://cdn.example.test/assets/pixel.png",
+        "host-like URL resolution should avoid treating the hostname as a relative path segment");
+}
+
+void test_curl_resource_loader_decodes_gzip_content_encoding()
+{
+    const std::string expected = "document.body.setAttribute('data-gzip','ok');";
+    const unsigned char compressed_bytes[] = {
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x4b, 0xc9,
+        0x4f, 0x2e, 0xcd, 0x4d, 0xcd, 0x2b, 0xd1, 0x4b, 0xca, 0x4f, 0xa9, 0xd4,
+        0x2b, 0x4e, 0x2d, 0x71, 0x2c, 0x29, 0x29, 0xca, 0x4c, 0x2a, 0x2d, 0x49,
+        0xd5, 0x50, 0x4f, 0x49, 0x2c, 0x49, 0xd4, 0x4d, 0xaf, 0xca, 0x2c, 0x50,
+        0xd7, 0x51, 0xcf, 0xcf, 0x56, 0xd7, 0xb4, 0x06, 0x00, 0x23, 0x13, 0x77,
+        0x43, 0x2d, 0x00, 0x00, 0x00,
+    };
+    const std::string compressed(
+        reinterpret_cast<const char*>(compressed_bytes),
+        sizeof(compressed_bytes));
+
+    SingleResponseHttpServer server(
+        compressed,
+        {
+            {"Content-Encoding", "gzip"},
+            {"Content-Type", "application/javascript"},
+        });
+
+    pagecore::CurlResourceLoader loader("pagecore-test");
+    const auto response = loader.load(pagecore::ResourceRequest{
+        server.url(),
+        pagecore::ResourceKind::Script,
+    });
+
+    require(response.body == expected, "CurlResourceLoader should decode gzip Content-Encoding before returning a body");
+    require(
+        response.mime_type.find("application/javascript") == 0,
+        "CurlResourceLoader should preserve response Content-Type while decoding content");
+}
+
+void test_resource_policy_errors()
+{
+    pagecore::ResourcePolicy no_network;
+    no_network.allow_network = false;
+    pagecore::CurlResourceLoader curl_loader("pagecore-test", no_network);
+    require_resource_error(
+        pagecore::ResourceErrorCode::NetworkDisabled,
+        [&] {
+            (void) curl_loader.load(pagecore::ResourceRequest{
+                "https://example.test/app.js",
+                pagecore::ResourceKind::Script,
+            });
+        },
+        "network policy should reject HTTP requests before transport");
+
+    pagecore::ResourcePolicy same_origin;
+    same_origin.same_origin_only = true;
+    pagecore::MemoryResourceLoader same_origin_loader(same_origin);
+    same_origin_loader.add("https://cdn.test/app.js", "x", "text/javascript");
+    require_resource_error(
+        pagecore::ResourceErrorCode::SameOriginViolation,
+        [&] {
+            (void) same_origin_loader.load(pagecore::ResourceRequest{
+                "https://cdn.test/app.js",
+                pagecore::ResourceKind::Script,
+                "https://example.test/index.html",
+                "https://example.test/index.html",
+            });
+        },
+        "same-origin policy should reject cross-origin resources");
+
+    pagecore::ResourcePolicy tiny;
+    tiny.max_response_bytes = 3;
+    pagecore::MemoryResourceLoader tiny_loader(tiny);
+    tiny_loader.add("https://example.test/big.css", "1234", "text/css");
+    require_resource_error(
+        pagecore::ResourceErrorCode::TooLarge,
+        [&] {
+            (void) tiny_loader.load(pagecore::ResourceRequest{
+                "https://example.test/big.css",
+                pagecore::ResourceKind::Stylesheet,
+            });
+        },
+        "max response size should reject oversized resources");
+}
+
+void test_curl_resource_loader_revalidates_redirect_policy()
+{
+    SingleResponseHttpServer redirected(
+        "cross-origin",
+        {
+            {"Content-Type", "text/plain"},
+        });
+    SingleResponseHttpServer redirecting(
+        "",
+        {
+            {"Location", redirected.url("/final.txt")},
+        },
+        302,
+        "Found");
+
+    pagecore::ResourcePolicy same_origin;
+    same_origin.same_origin_only = true;
+    pagecore::CurlResourceLoader loader("pagecore-test", same_origin);
+    require_resource_error(
+        pagecore::ResourceErrorCode::SameOriginViolation,
+        [&] {
+            (void) loader.load(pagecore::ResourceRequest{
+                redirecting.url("/start.txt"),
+                pagecore::ResourceKind::Script,
+                redirecting.url("/page.html"),
+                redirecting.url("/page.html"),
+            });
+        },
+        "same-origin policy should reject cross-origin redirect effective URLs");
+}
+
+#if defined(PAGECORE_ENABLE_RENDERING)
+void test_cairo_raster_backend()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{160, 80, 1.0f};
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{2, 3, 5, 4},
+        pagecore::Color{10, 20, 30, 255},
+        false,
+    });
+    display_list.commands.emplace_back(pagecore::BorderCommand{
+        pagecore::Rect{10, 10, 6, 6},
+        pagecore::BorderSide{2, pagecore::Color{200, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{1, pagecore::Color{0, 200, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{2, pagecore::Color{0, 0, 200, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{1, pagecore::Color{100, 100, 0, 255}, pagecore::BorderStyle::Solid},
+        false,
+    });
+    display_list.commands.emplace_back(pagecore::TextCommand{
+        "Hello",
+        pagecore::Rect{24, 16, 120, 40},
+        pagecore::Color{0, 0, 0, 255},
+        pagecore::Font{"sans-serif", 28.0f, 400, false},
+    });
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list);
+
+    require(image.width == 160 && image.height == 80, "Cairo raster should use viewport dimensions");
+    require(image.rgba.size() == 160 * 80 * 4, "Cairo raster should emit RGBA pixels");
+    require(pixel_matches(image, 2, 3, pagecore::Color{10, 20, 30, 255}), "Cairo raster should draw solid fills");
+    require(pixel_matches(image, 13, 10, pagecore::Color{0, 200, 0, 255}), "Cairo raster should draw top border");
+    require(pixel_matches(image, 10, 12, pagecore::Color{200, 0, 0, 255}), "Cairo raster should draw left border");
+    require(image_has_non_solid_text_pixel(image), "Cairo/Pango raster should render anti-aliased text, not placeholder bars");
+}
+
+void test_cairo_raster_rounded_border_uses_inner_curve()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{56, 56, 1.0f};
+    display_list.commands.emplace_back(pagecore::BorderCommand{
+        pagecore::Rect{4, 4, 40, 40},
+        pagecore::BorderSide{6, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{6, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{6, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{6, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        false,
+        pagecore::BorderRadii{
+            pagecore::CornerRadii{16, 16},
+            pagecore::CornerRadii{16, 16},
+            pagecore::CornerRadii{16, 16},
+            pagecore::CornerRadii{16, 16},
+        },
+    });
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list);
+
+    require(pixel_matches(image, 4, 4, pagecore::Color{255, 255, 255, 255}),
+            "rounded border should not fill outside the outer curve");
+    require(pixel_is_dark(image, 10, 10), "rounded border should follow the inner curve, not square strips");
+    require(pixel_matches(image, 15, 15, pagecore::Color{255, 255, 255, 255}),
+            "rounded border should leave the inner corner open");
+}
+
+void test_cairo_raster_rounded_border_supports_uneven_widths()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{64, 56, 1.0f};
+    display_list.commands.emplace_back(pagecore::BorderCommand{
+        pagecore::Rect{4, 4, 48, 40},
+        pagecore::BorderSide{10, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{4, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{6, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        pagecore::BorderSide{12, pagecore::Color{0, 0, 0, 255}, pagecore::BorderStyle::Solid},
+        false,
+        pagecore::BorderRadii{
+            pagecore::CornerRadii{18, 18},
+            pagecore::CornerRadii{18, 18},
+            pagecore::CornerRadii{18, 18},
+            pagecore::CornerRadii{18, 18},
+        },
+    });
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list);
+
+    require(pixel_is_dark(image, 15, 9), "uneven rounded border should fill curved ring outside strip-only regions");
+    require(pixel_matches(image, 18, 12, pagecore::Color{255, 255, 255, 255}),
+            "uneven rounded border should preserve the inner rounded opening");
+    require(pixel_is_dark(image, 8, 24), "uneven rounded border should still draw the wide left side");
+    require(pixel_is_dark(image, 28, 39), "uneven rounded border should still draw the wide bottom side");
+}
+#endif
+
+void test_display_list_json_dump()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{80, 40, 2.0f};
+    display_list.content_width = 70;
+    display_list.content_height = 30;
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{1, 2, 3, 4},
+        pagecore::Color{5, 6, 7, 255},
+        false,
+        pagecore::BorderRadii{pagecore::CornerRadii{8, 8}, {}, {}, {}},
+    });
+    display_list.commands.emplace_back(pagecore::TextCommand{
+        "quoted \"text\"",
+        pagecore::Rect{10, 12, 30, 14},
+        pagecore::Color{20, 30, 40, 255},
+        pagecore::Font{"Arial", 16.0f, 700, true},
+    });
+
+    const auto dump = pagecore::display_list_to_json(display_list);
+    require(dump.find("\"viewport\":{\"width\":80,\"height\":40") != std::string::npos,
+            "display list dump should include viewport");
+    require(dump.find("\"contentWidth\":70") != std::string::npos, "display list dump should include content width");
+    require(dump.find("\"type\":\"solidFill\"") != std::string::npos, "display list dump should include solid fills");
+    require(dump.find("\"type\":\"text\"") != std::string::npos, "display list dump should include text commands");
+    require(dump.find("quoted \\\"text\\\"") != std::string::npos, "display list dump should escape strings");
+}
+
+void test_png_encoder_rgba()
+{
+    pagecore::RenderedImage image;
+    image.width = 2;
+    image.height = 1;
+    image.rgba = {
+        255, 0, 0, 255,
+        0, 255, 0, 128,
+    };
+
+    const auto png = pagecore::encode_png_rgba(image);
+    require(png.size() > 8, "PNG encoder should emit data");
+    require(
+        png[0] == 0x89 && png[1] == 'P' && png[2] == 'N' && png[3] == 'G'
+            && png[4] == '\r' && png[5] == '\n' && png[6] == 0x1a && png[7] == '\n',
+        "PNG encoder should emit PNG signature");
+
+    bool saw_ihdr = false;
+    bool saw_idat = false;
+    bool saw_iend = false;
+    std::size_t offset = 8;
+    while (offset < png.size()) {
+        const std::uint32_t length = read_be32(png, offset);
+        offset += 4;
+        require(offset + 4 <= png.size(), "PNG chunk should have a type");
+        const std::string type(reinterpret_cast<const char*>(&png[offset]), 4);
+        offset += 4;
+        require(offset + length + 4 <= png.size(), "PNG chunk should fit in file");
+
+        if (type == "IHDR") {
+            saw_ihdr = true;
+            require(length == 13, "IHDR should be 13 bytes");
+            require(read_be32(png, offset) == 2, "IHDR should store image width");
+            require(read_be32(png, offset + 4) == 1, "IHDR should store image height");
+            require(png[offset + 8] == 8, "IHDR should use 8-bit samples");
+            require(png[offset + 9] == 6, "IHDR should use RGBA color type");
+        } else if (type == "IDAT") {
+            saw_idat = true;
+            require(length > 0, "IDAT should contain zlib data");
+        } else if (type == "IEND") {
+            saw_iend = true;
+            require(length == 0, "IEND should be empty");
+        }
+
+        offset += length + 4;
+    }
+
+    require(saw_ihdr && saw_idat && saw_iend, "PNG encoder should emit required chunks");
+
+    pagecore::RenderedImage invalid;
+    invalid.width = 1;
+    invalid.height = 1;
+    bool rejected = false;
+    try {
+        (void) pagecore::encode_png_rgba(invalid);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    require(rejected, "PNG encoder should reject mismatched RGBA buffers");
+}
+
+#if defined(PAGECORE_ENABLE_RENDERING)
+void test_png_decoder_rgba()
+{
+    const auto body = png_body(pagecore::Color{31, 63, 127, 255}, 3, 2);
+    const auto decoded = pagecore::decode_image_rgba(body);
+
+    require(decoded != nullptr, "PNG decoder should return an image");
+    require(decoded->width == 3 && decoded->height == 2, "PNG decoder should preserve dimensions");
+    require(decoded->rgba.size() == 3 * 2 * 4, "PNG decoder should emit RGBA pixels");
+    require(decoded->rgba[0] == 31 && decoded->rgba[1] == 63 && decoded->rgba[2] == 127 && decoded->rgba[3] == 255,
+            "PNG decoder should preserve pixel color");
+}
+
+void test_jpeg_decoder_rgba()
+{
+    const auto body = jpeg_body(pagecore::Color{120, 80, 40, 255}, 4, 3);
+    const auto decoded = pagecore::decode_image_rgba(body);
+
+    require(decoded != nullptr, "JPEG decoder should return an image");
+    require(decoded->width == 4 && decoded->height == 3, "JPEG decoder should preserve dimensions");
+    require(decoded->rgba.size() == 4 * 3 * 4, "JPEG decoder should emit RGBA pixels");
+    require(color_close(decoded->rgba, pagecore::Color{120, 80, 40, 255}, 8),
+            "JPEG decoder should preserve approximate pixel color");
+}
+
+void test_webp_decoder_rgba()
+{
+    const auto body = webp_body(pagecore::Color{12, 200, 90, 255}, 4, 3);
+    const auto decoded = pagecore::decode_image_rgba(body);
+
+    require(decoded != nullptr, "WebP decoder should return an image");
+    require(decoded->width == 4 && decoded->height == 3, "WebP decoder should preserve dimensions");
+    require(decoded->rgba.size() == 4 * 3 * 4, "WebP decoder should emit RGBA pixels");
+    require(color_close(decoded->rgba, pagecore::Color{12, 200, 90, 255}, 0),
+            "WebP decoder should preserve lossless pixel color");
+}
+
+void test_jpeg_decoder_rejects_huge_dimensions()
+{
+    std::string body = jpeg_body(pagecore::Color{120, 80, 40, 255}, 4, 3);
+    bool patched = false;
+    for (std::size_t offset = 0; offset + 9 < body.size(); ++offset) {
+        const auto marker = static_cast<unsigned char>(body[offset + 1]);
+        if (static_cast<unsigned char>(body[offset]) == 0xff && (marker == 0xc0 || marker == 0xc1 || marker == 0xc2)) {
+            body[offset + 5] = static_cast<char>(0x20);
+            body[offset + 6] = static_cast<char>(0x00);
+            body[offset + 7] = static_cast<char>(0x20);
+            body[offset + 8] = static_cast<char>(0x00);
+            patched = true;
+            break;
+        }
+    }
+    require(patched, "test JPEG should contain a SOF marker");
+
+    require_runtime_error_contains(
+        [&] {
+            (void) pagecore::decode_jpeg_rgba(body);
+        },
+        "too large",
+        "JPEG decoder should reject huge decoded dimensions before allocation");
+}
+
+void test_webp_decoder_rejects_huge_dimensions()
+{
+    std::string body = webp_body(pagecore::Color{12, 200, 90, 255}, 4, 3);
+    bool patched = false;
+    for (std::size_t offset = 0; offset + 13 <= body.size(); ++offset) {
+        if (body[offset] == 'V' && body[offset + 1] == 'P' && body[offset + 2] == '8' && body[offset + 3] == 'L') {
+            require(static_cast<unsigned char>(body[offset + 8]) == 0x2f, "test WebP should contain a VP8L signature");
+            const std::uint32_t width_minus_one = 8191;
+            const std::uint32_t height_minus_one = 8191;
+            const std::uint32_t packed_dimensions = width_minus_one | (height_minus_one << 14);
+            body[offset + 9] = static_cast<char>(packed_dimensions & 0xff);
+            body[offset + 10] = static_cast<char>((packed_dimensions >> 8) & 0xff);
+            body[offset + 11] = static_cast<char>((packed_dimensions >> 16) & 0xff);
+            body[offset + 12] = static_cast<char>((packed_dimensions >> 24) & 0xff);
+            patched = true;
+            break;
+        }
+    }
+    require(patched, "test WebP should contain a VP8L chunk");
+
+    require_runtime_error_contains(
+        [&] {
+            (void) pagecore::decode_webp_rgba(body);
+        },
+        "too large",
+        "WebP decoder should reject huge decoded dimensions before allocation");
+}
+
+void test_gif_decoder_rgba()
+{
+    const auto decoded = pagecore::decode_image_rgba(gif_body());
+
+    require(decoded != nullptr, "GIF decoder should return an image");
+    require(decoded->width == 1 && decoded->height == 1, "GIF decoder should preserve first-frame canvas dimensions");
+    require(decoded->rgba.size() == 4, "GIF decoder should emit RGBA pixels");
+    require(color_close(decoded->rgba, pagecore::Color{255, 0, 0, 255}, 0),
+            "GIF decoder should preserve first-frame palette color");
+}
+
+void test_svg_decoder_rgba()
+{
+    const auto decoded = pagecore::decode_image_rgba(svg_body(pagecore::Color{240, 20, 30, 255}));
+
+    require(decoded != nullptr, "SVG decoder should return an image");
+    require(decoded->width == 4 && decoded->height == 3, "SVG decoder should use SVG intrinsic dimensions");
+    require(decoded->rgba.size() == 4 * 3 * 4, "SVG decoder should emit RGBA pixels");
+    require(color_close(decoded->rgba, pagecore::Color{240, 20, 30, 255}, 0),
+            "SVG decoder should rasterize filled primitives");
+
+    const auto path = pagecore::decode_image_rgba(
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 8 8">
+  <path d="M1 1 H7 V7 H1 Z" fill="#00aa00"/>
+</svg>)SVG");
+    require(path->width == 8 && path->height == 8, "SVG decoder should parse path dimensions");
+    require(path->rgba[4 * (static_cast<std::size_t>(4) * 8 + 4) + 1] > 120,
+            "SVG decoder should rasterize basic path data");
+}
+#endif
+
+void test_eval_api()
+{
+    pagecore::Page page;
+    page.load_html("<html><body><main id='m'>x</main></body></html>");
+    const auto result = page.eval("document.getElementById('m').textContent");
+    require(result == "x", "Page::eval should return stringified JS values");
+}
+
+void test_js_exception_message_includes_source_name()
+{
+    pagecore::Page page;
+    try {
+        page.load_html(R"HTML(
+<html><body>
+  <script>throw new Error('boom')</script>
+</body></html>
+)HTML", "https://example.test/page.html");
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        require(
+            message.find("JS exception (https://example.test/page.html#inline-script-0): Error: boom") != std::string::npos,
+            "JS exception message should include the script source before the exception text");
+        return;
+    }
+
+    require(false, "throwing script should fail page load");
+}
+
+#if defined(PAGECORE_ENABLE_RENDERING)
+void test_page_display_list_pipeline_with_external_css()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/style.css",
+        "#box { width: 120px; height: 30px; background-color: rgb(8, 9, 10); border: 3px solid #00ff00; }");
+    loader->add("https://example.test/pixel.png", "png", "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <link rel="stylesheet" href="/style.css">
+  <div id="box"></div>
+  <img src="/pixel.png">
+  <script>
+    document.getElementById('box').textContent = 'Rendered';
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    require(display_list.viewport.width == 320, "display list should preserve viewport");
+    require(display_list.content_width > 0, "litehtml should compute content width");
+    require(display_list.content_height > 0, "litehtml should compute content height");
+
+    bool has_text = false;
+    bool has_fill = false;
+    bool has_border = false;
+
+    for (const auto& command : display_list.commands) {
+        if (const auto* text = std::get_if<pagecore::TextCommand>(&command)) {
+            has_text = has_text || text->text.find("Rendered") != std::string::npos;
+        }
+        if (const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command)) {
+            has_fill = has_fill || (fill->color.r == 8 && fill->color.g == 9 && fill->color.b == 10);
+        }
+        if (const auto* border = std::get_if<pagecore::BorderCommand>(&command)) {
+            has_border = has_border || (border->top.width >= 3.0f && border->top.color.g == 255);
+        }
+    }
+
+    require(has_text, "display list should include text after JS DOM mutation");
+    require(has_fill, "display list should include solid fills from external CSS");
+    require(has_border, "display list should include borders from external CSS");
+    require(
+        has_request_kind(*loader, "https://example.test/style.css", pagecore::ResourceKind::Stylesheet),
+        "external CSS should be requested as Stylesheet");
+    require(
+        has_request_kind(*loader, "https://example.test/pixel.png", pagecore::ResourceKind::Image),
+        "images should be requested as Image");
+}
+
+void test_page_display_list_hides_head_text_nodes()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <head>
+    <style>body { margin: 0; }</style>
+  </head>
+  <body>
+    <script>
+      document.head.appendChild(document.createTextNode('head_text_should_not_render'));
+    </script>
+    <div>visible body</div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 120, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_head_text = false;
+    bool has_body_text = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* text = std::get_if<pagecore::TextCommand>(&command)) {
+            has_head_text = has_head_text || text->text.find("head_text_should_not_render") != std::string::npos;
+            has_body_text = has_body_text || text->text.find("visible") != std::string::npos;
+        }
+    }
+
+    require(!has_head_text, "display list should not include text nodes from head");
+    require(has_body_text, "display list should still include body text");
+}
+
+void test_page_display_list_resolves_litehtml_relative_base_urls()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/styles.css",
+        "#box { width: 32px; height: 32px; background-color: rgb(3, 4, 5); background-image: url('./pixel.png'); }",
+        "text/css");
+    loader->add(
+        "https://example.test/pixel.png",
+        png_body(pagecore::Color{240, 20, 30, 255}),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <link rel="stylesheet" href="styles.css">
+  <div id="box"></div>
+</body></html>
+)HTML", "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 90, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_fill = false;
+    bool has_background_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command)) {
+            has_fill = has_fill || (fill->color.r == 3 && fill->color.g == 4 && fill->color.b == 5);
+        }
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_background_image = has_background_image || image->url == "https://example.test/pixel.png";
+        }
+    }
+
+    require(has_fill, "relative root stylesheet should be loaded and applied");
+    require(has_background_image, "relative CSS background image should resolve against stylesheet URL");
+    require(
+        has_request_kind(*loader, "https://example.test/styles.css", pagecore::ResourceKind::Stylesheet),
+        "relative root stylesheet should be requested as absolute URL");
+    require(
+        has_request_kind(*loader, "https://example.test/pixel.png", pagecore::ResourceKind::Image),
+        "relative CSS image should be requested as absolute URL");
+}
+
+void test_page_display_list_resolves_relative_base_element_against_document_url()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/assets/styles.css",
+        "#box { width: 32px; height: 32px; background-image: url('./pixel.png'); }",
+        "text/css");
+    loader->add(
+        "https://example.test/assets/pixel.png",
+        png_body(pagecore::Color{240, 20, 30, 255}),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head>
+  <base href="/assets/">
+  <link rel="stylesheet" href="styles.css">
+</head><body>
+  <div id="box"></div>
+</body></html>
+)HTML", "https://example.test/docs/page.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 90, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_background_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_background_image = has_background_image || image->url == "https://example.test/assets/pixel.png";
+        }
+    }
+
+    require(has_background_image, "relative base element should resolve CSS image URLs against document origin");
+    require(
+        has_request_kind(*loader, "https://example.test/assets/styles.css", pagecore::ResourceKind::Stylesheet),
+        "relative base element should resolve stylesheet URL against document origin");
+    require(
+        has_request_kind(*loader, "https://example.test/assets/pixel.png", pagecore::ResourceKind::Image),
+        "relative base element should resolve image URL against document origin");
+}
+
+void test_page_display_list_resolves_protocol_relative_and_host_like_css_urls()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://portal.test/styles/main.css",
+        R"CSS(
+#protocol { width: 20px; height: 20px; background-image: url("//cdn.example.test/protocol.png"); }
+#hostlike { width: 20px; height: 20px; background-image: url("cdn.example.test/host.png"); }
+)CSS",
+        "text/css");
+    loader->add(
+        "https://cdn.example.test/protocol.png",
+        png_body(pagecore::Color{240, 20, 30, 255}),
+        "image/png");
+    loader->add(
+        "https://cdn.example.test/host.png",
+        png_body(pagecore::Color{20, 200, 90, 255}),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head>
+  <link rel="stylesheet" href="/styles/main.css">
+</head><body>
+  <div id="protocol"></div>
+  <div id="hostlike"></div>
+</body></html>
+)HTML", "https://portal.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 90, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_protocol_relative_image = false;
+    bool has_host_like_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_protocol_relative_image = has_protocol_relative_image
+                || (image->url == "https://cdn.example.test/protocol.png" && image->image);
+            has_host_like_image = has_host_like_image
+                || (image->url == "https://cdn.example.test/host.png" && image->image);
+        }
+    }
+
+    require(has_protocol_relative_image, "protocol-relative CSS image URL should resolve and decode");
+    require(has_host_like_image, "host-like CSS image URL should resolve and decode without duplicating the stylesheet host");
+    require(
+        has_request_kind(*loader, "https://cdn.example.test/protocol.png", pagecore::ResourceKind::Image),
+        "protocol-relative CSS image should be requested as an absolute Image resource");
+    require(
+        has_request_kind(*loader, "https://cdn.example.test/host.png", pagecore::ResourceKind::Image),
+        "host-like CSS image should be requested as an absolute Image resource");
+}
+
+void test_page_render_uses_cairo_raster_backend()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/style.css",
+        "#box { width: 40px; height: 30px; background-color: rgb(12, 34, 56); }",
+        "text/css");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <link rel="stylesheet" href="/style.css">
+  <div id="box">Hello</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{100, 80, 1.0f};
+    const auto image = page.render(options);
+
+    require(image.width == 100 && image.height == 80, "Page::render should return viewport-sized image");
+    require(image_has_pixel(image, pagecore::Color{12, 34, 56, 255}), "Page::render should rasterize display-list fills");
+    require(image_has_non_solid_text_pixel(image), "Page::render should rasterize real anti-aliased text");
+}
+
+void test_page_render_decodes_and_draws_png_images()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/pixel.png",
+        png_body(pagecore::Color{240, 20, 30, 255}),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <img src="/pixel.png" style="width: 24px; height: 24px">
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_decoded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_decoded_image = has_decoded_image || (image->image && image->image->width == 2 && image->image->height == 2);
+        }
+    }
+    require(has_decoded_image, "display list should carry decoded image pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_pixel(rendered, pagecore::Color{240, 20, 30, 255}), "Page::render should draw decoded PNG pixels");
+}
+
+void test_page_render_decodes_and_draws_jpeg_images()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/pixel.jpg",
+        jpeg_body(pagecore::Color{120, 80, 40, 255}, 4, 4),
+        "image/jpeg");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <img src="/pixel.jpg" style="width: 24px; height: 24px">
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_decoded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_decoded_image = has_decoded_image || (image->image && image->image->width == 4 && image->image->height == 4);
+        }
+    }
+    require(has_decoded_image, "display list should carry decoded JPEG pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_close_pixel(rendered, pagecore::Color{120, 80, 40, 255}, 8),
+            "Page::render should draw decoded JPEG pixels");
+}
+
+void test_page_render_decodes_and_draws_webp_images()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/pixel.webp",
+        webp_body(pagecore::Color{12, 200, 90, 255}, 4, 4),
+        "image/webp");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <img src="/pixel.webp" style="width: 24px; height: 24px">
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_decoded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_decoded_image = has_decoded_image || (image->image && image->image->width == 4 && image->image->height == 4);
+        }
+    }
+    require(has_decoded_image, "display list should carry decoded WebP pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_pixel(rendered, pagecore::Color{12, 200, 90, 255}), "Page::render should draw decoded WebP pixels");
+}
+
+void test_page_render_decodes_and_draws_gif_images()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/pixel.gif",
+        gif_body(),
+        "image/gif");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <img src="/pixel.gif" style="width: 24px; height: 24px">
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_decoded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_decoded_image = has_decoded_image || (image->image && image->image->width == 1 && image->image->height == 1);
+        }
+    }
+    require(has_decoded_image, "display list should carry decoded GIF pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_close_pixel(rendered, pagecore::Color{255, 0, 0, 255}, 16),
+            "Page::render should draw decoded GIF pixels");
+}
+
+void test_page_render_decodes_and_draws_svg_images()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/pixel.svg",
+        svg_body(pagecore::Color{240, 20, 30, 255}),
+        "image/svg+xml");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <img src="/pixel.svg" style="width: 24px; height: 24px">
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_decoded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_decoded_image = has_decoded_image || (image->image && image->image->width == 4 && image->image->height == 3);
+        }
+    }
+    require(has_decoded_image, "display list should carry decoded SVG pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_pixel(rendered, pagecore::Color{240, 20, 30, 255}), "Page::render should draw decoded SVG pixels");
+}
+
+void test_page_render_background_image_size_position_and_repeat()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/red.png",
+        png_body(pagecore::Color{240, 20, 30, 255}),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html>
+  <body style="margin:0">
+    <div id="box" style="
+      width: 40px;
+      height: 24px;
+      background-image: url('/red.png');
+      background-size: 10px 10px;
+      background-position: 20px 5px;
+      background-repeat: repeat-x;
+    "></div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{60, 40, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_background_tile = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_background_tile = has_background_tile
+                || (image->image
+                    && image->repeat == pagecore::ImageRepeat::RepeatX
+                    && static_cast<int>(image->tile.width) == 10
+                    && static_cast<int>(image->tile.height) == 10
+                    && static_cast<int>(image->tile.x) == 20
+                    && static_cast<int>(image->tile.y) == 5);
+        }
+    }
+    require(has_background_tile, "display list should carry background-size, position and repeat metadata");
+
+    const auto rendered = page.render(options);
+    require(pixel_matches(rendered, 22, 7, pagecore::Color{240, 20, 30, 255}),
+            "background image should draw at positioned tile");
+    require(pixel_matches(rendered, 12, 7, pagecore::Color{240, 20, 30, 255}),
+            "background-repeat-x should draw tiles before the positioned tile");
+    require(pixel_matches(rendered, 32, 7, pagecore::Color{240, 20, 30, 255}),
+            "background-repeat-x should draw tiles after the positioned tile");
+    require(!pixel_matches(rendered, 22, 17, pagecore::Color{240, 20, 30, 255}),
+            "background-repeat-x should not repeat along the y axis");
+}
+
+void test_page_render_linear_gradient_background()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <body style="margin:0">
+    <div id="box" style="
+      width: 100px;
+      height: 24px;
+      background-image: linear-gradient(to right, rgb(240, 20, 30), rgb(20, 30, 240));
+    "></div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 40, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_gradient = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* gradient = std::get_if<pagecore::LinearGradientCommand>(&command)) {
+            has_gradient = has_gradient || (gradient->stops.size() >= 2 && static_cast<int>(gradient->rect.width) == 100);
+        }
+    }
+    require(has_gradient, "display list should carry linear gradient backgrounds");
+
+    const auto rendered = page.render(options);
+    require(pixel_close(rendered, 4, 12, pagecore::Color{240, 20, 30, 255}, 30),
+            "linear gradient should draw the first color near the start");
+    require(pixel_close(rendered, 96, 12, pagecore::Color{20, 30, 240, 255}, 30),
+            "linear gradient should draw the last color near the end");
+}
+
+void test_page_render_clips_background_to_border_radius()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <body style="margin:0">
+    <div id="box" style="
+      width: 40px;
+      height: 40px;
+      border-radius: 16px;
+      background: rgb(240, 20, 30);
+    "></div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{60, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_rounded_fill = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command)) {
+            has_rounded_fill = has_rounded_fill || static_cast<int>(fill->radii.top_left.x) == 16;
+        }
+    }
+    require(has_rounded_fill, "display list should carry border-radius for solid backgrounds");
+
+    const auto rendered = page.render(options);
+    require(pixel_matches(rendered, 20, 20, pagecore::Color{240, 20, 30, 255}),
+            "rounded background should fill the center");
+    require(pixel_matches(rendered, 1, 1, pagecore::Color{255, 255, 255, 255}),
+            "rounded background should not fill the clipped corner");
+}
+
+void test_page_render_clips_background_image_to_border_radius()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/red.png",
+        png_body(pagecore::Color{240, 20, 30, 255}, 4, 4),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html>
+  <body style="margin:0">
+    <div id="box" style="
+      width: 40px;
+      height: 40px;
+      border-radius: 16px;
+      background-image: url('/red.png');
+      background-size: 40px 40px;
+      background-repeat: no-repeat;
+    "></div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{60, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_rounded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_rounded_image = has_rounded_image || static_cast<int>(image->radii.top_left.x) == 16;
+        }
+    }
+    require(has_rounded_image, "display list should carry border-radius for image backgrounds");
+
+    const auto rendered = page.render(options);
+    require(pixel_matches(rendered, 20, 20, pagecore::Color{240, 20, 30, 255}),
+            "rounded background image should fill the center");
+    require(pixel_matches(rendered, 1, 1, pagecore::Color{255, 255, 255, 255}),
+            "rounded background image should not fill the clipped corner");
+}
+
+void test_page_render_hides_noscript_when_javascript_is_enabled()
+{
+    constexpr std::string_view html = R"HTML(
+<html>
+  <head>
+    <style>body { margin: 0; }</style>
+  </head>
+  <body>
+    <noscript><div style="width: 40px; height: 20px; background: rgb(240, 20, 30);"></div></noscript>
+    <div style="width: 40px; height: 20px; background: rgb(20, 240, 30);"></div>
+  </body>
+</html>
+)HTML";
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{60, 40, 1.0f};
+
+    pagecore::Page scripting_enabled_page;
+    scripting_enabled_page.load_html(html, "https://example.test/index.html");
+    const auto scripting_enabled = scripting_enabled_page.render(options);
+    require(pixel_matches(scripting_enabled, 5, 5, pagecore::Color{20, 240, 30, 255}),
+            "noscript fallback should not participate in layout when JavaScript is enabled");
+
+    pagecore::LoadOptions load_options;
+    load_options.enable_js = false;
+    pagecore::Page scripting_disabled_page(load_options);
+    scripting_disabled_page.load_html(html, "https://example.test/index.html");
+    const auto scripting_disabled = scripting_disabled_page.render(options);
+    require(pixel_matches(scripting_disabled, 5, 5, pagecore::Color{240, 20, 30, 255}),
+            "noscript fallback should remain visible when JavaScript is disabled");
+}
+
+void test_visual_fixture_regression()
+{
+    const std::filesystem::path source_dir(PAGECORE_SOURCE_DIR);
+    const std::filesystem::path fixture = source_dir / "examples" / "visual-regression" / "index.html";
+    const std::filesystem::path output = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_visual_fixture_test.png";
+
+    pagecore::Page page;
+    page.load_url("file://" + fixture.string());
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{1280, 1000, 1.0f};
+    const auto image = page.render(options);
+    pagecore::write_png_rgba(image, output.string());
+
+    require(image.width == 1280 && image.height == 1000, "visual fixture should render the requested viewport");
+    require(
+        region_has_close_pixel(image, 460, 112, 220, 48, pagecore::Color{35, 111, 82, 255}, 6),
+        "visual fixture should show JS-mutated green status chips");
+    require(
+        region_has_close_pixel(image, 12, 328, 356, 58, pagecore::Color{229, 241, 255, 255}, 4),
+        "visual fixture should show imported theme.css styles");
+
+    require(region_has_saturated_pixel(image, 56, 596, 112, 76), "visual fixture should draw PNG img content");
+    require(region_has_saturated_pixel(image, 220, 596, 118, 76), "visual fixture should draw JPEG img content");
+    require(region_has_saturated_pixel(image, 56, 728, 112, 76), "visual fixture should draw WebP img content");
+
+    require(region_has_saturated_pixel(image, 408, 580, 352, 58), "visual fixture should draw JPEG background image");
+    require(region_has_saturated_pixel(image, 408, 646, 352, 58), "visual fixture should draw PNG repeated background image");
+    require(region_has_saturated_pixel(image, 408, 712, 352, 58), "visual fixture should draw WebP repeated background image");
+
+    require(
+        region_has_close_pixel(image, 12, 930, 760, 54, pagecore::Color{23, 32, 42, 255}, 4),
+        "visual fixture footer should be visible and not clipped out of the viewport");
+}
+#endif
+
+} // namespace
+
+int main()
+{
+    try {
+        test_inline_script_mutates_lexbor_dom();
+        test_timers_and_events();
+        test_inner_html_fragment_parsing();
+        test_tree_operations_and_clone();
+        test_dataset_attributes_and_cached_facades();
+        test_inner_html_invalidates_stale_wrappers();
+        test_timer_wait_budget();
+        test_browser_like_web_api_shims();
+        test_event_constructor_ignores_prototype_accessors();
+        test_document_lifecycle_ignores_ready_state_overrides();
+        test_get_computed_style_reads_display_from_stylesheets();
+        test_cssom_stylesheets_rules_declarations_and_cascade();
+        test_cssom_dynamic_sheets_media_disabled_and_adopted();
+        test_dom_fragment_range_serializer_and_mutation_observer();
+        test_text_content_mutation_observer_records_nodes();
+        test_document_write_fragment_insertion();
+        test_document_write_external_script_and_open_close();
+        test_document_write_escaped_script_text_remains_text();
+        test_comment_nodes_wrap_for_sibling_traversal();
+        test_create_comment_nodes_are_not_visible_text();
+        test_event_options_bubbling_and_wpt_driver_shim();
+        test_custom_elements_registry_shim();
+        test_shadow_root_and_element_internals_shims();
+        test_custom_elements_with_private_fields_construct_instances();
+        test_external_script_via_resource_loader();
+        test_current_script_and_reflected_url_attributes();
+        test_module_script_imports_relative_dependencies();
+        test_inline_module_uses_document_url_for_relative_imports();
+        test_html_element_specific_constructors();
+        test_create_element_ns_and_template_content_clone();
+        test_global_event_listener_aliases_bind_to_window();
+        test_document_domain_and_cookie_jar();
+        test_document_location_aliases_window_location();
+        test_dom_implementation_create_html_document();
+        test_message_channel_and_crypto_shims();
+        test_text_encoder_decoder_utf8_shims();
+        test_escaped_colon_class_selector_fallback();
+        test_target_pseudo_class_selector_fallback();
+        test_request_response_fetch_object_shims();
+        test_xhr_and_fetch_load_through_resource_loader();
+        test_xhr_event_handler_exceptions_are_reported();
+        test_non_javascript_script_types_are_not_executed();
+        test_resource_request_kind_and_cache();
+        test_resource_url_resolution_normalizes_dot_segments();
+        test_curl_resource_loader_decodes_gzip_content_encoding();
+        test_resource_policy_errors();
+        test_curl_resource_loader_revalidates_redirect_policy();
+#if defined(PAGECORE_ENABLE_RENDERING)
+        test_cairo_raster_backend();
+        test_cairo_raster_rounded_border_uses_inner_curve();
+        test_cairo_raster_rounded_border_supports_uneven_widths();
+#endif
+        test_display_list_json_dump();
+        test_png_encoder_rgba();
+#if defined(PAGECORE_ENABLE_RENDERING)
+        test_png_decoder_rgba();
+        test_jpeg_decoder_rgba();
+        test_webp_decoder_rgba();
+        test_jpeg_decoder_rejects_huge_dimensions();
+        test_webp_decoder_rejects_huge_dimensions();
+        test_gif_decoder_rgba();
+        test_svg_decoder_rgba();
+#endif
+        test_eval_api();
+        test_js_exception_message_includes_source_name();
+#if defined(PAGECORE_ENABLE_RENDERING)
+        test_page_display_list_pipeline_with_external_css();
+        test_page_display_list_hides_head_text_nodes();
+        test_page_display_list_resolves_litehtml_relative_base_urls();
+        test_page_display_list_resolves_relative_base_element_against_document_url();
+        test_page_display_list_resolves_protocol_relative_and_host_like_css_urls();
+        test_page_render_uses_cairo_raster_backend();
+        test_page_render_decodes_and_draws_png_images();
+        test_page_render_decodes_and_draws_jpeg_images();
+        test_page_render_decodes_and_draws_webp_images();
+        test_page_render_decodes_and_draws_gif_images();
+        test_page_render_decodes_and_draws_svg_images();
+        test_page_render_background_image_size_position_and_repeat();
+        test_page_render_linear_gradient_background();
+        test_page_render_clips_background_to_border_radius();
+        test_page_render_clips_background_image_to_border_radius();
+        test_page_render_hides_noscript_when_javascript_is_enabled();
+        test_visual_fixture_regression();
+#endif
+    } catch (const std::exception& error) {
+        std::cerr << "test failed: " << error.what() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "pagecore tests passed\n";
+    return EXIT_SUCCESS;
+}

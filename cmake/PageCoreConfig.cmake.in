@@ -1,0 +1,33 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(CURL)
+
+set(PAGECORE_ENABLE_RENDERING @PAGECORE_ENABLE_RENDERING@)
+
+function(_pagecore_import_static_dependency target file_name)
+    if(TARGET "${target}")
+        return()
+    endif()
+
+    add_library("${target}" STATIC IMPORTED)
+    set_target_properties("${target}" PROPERTIES
+        IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/@PAGECORE_INSTALL_DEPSDIR@/${file_name}"
+    )
+endfunction()
+
+_pagecore_import_static_dependency(PageCore::lexbor_static "@PAGECORE_LEXBOR_STATIC_FILE@")
+_pagecore_import_static_dependency(PageCore::qjs "@PAGECORE_QJS_STATIC_FILE@")
+
+if(PAGECORE_ENABLE_RENDERING)
+    _pagecore_import_static_dependency(PageCore::litehtml "@PAGECORE_LITEHTML_STATIC_FILE@")
+    _pagecore_import_static_dependency(PageCore::gumbo "@PAGECORE_GUMBO_STATIC_FILE@")
+    set_property(TARGET PageCore::litehtml APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES PageCore::gumbo
+    )
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/PageCoreTargets.cmake")
+
+set(PageCore_FOUND TRUE)
+check_required_components(PageCore)

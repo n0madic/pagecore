@@ -1,0 +1,20 @@
+body {
+  background-color: #f4f0e8;
+  color: #17202a;
+}
+
+.from-import {
+  background-color: #e5f1ff;
+  border: 2px solid #3b7bbb;
+  color: #14365d;
+}
+
+mark {
+  background-color: #f8e08e;
+  color: #17130c;
+}
+
+.import-chip {
+  background-color: #14365d;
+  color: #ffffff;
+}

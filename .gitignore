@@ -1,0 +1,9 @@
+.DS_Store
+/build*/
+cmake-build-*/
+out/
+out*.png
+*.user
+*.swp
+*.swo
+

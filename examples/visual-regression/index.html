@@ -1,0 +1,137 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>pagecore visual fixture</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .inline-style-check {
+      background-color: #efe4ff;
+      border: 2px solid #7952b3;
+      border-radius: 8px;
+      padding: 6px;
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <h1>pagecore visual fixture</h1>
+      <p>
+        One viewport with text shaping, solid fills, borders, rounded clipping,
+        JS DOM mutations, external CSS, imported CSS, and PNG/JPEG/WebP images.
+      </p>
+      <span class="chip">Lexbor DOM</span>
+      <span class="chip">QuickJS-NG</span>
+      <span class="chip">litehtml layout</span>
+      <span class="chip">Cairo/Pango raster</span>
+      <span id="js-status" class="chip">JS pending</span>
+      <span id="timer-status" class="chip">timer pending</span>
+    </header>
+
+    <section class="row">
+      <article class="panel text-demo">
+        <h2>Text and inline nodes</h2>
+        <p>
+          Normal text, <strong>bold</strong>, <em>italic</em>,
+          <mark>marked text</mark>, <code>code</code>, and an
+          <a href="#images">anchor</a> share one rendered line.
+        </p>
+        <p class="inline-style-check">
+          Inline style block with border-radius and padding.
+        </p>
+        <p class="from-import">
+          This panel style comes from imported theme.css.
+          <span class="chip import-chip">imported CSS</span>
+        </p>
+      </article>
+
+      <article class="panel">
+        <h2>Lists, markers, table</h2>
+        <ul>
+          <li>unordered marker</li>
+          <li>DOM selectors</li>
+          <li>external stylesheet</li>
+        </ul>
+        <ol>
+          <li>ordered marker</li>
+          <li>text transform</li>
+        </ol>
+        <table>
+          <thead>
+            <tr><th>Primitive</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>TextCommand</td><td>visible</td></tr>
+            <tr><td>SolidFillCommand</td><td>visible</td></tr>
+            <tr><td>BorderCommand</td><td>visible</td></tr>
+            <tr><td>ImageCommand</td><td>visible</td></tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="panel last">
+        <h2>Fills, borders, clipping</h2>
+        <div class="swatches">
+          <div class="swatch solid">solid fill</div>
+          <div class="swatch rounded">radius</div>
+          <div class="swatch clipped"><span class="clip-inner">clip</span></div>
+        </div>
+        <div id="dom-zone" class="dom-zone">
+          <strong>DOM zone:</strong>
+        </div>
+        <p id="event-target" class="chip">event pending</p>
+      </article>
+    </section>
+
+    <section id="images" class="row">
+      <article class="panel">
+        <h2>Image elements</h2>
+        <figure class="image-card">
+          <img src="assets/sample-transparent.png" alt="PNG sample">
+          <figcaption><span>PNG RGBA</span></figcaption>
+        </figure>
+        <figure class="image-card">
+          <img src="assets/sample-photo.jpg" alt="JPEG sample">
+          <figcaption><span>JPEG</span></figcaption>
+        </figure>
+        <figure class="image-card">
+          <img src="assets/sample-photo.webp" alt="WebP sample">
+          <figcaption><span>WebP</span></figcaption>
+        </figure>
+        <p>
+          The same resource path pipeline feeds img sizing and decoded RGBA.
+        </p>
+      </article>
+
+      <article class="panel">
+        <h2>Background images</h2>
+        <div class="bg-sample bg-jpeg"></div>
+        <div class="bg-sample bg-png-repeat"></div>
+        <div class="bg-sample bg-webp"></div>
+        <div class="bg-sample bg-gradient"></div>
+        <p>
+          Background-size, position, repeat modes, radius and linear gradients.
+        </p>
+      </article>
+
+      <aside class="panel last">
+        <h2>Resource coverage</h2>
+        <p>Document: local file URL.</p>
+        <p>Stylesheet: style.css plus @import theme.css.</p>
+        <p>Script: fixture.js mutates the serialized DOM before layout.</p>
+        <p>Images: local PNG, JPEG and WebP assets.</p>
+        <p class="from-import">Imported rule still visible in the final pass.</p>
+      </aside>
+    </section>
+
+    <footer class="footer-strip">
+      <p>
+        Footer uses a repeated transparent PNG background over a dark fill,
+        exercising alpha decode, tiling, clipping and foreground text together.
+      </p>
+    </footer>
+  </main>
+  <script src="fixture.js"></script>
+</body>
+</html>
