@@ -44,4 +44,6 @@ For JS-heavy DOM/geometry performance work, measure the current behavior before 
 
 When changing public embedding APIs, keep the README and public headers aligned. Perf tracing lives in `include/pagecore/perf.hpp`; `LoadOptions::perf_trace` is the load-time/fallback sink, `RenderOptions::perf_trace` can override it for a specific render/display-list/layout-related read, and PNG encoding has explicit traced overloads.
 
+When changing the page-visible browser API surface in `src/dom_shim/` (adding, removing, or materially changing globals, constructors, or feature-detection behavior), update `docs/browser-api-support.md` in the same change. Keep each affected API classified as `supported`, `partial`, or `absent`, and do not expose no-op/always-failing stubs when an absent API would let scraping targets take a safer fallback path.
+
 Keep measured negative perf experiments documented instead of reintroducing them. In particular, the one-pass DOM traversal replacement for render sub-resource discovery was measured and reverted after a small end-to-end regression; keep the selector-based discovery unless a new patch shows both an isolated discovery-stage win and a full render-pipeline win.
