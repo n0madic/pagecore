@@ -5159,6 +5159,65 @@ public:
     std::shared_ptr<int> layout_calls;
 };
 
+class SlowComputedStyleEngine final : public pagecore::LayoutEngine {
+public:
+    explicit SlowComputedStyleEngine(std::shared_ptr<int> compute_calls)
+        : compute_calls_(std::move(compute_calls))
+    {
+    }
+
+    void set_resource_loader(std::shared_ptr<pagecore::ResourceLoader>) override { }
+    void set_viewport(pagecore::Viewport viewport) override
+    {
+        viewport_ = viewport;
+        display_list_.viewport = viewport_;
+    }
+    void load_html(std::string_view, std::string_view) override
+    {
+        display_list_.clear();
+        display_list_.viewport = viewport_;
+    }
+    void layout() override { }
+    const pagecore::DisplayList& display_list() const override { return display_list_; }
+    void compute_styles_only() override
+    {
+        ++(*compute_calls_);
+        std::this_thread::sleep_for(std::chrono::milliseconds(65));
+    }
+    std::optional<std::string> computed_style_property(
+        std::string_view,
+        std::string_view property) override
+    {
+        if (property == "width") {
+            return std::to_string(*compute_calls_ * 10) + "px";
+        }
+        if (property == "display") {
+            return "block";
+        }
+        return std::nullopt;
+    }
+
+private:
+    std::shared_ptr<int> compute_calls_;
+    pagecore::Viewport viewport_;
+    pagecore::DisplayList display_list_;
+};
+
+class SlowComputedStyleFactory final : public pagecore::LayoutEngineFactory {
+public:
+    SlowComputedStyleFactory()
+        : compute_calls(std::make_shared<int>(0))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        return std::make_unique<SlowComputedStyleEngine>(compute_calls);
+    }
+
+    std::shared_ptr<int> compute_calls;
+};
+
 void test_element_geometry_reuses_cached_layout()
 {
     auto counting = std::make_shared<LayoutCallCountingFactory>(pagecore::create_litehtml_layout_engine_factory());
@@ -5244,6 +5303,46 @@ void test_element_geometry_bounded_mode_drops_disconnected_stale_geometry()
     auto removed = page.element_geometry(box);
     require(!removed, "bounded mode must not return stale geometry for a disconnected node");
     require(*factory->layout_calls == 2, "disconnected geometry read must not force another layout");
+}
+
+void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto factory = std::make_shared<SlowComputedStyleFactory>();
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected to find #x");
+
+    auto first = page.computed_style_property(box, "width");
+    require(first && *first == "10px", "first computed style property read should be exact");
+    require(*factory->compute_calls == 1, "first computed style property read should compute styles");
+
+    page.document().set_attribute(box, "style", "width:20px");
+    auto second = page.computed_style_property(box, "width");
+    require(second && *second == "20px", "inline width should be read after the second exact rebuild");
+    require(*factory->compute_calls == 2, "second post-mutation read should still be exact");
+
+    page.document().set_attribute(box, "style", "width:30px");
+    auto third = page.computed_style_property(box, "width");
+    require(third && *third == "30px", "bounded mode should return inline style values");
+    require(*factory->compute_calls == 2, "bounded mode must not force another computed style rebuild");
+
+    const bool saw_bounded_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ComputedStyle
+            && event.name == "computed_style_property"
+            && event.property == "width"
+            && event.styled_document_cache_reason == "bounded_mode:layout_mutation_version_changed";
+    });
+    require(saw_bounded_event, "perf trace should identify bounded computed-style property reads");
 }
 #endif
 
@@ -5402,6 +5501,7 @@ int main()
         test_element_geometry_reuses_cached_layout();
         test_element_geometry_bounded_mode_returns_cached_geometry();
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();
+        test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";

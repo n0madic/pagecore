@@ -117,6 +117,229 @@ struct GeometryCacheEntry {
     std::optional<ElementGeometry> geometry;
 };
 
+std::string ascii_lower(std::string_view value)
+{
+    std::string out(value);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return out;
+}
+
+std::string_view trim_ascii(std::string_view value)
+{
+    const auto first = value.find_first_not_of(" \t\n\r\f");
+    if (first == std::string_view::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\n\r\f");
+    return value.substr(first, last - first + 1);
+}
+
+bool ends_with_important(std::string_view value)
+{
+    value = trim_ascii(value);
+    if (value.size() < 10) {
+        return false;
+    }
+    return ascii_lower(value.substr(value.size() - 10)) == "!important";
+}
+
+std::optional<std::string> inline_style_property_value(std::string_view style, std::string_view property)
+{
+    const std::string wanted = ascii_lower(trim_ascii(property));
+    if (wanted.empty()) {
+        return std::nullopt;
+    }
+
+    std::size_t segment_start = 0;
+    int paren_depth = 0;
+    char quote = '\0';
+
+    auto parse_segment = [&](std::string_view segment) -> std::optional<std::string> {
+        segment = trim_ascii(segment);
+        if (segment.empty()) {
+            return std::nullopt;
+        }
+
+        std::size_t colon = std::string_view::npos;
+        int local_paren_depth = 0;
+        char local_quote = '\0';
+        for (std::size_t i = 0; i < segment.size(); ++i) {
+            const char ch = segment[i];
+            if (local_quote != '\0') {
+                if (ch == '\\' && i + 1 < segment.size()) {
+                    ++i;
+                    continue;
+                }
+                if (ch == local_quote) {
+                    local_quote = '\0';
+                }
+                continue;
+            }
+            if (ch == '"' || ch == '\'') {
+                local_quote = ch;
+                continue;
+            }
+            if (ch == '(') {
+                ++local_paren_depth;
+                continue;
+            }
+            if (ch == ')' && local_paren_depth > 0) {
+                --local_paren_depth;
+                continue;
+            }
+            if (ch == ':' && local_paren_depth == 0) {
+                colon = i;
+                break;
+            }
+        }
+        if (colon == std::string_view::npos) {
+            return std::nullopt;
+        }
+
+        if (ascii_lower(trim_ascii(segment.substr(0, colon))) != wanted) {
+            return std::nullopt;
+        }
+
+        std::string value(trim_ascii(segment.substr(colon + 1)));
+        if (ends_with_important(value)) {
+            value.erase(value.size() - 10);
+            value = std::string(trim_ascii(value));
+        }
+        return value;
+    };
+
+    for (std::size_t i = 0; i <= style.size(); ++i) {
+        const bool at_end = i == style.size();
+        const char ch = at_end ? ';' : style[i];
+        if (quote != '\0') {
+            if (ch == '\\' && i + 1 < style.size()) {
+                ++i;
+                continue;
+            }
+            if (ch == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+            continue;
+        }
+        if (ch == '(') {
+            ++paren_depth;
+            continue;
+        }
+        if (ch == ')' && paren_depth > 0) {
+            --paren_depth;
+            continue;
+        }
+        if ((at_end || ch == ';') && paren_depth == 0) {
+            if (auto value = parse_segment(style.substr(segment_start, i - segment_start))) {
+                return value;
+            }
+            segment_start = i + 1;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::string default_display_for_tag(std::string_view tag)
+{
+    const std::string normalized = ascii_lower(tag);
+    if (normalized == "li") return "list-item";
+    if (normalized == "table") return "table";
+    if (normalized == "thead") return "table-header-group";
+    if (normalized == "tbody") return "table-row-group";
+    if (normalized == "tfoot") return "table-footer-group";
+    if (normalized == "tr") return "table-row";
+    if (normalized == "td" || normalized == "th") return "table-cell";
+    if (normalized == "input"
+        || normalized == "button"
+        || normalized == "select"
+        || normalized == "textarea") {
+        return "inline-block";
+    }
+    if (normalized == "script"
+        || normalized == "style"
+        || normalized == "template"
+        || normalized == "head"
+        || normalized == "meta"
+        || normalized == "link"
+        || normalized == "title") {
+        return "none";
+    }
+
+    static const std::unordered_set<std::string_view> block_tags = {
+        "address", "article", "aside", "blockquote", "body", "canvas", "dd", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "hr", "html", "legend", "main", "nav", "ol", "p", "pre", "section", "ul",
+    };
+    return block_tags.count(normalized) == 0 ? "inline" : "block";
+}
+
+std::optional<std::string> default_computed_style_property_value(
+    std::string_view property,
+    std::string_view tag)
+{
+    const std::string normalized = ascii_lower(property);
+    if (normalized == "display") return default_display_for_tag(tag);
+    if (normalized == "position") return "static";
+    if (normalized == "float") return "none";
+    if (normalized == "clear") return "none";
+    if (normalized == "visibility") return "visible";
+    if (normalized == "overflow") return "visible";
+    if (normalized == "box-sizing") return "content-box";
+    if (normalized == "z-index") return "auto";
+    if (normalized == "opacity") return "1";
+    if (normalized == "transform") return "none";
+    if (normalized == "direction") return "ltr";
+    if (normalized == "content") return "normal";
+
+    if (normalized == "width"
+        || normalized == "height"
+        || normalized == "left"
+        || normalized == "right"
+        || normalized == "top"
+        || normalized == "bottom") {
+        return "auto";
+    }
+    if (normalized == "min-width" || normalized == "min-height") return "auto";
+    if (normalized == "max-width" || normalized == "max-height") return "none";
+    if (normalized == "margin-left"
+        || normalized == "margin-right"
+        || normalized == "margin-top"
+        || normalized == "margin-bottom") {
+        return "0px";
+    }
+    if (normalized == "padding-left"
+        || normalized == "padding-right"
+        || normalized == "padding-top"
+        || normalized == "padding-bottom"
+        || normalized == "text-indent") {
+        return "0px";
+    }
+    if (normalized == "border-left-width"
+        || normalized == "border-right-width"
+        || normalized == "border-top-width"
+        || normalized == "border-bottom-width") {
+        return "0px";
+    }
+    if (normalized == "line-height") return "normal";
+    if (normalized == "font-weight") return "400";
+    if (normalized == "font-style") return "normal";
+    if (normalized == "white-space") return "normal";
+    if (normalized == "text-align") return "start";
+    if (normalized == "vertical-align") return "baseline";
+    if (normalized == "list-style-type") return "disc";
+    if (normalized == "list-style-position") return "outside";
+    if (normalized == "list-style-image") return "none";
+
+    return std::nullopt;
+}
+
 class PerfScope final {
 public:
     PerfScope(const PerfTraceCallback& callback, PerfPhase phase, std::string_view name, std::uint64_t count = 0)
@@ -455,6 +678,13 @@ struct Page::Impl {
     std::unordered_map<NodeId, GeometryCacheEntry> last_known_geometry;
     static constexpr int kGeometryForcedLayoutCountThreshold = 2;
     static constexpr long long kGeometryForcedLayoutBudgetUs = 100'000; // 0.10s
+    bool computed_style_property_bounded_mode = false;
+    int computed_style_property_forced_rebuild_count = 0;
+    long long computed_style_property_forced_rebuild_us = 0;
+    std::uint64_t computed_style_property_cache_forget_version = 0;
+    std::unordered_map<NodeId, std::unordered_map<std::string, std::string>> last_known_computed_style_properties;
+    static constexpr int kComputedStylePropertyForcedRebuildCountThreshold = 2;
+    static constexpr long long kComputedStylePropertyForcedRebuildBudgetUs = 100'000; // 0.10s
 
     // Sub-resource cache shared by every styled-document rebuild of the current
     // document, so a page that rebuilds many times during script execution
@@ -488,6 +718,11 @@ struct Page::Impl {
         geometry_forced_layout_us = 0;
         geometry_cache_forget_version = document.forget_version();
         last_known_geometry.clear();
+        computed_style_property_bounded_mode = false;
+        computed_style_property_forced_rebuild_count = 0;
+        computed_style_property_forced_rebuild_us = 0;
+        computed_style_property_cache_forget_version = document.forget_version();
+        last_known_computed_style_properties.clear();
     }
 
     void ensure_js()
@@ -1016,6 +1251,79 @@ struct Page::Impl {
         }
     }
 
+    void sync_computed_style_property_cache_for_forget_version()
+    {
+        const std::uint64_t current_forget_version = document.forget_version();
+        if (computed_style_property_cache_forget_version == current_forget_version) {
+            return;
+        }
+        computed_style_property_cache_forget_version = current_forget_version;
+        last_known_computed_style_properties.clear();
+    }
+
+    std::optional<std::string> cached_computed_style_property(NodeId node, std::string_view property)
+    {
+        sync_computed_style_property_cache_for_forget_version();
+        if (!document.is_connected(node)) {
+            last_known_computed_style_properties.erase(node);
+            return std::nullopt;
+        }
+
+        const auto node_found = last_known_computed_style_properties.find(node);
+        if (node_found == last_known_computed_style_properties.end()) {
+            return std::nullopt;
+        }
+        const auto property_found = node_found->second.find(std::string(property));
+        return property_found == node_found->second.end()
+            ? std::nullopt
+            : std::optional<std::string>(property_found->second);
+    }
+
+    void remember_computed_style_property(NodeId node, std::string_view property, std::optional<std::string> value)
+    {
+        sync_computed_style_property_cache_for_forget_version();
+        if (!document.is_connected(node)) {
+            last_known_computed_style_properties.erase(node);
+            return;
+        }
+        last_known_computed_style_properties[node][std::string(property)] = value.value_or("");
+    }
+
+    void note_computed_style_property_forced_rebuild(long long elapsed_us)
+    {
+        ++computed_style_property_forced_rebuild_count;
+        computed_style_property_forced_rebuild_us += std::max<long long>(0, elapsed_us);
+        if (styled_document_expensive
+            || (computed_style_property_forced_rebuild_count >= kComputedStylePropertyForcedRebuildCountThreshold
+                && computed_style_property_forced_rebuild_us > kComputedStylePropertyForcedRebuildBudgetUs)) {
+            computed_style_property_bounded_mode = true;
+        }
+    }
+
+    std::optional<std::string> bounded_computed_style_property(NodeId node, std::string_view property)
+    {
+        sync_computed_style_property_cache_for_forget_version();
+        if (!document.is_connected(node)) {
+            last_known_computed_style_properties.erase(node);
+            return std::nullopt;
+        }
+
+        if (const auto inline_style = document.get_attribute(node, "style")) {
+            if (auto value = inline_style_property_value(*inline_style, property)) {
+                remember_computed_style_property(node, property, value);
+                return value;
+            }
+        }
+
+        if (auto value = cached_computed_style_property(node, property)) {
+            return value;
+        }
+
+        auto value = default_computed_style_property_value(property, document.tag_name(node));
+        remember_computed_style_property(node, property, value);
+        return value;
+    }
+
     std::unique_ptr<LayoutEngine> build_layout(const RenderOptions& render_options)
     {
         if (!layout_factory) {
@@ -1144,17 +1452,34 @@ struct Page::Impl {
     {
         const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
         const std::string cache_reason = styled_document_cache_reason(key);
+        const bool cache_hit = cache_reason == "valid";
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style_property", 1);
         trace.event().node_id = node;
         trace.event().mutation_version = document.mutation_version();
         trace.event().layout_mutation_version = document.layout_mutation_version();
-        trace.event().styled_document_cache_hit = cache_reason == "valid";
+        trace.event().styled_document_cache_hit = cache_hit;
         trace.event().styled_document_cache_reason = cache_reason;
         trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
         trace.event().property = std::string(property);
+
+        if (!cache_hit && (computed_style_property_bounded_mode || styled_document_expensive)) {
+            computed_style_property_bounded_mode = true;
+            trace.event().styled_document_cache_reason = "bounded_mode:" + cache_reason;
+            auto value = bounded_computed_style_property(node, property);
+            trace.set_count(value && !value->empty() ? 1 : 0);
+            return value;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
         auto& engine = ensure_styled_document(last_render_options);
         engine.compute_styles_only();
         auto value = engine.computed_style_property(std::to_string(node), property);
+        if (!cache_hit) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            note_computed_style_property_forced_rebuild(elapsed_us);
+        }
+        remember_computed_style_property(node, property, value);
         trace.set_count(value ? 1 : 0);
         return value;
     }
