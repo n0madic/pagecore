@@ -501,7 +501,8 @@
               method: request.method,
               body: bodyText(request.body),
               headers: request.headers,
-              credentials: request.credentials
+              credentials: request.credentials,
+              referrer: request.referrer
             });
             return new Response(loaded.body || '', {
               status: loaded.status === undefined ? 200 : Number(loaded.status),

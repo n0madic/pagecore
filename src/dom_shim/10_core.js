@@ -210,11 +210,26 @@
         }
       }
 
-      function loadHostResource(url, kind = 'other') {
+      function normalizeReferrer(value) {
+        if (value === undefined || value === null || value === 'about:client') return 'about:client';
+        const referrer = String(value);
+        if (referrer === '' || referrer === 'no-referrer') return '';
+        return absoluteURL(referrer);
+      }
+
+      function loadHostResource(url, kind = 'other', init = {}) {
         if (!ctx.host || typeof ctx.host.loadResource !== 'function') {
           throw new Error('resource loading is not available');
         }
-        return ctx.host.loadResource(absoluteURL(url), kind);
+        return ctx.host.loadResource(
+          absoluteURL(url),
+          kind,
+          init.method || 'GET',
+          init.body == null ? '' : String(init.body),
+          Array.isArray(init.headers) ? init.headers : [],
+          init.credentials || 'same-origin',
+          normalizeReferrer(Object.prototype.hasOwnProperty.call(init, 'referrer') ? init.referrer : 'about:client')
+        );
       }
 
       return {

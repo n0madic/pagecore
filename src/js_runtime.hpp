@@ -58,7 +58,8 @@ public:
         std::string method = "GET",
         std::string body = {},
         std::vector<std::pair<std::string, std::string>> headers = {},
-        std::string credentials = "same-origin");
+        std::string credentials = "same-origin",
+        std::string referrer = "about:client");
     std::string document_cookie(std::string_view url) const;
     void set_document_cookie(std::string_view url, std::string_view cookie);
     void log_console(std::string_view severity, std::string_view message);

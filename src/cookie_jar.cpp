@@ -4,9 +4,11 @@
 #include <cctype>
 #include <ctime>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <stdlib.h>
@@ -160,6 +162,93 @@ std::string default_path_for(std::string_view request_path)
     return std::string(request_path.substr(0, slash));
 }
 
+bool is_ipv4_address(std::string_view host)
+{
+    if (host.empty()) {
+        return false;
+    }
+    int parts = 0;
+    std::size_t start = 0;
+    while (start <= host.size()) {
+        const std::size_t end = host.find('.', start);
+        const std::string_view part = host.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+        if (part.empty() || part.size() > 3) {
+            return false;
+        }
+        int value = 0;
+        for (char ch : part) {
+            if (!std::isdigit(static_cast<unsigned char>(ch))) {
+                return false;
+            }
+            value = value * 10 + (ch - '0');
+        }
+        if (value > 255) {
+            return false;
+        }
+        ++parts;
+        if (end == std::string_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return parts == 4;
+}
+
+std::string registrable_domain_heuristic(std::string_view host)
+{
+    const std::string lowered = lower_ascii(host);
+    if (lowered.empty()
+        || lowered == "localhost"
+        || lowered.front() == '['
+        || is_ipv4_address(lowered)) {
+        return lowered;
+    }
+
+    const std::size_t last_dot = lowered.rfind('.');
+    if (last_dot == std::string::npos) {
+        return lowered;
+    }
+    const std::size_t previous_dot = lowered.rfind('.', last_dot - 1);
+    return previous_dot == std::string::npos ? lowered : lowered.substr(previous_dot + 1);
+}
+
+std::string site_of(std::string_view url)
+{
+    const ParsedUrl parsed = parse_url(url);
+    if (parsed.scheme.empty() || parsed.host.empty()) {
+        return {};
+    }
+    return parsed.scheme + "://" + registrable_domain_heuristic(parsed.host);
+}
+
+bool same_site_url(std::string_view left, std::string_view right)
+{
+    const std::string left_site = site_of(left);
+    const std::string right_site = site_of(right);
+    return !left_site.empty() && left_site == right_site;
+}
+
+bool is_safe_method(std::string_view method)
+{
+    const std::string lowered = lower_ascii(method.empty() ? std::string_view("GET") : method);
+    return lowered == "get" || lowered == "head" || lowered == "options" || lowered == "trace";
+}
+
+std::optional<CookieSameSite> parse_same_site(std::string_view value)
+{
+    const std::string lowered = lower_ascii(trim_ascii(value));
+    if (lowered == "strict") {
+        return CookieSameSite::Strict;
+    }
+    if (lowered == "lax") {
+        return CookieSameSite::Lax;
+    }
+    if (lowered == "none") {
+        return CookieSameSite::None;
+    }
+    return std::nullopt;
+}
+
 std::time_t timegm_compat(std::tm* tm)
 {
 #if defined(_WIN32)
@@ -215,6 +304,25 @@ bool cookie_matches(const CookieJar::Cookie& cookie, const ParsedUrl& url)
     return path_match(url.path, cookie.path);
 }
 
+bool same_site_allows_cookie(
+    const CookieJar::Cookie& cookie,
+    std::string_view request_url,
+    std::string_view site_url,
+    bool top_level_navigation,
+    std::string_view method)
+{
+    if (site_url.empty() || same_site_url(request_url, site_url)) {
+        return true;
+    }
+    if (cookie.same_site == CookieSameSite::None) {
+        return true;
+    }
+    if (cookie.same_site == CookieSameSite::Strict) {
+        return false;
+    }
+    return top_level_navigation && is_safe_method(method);
+}
+
 bool has_cookie_header(const ResourceRequest& request)
 {
     return std::any_of(request.headers.begin(), request.headers.end(), [](const auto& header) {
@@ -257,7 +365,7 @@ bool cookie_credentials_allow(
 
 std::string CookieJar::document_cookie(std::string_view document_url) const
 {
-    return cookie_header_for_url(document_url, false);
+    return cookie_header_for_url(document_url, false, false, document_url, false, "GET");
 }
 
 void CookieJar::set_document_cookie(std::string_view document_url, std::string_view cookie)
@@ -273,7 +381,14 @@ ResourceRequest CookieJar::with_cookie_header(
     if (!cookie_credentials_allow(credentials, request.url, document_url) || has_cookie_header(request)) {
         return request;
     }
-    const std::string header = cookie_header_for_url(request.url, true);
+    const bool top_level_navigation = request.kind == ResourceKind::Document;
+    const std::string header = cookie_header_for_url(
+        request.url,
+        true,
+        true,
+        document_url,
+        top_level_navigation,
+        request.method.empty() ? std::string_view("GET") : std::string_view(request.method));
     if (!header.empty()) {
         request.headers.emplace_back("Cookie", header);
     }
@@ -310,7 +425,13 @@ void CookieJar::clear()
     cookies_.clear();
 }
 
-std::string CookieJar::cookie_header_for_url(std::string_view url, bool include_http_only) const
+std::string CookieJar::cookie_header_for_url(
+    std::string_view url,
+    bool include_http_only,
+    bool apply_same_site,
+    std::string_view site_url,
+    bool top_level_navigation,
+    std::string_view method) const
 {
     const ParsedUrl parsed = parse_url(url);
     if (parsed.host.empty()) {
@@ -322,6 +443,9 @@ std::string CookieJar::cookie_header_for_url(std::string_view url, bool include_
     std::string out;
     for (const Cookie& cookie : cookies_) {
         if (is_expired(cookie, now) || (!include_http_only && cookie.http_only) || !cookie_matches(cookie, parsed)) {
+            continue;
+        }
+        if (apply_same_site && !same_site_allows_cookie(cookie, url, site_url, top_level_navigation, method)) {
             continue;
         }
         if (!out.empty()) {
@@ -358,6 +482,7 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
     cookie.domain = parsed.host;
     cookie.path = default_path_for(parsed.path);
     cookie.host_only = true;
+    bool reject_cookie = false;
 
     for (std::size_t i = 1; i < parts.size(); ++i) {
         const std::string attr = trim_ascii(parts[i]);
@@ -376,6 +501,8 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
             if (!domain.empty() && domain_match(parsed.host, domain)) {
                 cookie.domain = std::move(domain);
                 cookie.host_only = false;
+            } else {
+                reject_cookie = true;
             }
         } else if (name == "path") {
             if (!value.empty() && value.front() == '/') {
@@ -395,7 +522,15 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
                 cookie.expires = std::chrono::system_clock::now() + std::chrono::seconds(seconds);
             } catch (...) {
             }
+        } else if (name == "samesite") {
+            if (auto same_site = parse_same_site(value)) {
+                cookie.same_site = *same_site;
+            }
         }
+    }
+
+    if (reject_cookie || (cookie.secure && !parsed.secure) || (cookie.same_site == CookieSameSite::None && !cookie.secure)) {
+        return;
     }
 
     const auto now = std::chrono::system_clock::now();

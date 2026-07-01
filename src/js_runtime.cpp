@@ -1049,8 +1049,19 @@ JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
         if (argc > 5 && !JS_IsNull(argv[5]) && !JS_IsUndefined(argv[5])) {
             credentials = to_string(ctx, argv[5]);
         }
+        std::string referrer = "about:client";
+        if (argc > 6 && !JS_IsNull(argv[6]) && !JS_IsUndefined(argv[6])) {
+            referrer = to_string(ctx, argv[6]);
+        }
         const auto response =
-            js.load_resource(url, kind, std::move(method), std::move(body), std::move(headers), std::move(credentials));
+            js.load_resource(
+                url,
+                kind,
+                std::move(method),
+                std::move(body),
+                std::move(headers),
+                std::move(credentials),
+                std::move(referrer));
 
         JSValue out = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, out, "url", js_string(ctx, response.url));
@@ -1825,16 +1836,23 @@ ResourceResponse JsRuntime::load_resource(
     std::string method,
     std::string body,
     std::vector<std::pair<std::string, std::string>> headers,
-    std::string credentials)
+    std::string credentials,
+    std::string referrer)
 {
     if (!loader_) {
         throw std::runtime_error("resource loader is not available");
     }
     const std::string base = options_.base_url;
+    std::string request_referrer = base;
+    if (referrer.empty() || referrer == "no-referrer") {
+        request_referrer.clear();
+    } else if (referrer != "about:client") {
+        request_referrer = resolve_url(base, referrer);
+    }
     ResourceRequest request{
         resolve_url(base, url),
         resource_kind_from_string(kind),
-        base,
+        request_referrer,
         base,
         std::move(method),
         std::move(body),

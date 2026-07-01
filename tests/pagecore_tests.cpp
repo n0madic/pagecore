@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -2257,6 +2258,8 @@ void test_shared_cookie_jar_document_scripts_fetch_and_xhr()
     require(static_request != nullptr && header_contains(*static_request, "cookie", "top=nav")
                 && header_contains(*static_request, "cookie", "secret=hidden"),
             "static scripts should receive cookies from top-level Set-Cookie");
+    require(static_request != nullptr && static_request->referrer == "https://example.test/index.html",
+            "static script requests should carry the document referrer");
 
     const auto* api_request = find_request(*loader, "https://example.test/api");
     require(api_request != nullptr && header_contains(*api_request, "cookie", "client=js")
@@ -2264,15 +2267,21 @@ void test_shared_cookie_jar_document_scripts_fetch_and_xhr()
                 && header_contains(*api_request, "cookie", "secret=hidden")
                 && !header_contains(*api_request, "cookie", "secret=public"),
             "fetch should send document.cookie writes but document.cookie must not overwrite or delete HttpOnly cookies");
+    require(api_request != nullptr && api_request->referrer == "https://example.test/index.html",
+            "fetch requests should carry the document referrer by default");
 
     const auto* dynamic_request = find_request(*loader, "https://example.test/dynamic.js");
     require(dynamic_request != nullptr && header_contains(*dynamic_request, "cookie", "client=js")
                 && header_contains(*dynamic_request, "cookie", "api=ok"),
             "dynamic scripts should receive cookies updated by earlier fetch responses");
+    require(dynamic_request != nullptr && dynamic_request->referrer == "https://example.test/index.html",
+            "dynamic script requests should carry the document referrer");
 
     const auto* xhr_request = find_request(*loader, "https://example.test/xhr");
     require(xhr_request != nullptr && header_contains(*xhr_request, "cookie", "api=ok"),
             "XMLHttpRequest should send cookies from the shared jar");
+    require(xhr_request != nullptr && xhr_request->referrer == "https://example.test/index.html",
+            "XMLHttpRequest requests should carry the document referrer by default");
 }
 
 void test_fetch_xhr_credentials_control_cookie_injection()
@@ -2283,7 +2292,7 @@ void test_fetch_xhr_credentials_control_cookie_injection()
         "https://other.test/set",
         "set",
         "text/plain",
-        {{"Set-Cookie", "third=1; Domain=other.test; Path=/"}});
+        {{"Set-Cookie", "third=1; Domain=other.test; Path=/; SameSite=None; Secure"}});
     loader->add("https://other.test/same", "same", "text/plain");
     loader->add("https://other.test/include", "include", "text/plain");
     loader->add("https://other.test/xhr-same", "xhr-same", "text/plain");
@@ -2357,6 +2366,89 @@ void test_fetch_xhr_credentials_control_cookie_injection()
     const auto* xhr_include_request = find_request(*loader, "https://other.test/xhr-include");
     require(xhr_include_request != nullptr && header_contains(*xhr_include_request, "cookie", "third=1"),
             "XMLHttpRequest withCredentials should include matching cross-origin cookies");
+}
+
+void test_cookie_attributes_path_domain_expires_secure_samesite()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/app/check", "app", "text/plain");
+    loader->add("https://example.test/api/check", "api", "text/plain");
+    loader->add("https://sub.example.test/app/check", "sub", "text/plain");
+    loader->add("http://example.test/app/insecure", "insecure", "text/plain");
+    loader->add(
+        "https://third.test/set",
+        "set",
+        "text/plain",
+        {
+            {"Set-Cookie", "thirdStrict=1; Domain=third.test; Path=/; SameSite=Strict; Secure"},
+            {"Set-Cookie", "thirdLax=1; Domain=third.test; Path=/; SameSite=Lax; Secure"},
+            {"Set-Cookie", "thirdDefault=1; Domain=third.test; Path=/; Secure"},
+            {"Set-Cookie", "thirdNone=1; Domain=third.test; Path=/; SameSite=None; Secure"},
+            {"Set-Cookie", "thirdBadNone=1; Domain=third.test; Path=/; SameSite=None"},
+        });
+    loader->add("https://third.test/again", "again", "text/plain");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.cookie = 'pathok=1; Path=/app';
+    document.cookie = 'pathmiss=1; Path=/private';
+    document.cookie = 'domainok=1; Domain=.example.test; Path=/app; SameSite=Strict';
+    document.cookie = 'domainbad=1; Domain=evil.test; Path=/app';
+    document.cookie = 'secureok=1; Path=/app; SameSite=None; Secure';
+    document.cookie = 'badnone=1; Path=/app; SameSite=None';
+    document.cookie = 'expired=gone; Path=/app; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
+    document.cookie = 'maxgone=gone; Path=/app; Max-Age=0';
+    fetch('/app/check', { credentials: 'include' })
+      .then(() => fetch('/api/check', { credentials: 'include' }))
+      .then(() => fetch('https://sub.example.test/app/check', { credentials: 'include' }))
+      .then(() => fetch('http://example.test/app/insecure', { credentials: 'include' }))
+      .then(() => fetch('https://third.test/set', { credentials: 'include' }))
+      .then(() => fetch('https://third.test/again', { credentials: 'include' }))
+      .then(() => document.body.setAttribute('data-cookie-attrs', 'ok'));
+  </script>
+</body></html>
+)HTML", "https://example.test/start/index.html");
+
+    require(page.outer_html("body[data-cookie-attrs='ok']").has_value(),
+            "cookie attribute test chain should complete");
+
+    const auto* app_request = find_request(*loader, "https://example.test/app/check");
+    require(app_request != nullptr && header_contains(*app_request, "cookie", "pathok=1")
+                && header_contains(*app_request, "cookie", "domainok=1")
+                && header_contains(*app_request, "cookie", "secureok=1"),
+            "matching Path/Domain/Secure cookies should be sent to same-site HTTPS paths");
+    require(app_request != nullptr && !header_contains(*app_request, "cookie", "pathmiss=1")
+                && !header_contains(*app_request, "cookie", "domainbad=1")
+                && !header_contains(*app_request, "cookie", "badnone=1")
+                && !header_contains(*app_request, "cookie", "expired=gone")
+                && !header_contains(*app_request, "cookie", "maxgone=gone"),
+            "non-matching, rejected, and expired cookies should not be sent");
+
+    const auto* api_request = find_request(*loader, "https://example.test/api/check");
+    require(api_request != nullptr && !header_contains(*api_request, "cookie", "pathok=1")
+                && !header_contains(*api_request, "cookie", "domainok=1"),
+            "Path-scoped cookies should not be sent outside their path prefix");
+
+    const auto* subdomain_request = find_request(*loader, "https://sub.example.test/app/check");
+    require(subdomain_request != nullptr && header_contains(*subdomain_request, "cookie", "domainok=1")
+                && !header_contains(*subdomain_request, "cookie", "pathok=1"),
+            "Domain cookies should reach same-site subdomains while host-only cookies should not");
+
+    const auto* insecure_request = find_request(*loader, "http://example.test/app/insecure");
+    require(insecure_request != nullptr && !header_contains(*insecure_request, "cookie", "secureok=1")
+                && !header_contains(*insecure_request, "cookie", "pathok=1"),
+            "Secure and default-Lax cookies should not be sent to cross-scheme subresource requests");
+
+    const auto* third_again_request = find_request(*loader, "https://third.test/again");
+    require(third_again_request != nullptr && header_contains(*third_again_request, "cookie", "thirdNone=1")
+                && !header_contains(*third_again_request, "cookie", "thirdStrict=1")
+                && !header_contains(*third_again_request, "cookie", "thirdLax=1")
+                && !header_contains(*third_again_request, "cookie", "thirdDefault=1")
+                && !header_contains(*third_again_request, "cookie", "thirdBadNone=1"),
+            "cross-site subresource requests should only send SameSite=None cookies that satisfy Secure");
 }
 
 void test_page_readiness_wait_until_load_skips_timers()
@@ -3222,6 +3314,195 @@ void test_curl_loader_preserves_set_cookie_headers_across_redirects()
         server.join();
     }
     require(accepted == 2, "redirect cookie fixture should serve redirect and final requests");
+}
+
+void test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths()
+{
+    const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(server_fd >= 0, "header capture test server socket should open");
+
+    int reuse = 1;
+    (void) ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    require(::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+            "header capture test server should bind");
+    require(::listen(server_fd, 6) == 0, "header capture test server should listen");
+
+    socklen_t address_len = sizeof(address);
+    require(::getsockname(server_fd, reinterpret_cast<sockaddr*>(&address), &address_len) == 0,
+            "header capture test server should expose its port");
+    const int port = ntohs(address.sin_port);
+
+    std::vector<std::string> received_requests;
+    std::thread server([server_fd, &received_requests] {
+        for (int i = 0; i < 6; ++i) {
+            const int client = ::accept(server_fd, nullptr, nullptr);
+            if (client < 0) {
+                continue;
+            }
+            std::string request;
+            std::array<char, 2048> buffer{};
+            while (request.find("\r\n\r\n") == std::string::npos) {
+                const ssize_t n = ::recv(client, buffer.data(), buffer.size(), 0);
+                if (n <= 0) {
+                    break;
+                }
+                request.append(buffer.data(), static_cast<std::size_t>(n));
+            }
+            received_requests.push_back(std::move(request));
+            const std::string response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 2\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "ok";
+            (void) ::send(client, response.data(), response.size(), 0);
+            ::close(client);
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        pagecore::CurlResourceLoader loader("pagecore-agent-test", policy);
+        const std::string origin = "https://origin.test/page.html";
+        const std::string base = "http://127.0.0.1:" + std::to_string(port);
+
+        const auto single = loader.load(pagecore::ResourceRequest{
+            base + "/single",
+            pagecore::ResourceKind::Other,
+            "https://user:pass@origin.test/page.html?x=1#access_token=secret",
+            origin,
+        });
+        require(single.status == 200 && single.body == "ok", "serial curl request should complete");
+
+        const auto batch = loader.load_all({
+            pagecore::ResourceRequest{
+                base + "/batch-a",
+                pagecore::ResourceKind::Script,
+                "file:///Users/test/local.html#secret",
+                origin},
+            pagecore::ResourceRequest{
+                base + "/batch-b",
+                pagecore::ResourceKind::Image,
+                "http://origin.test/asset.html#fragment",
+                origin},
+            pagecore::ResourceRequest{
+                base + "/batch-c",
+                pagecore::ResourceKind::Other,
+                "https://origin.test/path\nInjected: bad",
+                origin},
+            pagecore::ResourceRequest{
+                base + "/batch-d",
+                pagecore::ResourceKind::Other,
+                origin,
+                origin,
+                "GET",
+                {},
+                {{"Referer", "file:///tmp/local.html#secret"}}},
+            pagecore::ResourceRequest{
+                base + "/batch-e",
+                pagecore::ResourceKind::Other,
+                origin,
+                origin,
+                "GET",
+                {},
+                {{"Referer", "https://user:pass@explicit.test/page.html#token"}}},
+        });
+        require(batch.size() == 5
+                    && batch[0].status == 200
+                    && batch[1].status == 200
+                    && batch[2].status == 200
+                    && batch[3].status == 200
+                    && batch[4].status == 200,
+                "multi curl requests should complete");
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        throw;
+    }
+
+    if (server.joinable()) {
+        server.join();
+    }
+
+    auto trim = [](std::string_view value) {
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+            value.remove_prefix(1);
+        }
+        while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+            value.remove_suffix(1);
+        }
+        return std::string(value);
+    };
+    auto raw_header = [&](std::string_view request, std::string_view name) {
+        std::size_t line_start = 0;
+        while (line_start < request.size()) {
+            const std::size_t line_end = request.find('\n', line_start);
+            std::string_view line = request.substr(
+                line_start,
+                line_end == std::string_view::npos ? std::string_view::npos : line_end - line_start);
+            while (!line.empty() && line.back() == '\r') {
+                line.remove_suffix(1);
+            }
+            if (line.empty()) {
+                break;
+            }
+            const std::size_t colon = line.find(':');
+            if (colon != std::string_view::npos && header_name_equals(trim(line.substr(0, colon)), name)) {
+                return trim(line.substr(colon + 1));
+            }
+            if (line_end == std::string_view::npos) {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+        return std::string{};
+    };
+    auto request_target = [](std::string_view request) {
+        const std::size_t method_end = request.find(' ');
+        if (method_end == std::string_view::npos) {
+            return std::string{};
+        }
+        const std::size_t target_end = request.find(' ', method_end + 1);
+        if (target_end == std::string_view::npos) {
+            return std::string{};
+        }
+        return std::string(request.substr(method_end + 1, target_end - method_end - 1));
+    };
+
+    require(received_requests.size() == 6, "header capture fixture should receive serial and batch requests");
+    for (const auto& request : received_requests) {
+        require(raw_header(request, "User-Agent") == "pagecore-agent-test",
+                "CurlResourceLoader should send configured User-Agent on network requests");
+        const std::string target = request_target(request);
+        const std::string referer = raw_header(request, "Referer");
+        if (target == "/single") {
+            require(referer == "https://origin.test/page.html?x=1",
+                    "HTTP Referer should strip userinfo and fragment");
+        } else if (target == "/batch-a") {
+            require(referer.empty(), "file:// referrers should not be sent to network resources");
+        } else if (target == "/batch-b") {
+            require(referer == "http://origin.test/asset.html",
+                    "HTTP Referer should strip fragments from batch requests");
+        } else if (target == "/batch-c") {
+            require(referer.empty(), "control characters should suppress HTTP Referer emission");
+        } else if (target == "/batch-d") {
+            require(referer.empty(), "explicit file:// Referer headers should not be emitted");
+        } else if (target == "/batch-e") {
+            require(referer == "https://explicit.test/page.html",
+                    "explicit Referer headers should strip userinfo and fragments");
+        } else {
+            require(false, "header capture fixture should only receive known paths");
+        }
+    }
 }
 #endif
 
@@ -4753,14 +5034,20 @@ void test_shared_cookie_jar_render_resources()
     const auto* stylesheet_request = find_request(*loader, "https://example.test/style.css");
     require(stylesheet_request != nullptr && header_contains(*stylesheet_request, "cookie", "render=sid"),
             "stylesheet loads should receive cookies from the shared jar");
+    require(stylesheet_request != nullptr && stylesheet_request->referrer == "https://example.test/index.html",
+            "stylesheet render loads should carry the document referrer");
 
     const auto* image_request = find_request(*loader, "https://example.test/image.png");
     require(image_request != nullptr && header_contains(*image_request, "cookie", "render=sid"),
             "image loads should receive cookies from the shared jar");
+    require(image_request != nullptr && image_request->referrer == "https://example.test/index.html",
+            "image render loads should carry the document referrer");
 
     const auto* font_request = find_request(*loader, "https://example.test/font.woff2");
     require(font_request != nullptr && header_contains(*font_request, "cookie", "render=sid"),
             "font loads should receive cookies from the shared jar");
+    require(font_request != nullptr && font_request->referrer == "https://example.test/index.html",
+            "font render loads should carry the document referrer");
 }
 
 // Records load_all() batches separately from single load() calls so a test can
@@ -6404,6 +6691,7 @@ int main()
         test_xhr_and_fetch_load_through_resource_loader();
         test_shared_cookie_jar_document_scripts_fetch_and_xhr();
         test_fetch_xhr_credentials_control_cookie_injection();
+        test_cookie_attributes_path_domain_expires_secure_samesite();
         test_page_readiness_wait_until_load_skips_timers();
         test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable();
         test_page_readiness_image_and_stylesheet_load_events();
@@ -6424,6 +6712,7 @@ int main()
         test_resource_blocks_file_from_network_origin();
 #if !defined(_WIN32)
         test_curl_loader_preserves_set_cookie_headers_across_redirects();
+        test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths();
 #endif
         test_caching_loader_bounds_and_skips_errors();
         test_resource_load_all_returns_in_order();

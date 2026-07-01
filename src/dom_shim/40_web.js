@@ -659,7 +659,10 @@
             this.credentials = normalizeCredentials(init.credentials || (source && source.credentials) || 'same-origin');
             this.cache = init.cache || (source && source.cache) || 'default';
             this.redirect = init.redirect || (source && source.redirect) || 'follow';
-            this.referrer = init.referrer || (source && source.referrer) || 'about:client';
+            this.referrer = normalizeReferrer(
+              Object.prototype.hasOwnProperty.call(init, 'referrer')
+                ? init.referrer
+                : (source ? source.referrer : 'about:client'));
             this.signal = init.signal || (source && source.signal) || null;
           }
 
@@ -737,6 +740,13 @@
           throw new TypeError('Invalid credentials mode');
         }
 
+        function normalizeReferrer(value) {
+          if (value === undefined || value === null || value === 'about:client') return 'about:client';
+          const referrer = String(value);
+          if (referrer === '' || referrer === 'no-referrer') return '';
+          return new URL(referrer, global.location.href || undefined).href;
+        }
+
         function bodyText(body) {
           if (body == null) return '';
           if (body instanceof Blob) return decodeUtf8(body._bytes);
@@ -760,7 +770,8 @@
             init.method || 'GET',
             init.body == null ? '' : String(init.body),
             headerPairs(init.headers),
-            normalizeCredentials(init.credentials || 'same-origin')
+            normalizeCredentials(init.credentials || 'same-origin'),
+            normalizeReferrer(Object.prototype.hasOwnProperty.call(init, 'referrer') ? init.referrer : 'about:client')
           );
         }
 
@@ -845,7 +856,8 @@
                   method: this._method,
                   body: bodyText(body),
                   headers: this._requestHeaders,
-                  credentials: this.withCredentials ? 'include' : 'same-origin'
+                  credentials: this.withCredentials ? 'include' : 'same-origin',
+                  referrer: 'about:client'
                 });
                 this.status = loaded.status === undefined ? 200 : Number(loaded.status);
                 this.statusText = loaded.statusText === undefined ? '' : String(loaded.statusText);

@@ -192,6 +192,26 @@ bool starts_with(std::string_view value, std::string_view prefix)
     return value.substr(0, prefix.size()) == prefix;
 }
 
+bool header_name_equals(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool has_request_header(const ResourceRequest& request, std::string_view name)
+{
+    return std::any_of(request.headers.begin(), request.headers.end(), [&](const auto& header) {
+        return header_name_equals(header.first, name);
+    });
+}
+
 std::string default_status_text(int status)
 {
     switch (status) {
@@ -289,6 +309,52 @@ bool is_file_scheme(std::string_view scheme)
 bool is_data_scheme(std::string_view scheme)
 {
     return scheme == "data";
+}
+
+std::string sanitize_http_referrer(std::string_view referrer)
+{
+    for (unsigned char ch : referrer) {
+        if (ch <= 0x20 || ch == 0x7f) {
+            return {};
+        }
+    }
+
+    const std::string scheme = scheme_of(referrer);
+    if (!is_network_scheme(scheme)) {
+        return {};
+    }
+
+    const auto scheme_pos = referrer.find("://");
+    if (scheme_pos == std::string_view::npos) {
+        return {};
+    }
+
+    auto rest = referrer.substr(scheme_pos + 3);
+    const auto authority_end = rest.find_first_of("/?#");
+    auto authority = rest.substr(0, authority_end);
+    rest = authority_end == std::string_view::npos ? std::string_view{} : rest.substr(authority_end);
+
+    const auto at = authority.find_last_of('@');
+    if (at != std::string_view::npos) {
+        authority = authority.substr(at + 1);
+    }
+    if (authority.empty()) {
+        return {};
+    }
+
+    std::string path_query = "/";
+    if (!rest.empty() && rest.front() == '/') {
+        const auto fragment = rest.find('#');
+        path_query = std::string(rest.substr(0, fragment));
+        if (path_query.empty()) {
+            path_query = "/";
+        }
+    } else if (!rest.empty() && rest.front() == '?') {
+        const auto fragment = rest.find('#');
+        path_query += std::string(rest.substr(0, fragment));
+    }
+
+    return scheme + "://" + std::string(authority) + path_query;
 }
 
 bool scheme_allowed(std::string_view scheme, const ResourcePolicy& policy)
@@ -1019,8 +1085,17 @@ CurlHeaderList apply_request_metadata(CURL* curl, const ResourceRequest& request
         if (name.empty()) {
             continue;
         }
-        const std::string header = name + ": " + value;
-        raw_headers = curl_slist_append(raw_headers, header.c_str());
+        if (header_name_equals(name, "referer")) {
+            const std::string sanitized_referrer = sanitize_http_referrer(value);
+            if (sanitized_referrer.empty()) {
+                continue;
+            }
+            const std::string header = "Referer: " + sanitized_referrer;
+            raw_headers = curl_slist_append(raw_headers, header.c_str());
+        } else {
+            const std::string header = name + ": " + value;
+            raw_headers = curl_slist_append(raw_headers, header.c_str());
+        }
     }
     CurlHeaderList headers(raw_headers);
     if (headers) {
@@ -1088,6 +1163,10 @@ CurlHeaderList configure_network_handle(
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(policy.timeout.count()));
+    const std::string sanitized_referrer = sanitize_http_referrer(request.referrer);
+    if (!sanitized_referrer.empty() && !has_request_header(request, "referer")) {
+        curl_easy_setopt(curl, CURLOPT_REFERER, sanitized_referrer.c_str());
+    }
     if (share != nullptr) {
         curl_easy_setopt(curl, CURLOPT_SHARE, share);
     }
