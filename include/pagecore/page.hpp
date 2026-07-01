@@ -19,9 +19,24 @@ enum class JsResourceLoadPolicy {
     BlockAll,
 };
 
+enum class WaitUntil {
+    Load,
+    NetworkIdle,
+    DomStable,
+    Ready,
+};
+
+struct PageReadinessOptions {
+    WaitUntil wait_until = WaitUntil::Ready;
+    std::chrono::milliseconds wait_time{15000};
+    std::chrono::milliseconds stable_window{350};
+};
+
 struct LoadOptions {
     bool enable_js = true;
     std::chrono::milliseconds wait_time{15000};
+    WaitUntil wait_until = WaitUntil::Ready;
+    std::chrono::milliseconds stable_window{350};
     std::chrono::milliseconds js_timeout{30000};
     std::size_t js_memory_limit_bytes = 256 * 1024 * 1024;
     JsResourceLoadPolicy js_resource_load_policy = JsResourceLoadPolicy::Allow;
@@ -51,6 +66,7 @@ public:
     void load_url(std::string_view url);
     std::string eval(std::string_view script);
     void run_until_idle();
+    bool run_until_ready(PageReadinessOptions options = {});
 
     DomDocument& document();
     const DomDocument& document() const;

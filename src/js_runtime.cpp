@@ -1034,6 +1034,41 @@ JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue host_activity_begin(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("activityBegin requires kind");
+        js.activity_tracker().begin(page_activity_kind_from_string(to_string(ctx, argv[0])));
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_activity_end(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("activityEnd requires kind");
+        js.activity_tracker().end(page_activity_kind_from_string(to_string(ctx, argv[0])));
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_activity_mark_mutation(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        int64_t version = 0;
+        if (argc > 0 && JS_ToInt64(ctx, &version, argv[0]) < 0) {
+            throw std::runtime_error("activityMarkMutation requires numeric mutation version");
+        }
+        int64_t clock = 0;
+        if (argc > 1 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &clock, argv[1]) == 0) {
+            js.activity_tracker().set_clock(std::chrono::milliseconds{std::max<int64_t>(0, clock)});
+        }
+        if (version < 0) version = 0;
+        js.activity_tracker().mark_mutation(static_cast<std::uint64_t>(version));
+        return JS_UNDEFINED;
+    });
+}
+
 JSValue host_random_bytes(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
@@ -1164,6 +1199,7 @@ JsRuntime::JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr
     }
 
     JS_SetContextOpaque(context_, this);
+    activity_tracker_.reset(document_->mutation_version());
 }
 
 JsRuntime::~JsRuntime()
@@ -1230,6 +1266,9 @@ void JsRuntime::install()
     set_function(context_, dom, "getElementById", bridge_get_element_by_id, 1);
     set_function(context_, host, "log", host_log, 1);
     set_function(context_, host, "loadResource", host_load_resource, 2);
+    set_function(context_, host, "activityBegin", host_activity_begin, 1);
+    set_function(context_, host, "activityEnd", host_activity_end, 1);
+    set_function(context_, host, "activityMarkMutation", host_activity_mark_mutation, 1);
     set_function(context_, host, "randomBytes", host_random_bytes, 1);
     set_function(context_, host, "base64Encode", host_base64_encode, 1);
     set_function(context_, host, "base64Decode", host_base64_decode, 1);
@@ -1409,9 +1448,211 @@ void JsRuntime::run_until_idle()
     emit_script_perf("run_until_idle", perf_start, static_cast<std::uint64_t>(iterations));
 }
 
+int JsRuntime::drain_jobs_logged()
+{
+    try {
+        drain_jobs();
+        return 0;
+    } catch (const std::exception& error) {
+        log_console("error", error.what());
+        return -1;
+    }
+}
+
+int JsRuntime::run_timers(std::chrono::milliseconds advance)
+{
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue run_timers = JS_GetPropertyStr(context_, global, "__pagecore_run_timers");
+    JS_FreeValue(context_, global);
+
+    if (!JS_IsFunction(context_, run_timers)) {
+        JS_FreeValue(context_, run_timers);
+        return 0;
+    }
+
+    if (advance.count() < 0) {
+        advance = std::chrono::milliseconds{0};
+    }
+    JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(advance.count()))};
+    JSValue result = JS_Call(context_, run_timers, JS_UNDEFINED, 1, args);
+    JS_FreeValue(context_, args[0]);
+    JS_FreeValue(context_, run_timers);
+    try {
+        check_exception(result, "<timer-callback>");
+    } catch (const std::exception& error) {
+        log_console("error", error.what());
+        JS_FreeValue(context_, result);
+        return -1;
+    }
+
+    int32_t ran = 0;
+    JS_ToInt32(context_, &ran, result);
+    JS_FreeValue(context_, result);
+    return ran;
+}
+
+JsRuntime::TimerSnapshot JsRuntime::timer_snapshot(std::chrono::milliseconds horizon)
+{
+    TimerSnapshot snapshot;
+
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue timer_snapshot_fn = JS_GetPropertyStr(context_, global, "__pagecore_timer_snapshot");
+    JS_FreeValue(context_, global);
+
+    if (!JS_IsFunction(context_, timer_snapshot_fn)) {
+        JS_FreeValue(context_, timer_snapshot_fn);
+        return snapshot;
+    }
+
+    if (horizon.count() < 0) {
+        horizon = std::chrono::milliseconds{0};
+    }
+    JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(horizon.count()))};
+    JSValue result = JS_Call(context_, timer_snapshot_fn, JS_UNDEFINED, 1, args);
+    JS_FreeValue(context_, args[0]);
+    JS_FreeValue(context_, timer_snapshot_fn);
+    check_exception(result, "<timer-snapshot>");
+
+    auto int_property = [this, result](const char* name) -> int64_t {
+        JSValue value = JS_GetPropertyStr(context_, result, name);
+        int64_t out = 0;
+        JS_ToInt64(context_, &out, value);
+        JS_FreeValue(context_, value);
+        return out;
+    };
+
+    const int64_t now = int_property("now");
+    const int64_t relevant = int_property("relevant");
+    const int64_t next_delay = int_property("nextDelay");
+    snapshot.now = std::chrono::milliseconds{std::max<int64_t>(0, now)};
+    snapshot.relevant_count = static_cast<std::size_t>(std::max<int64_t>(0, relevant));
+    if (next_delay >= 0) {
+        snapshot.next_relevant_delay = std::chrono::milliseconds{next_delay};
+    }
+    JS_FreeValue(context_, result);
+    return snapshot;
+}
+
+void JsRuntime::sync_activity_state(std::chrono::milliseconds timer_horizon)
+{
+    const TimerSnapshot timers = timer_snapshot(timer_horizon);
+    activity_tracker_.set_clock(timers.now);
+    activity_tracker_.set_relevant_timers(timers.relevant_count);
+    activity_tracker_.sync_mutation_version(document_->mutation_version());
+}
+
+bool JsRuntime::readiness_satisfied(WaitUntil wait_until, std::chrono::milliseconds stable_window) const
+{
+    if (!activity_tracker_.snapshot().load_fired || !activity_tracker_.mutation_observers_drained()) {
+        return false;
+    }
+
+    switch (wait_until) {
+    case WaitUntil::Load:
+        return true;
+    case WaitUntil::NetworkIdle:
+        return activity_tracker_.network_idle();
+    case WaitUntil::DomStable:
+        return activity_tracker_.snapshot().pending_relevant_timers == 0
+            && activity_tracker_.dom_stable(stable_window);
+    case WaitUntil::Ready:
+        return activity_tracker_.network_idle()
+            && activity_tracker_.dom_stable(stable_window);
+    }
+    return false;
+}
+
+bool JsRuntime::run_until_ready(PageReadinessOptions options)
+{
+    if (options.wait_time.count() < 0) {
+        options.wait_time = std::chrono::milliseconds{0};
+    }
+    if (options.stable_window.count() < 0) {
+        options.stable_window = std::chrono::milliseconds{0};
+    }
+
+    const auto perf_start = std::chrono::steady_clock::now();
+    const auto wait_start = std::chrono::steady_clock::now();
+    start_deadline();
+
+    bool ready = false;
+    int iterations = 0;
+    constexpr int kMaxReadinessIterations = 1000;
+
+    for (;;) {
+        ++iterations;
+        if (drain_jobs_logged() < 0) {
+            break;
+        }
+
+        TimerSnapshot timers;
+        try {
+            timers = timer_snapshot(options.stable_window);
+            activity_tracker_.set_clock(timers.now);
+            activity_tracker_.set_relevant_timers(timers.relevant_count);
+            activity_tracker_.sync_mutation_version(document_->mutation_version());
+        } catch (const std::exception& error) {
+            log_console("error", error.what());
+            break;
+        }
+
+        if (readiness_satisfied(options.wait_until, options.stable_window)) {
+            ready = true;
+            break;
+        }
+
+        if (options.wait_time.count() <= 0 || iterations >= kMaxReadinessIterations) {
+            break;
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - wait_start;
+        if (elapsed >= options.wait_time) {
+            break;
+        }
+
+        const bool wants_dom_stability = options.wait_until == WaitUntil::DomStable
+            || options.wait_until == WaitUntil::Ready;
+        std::optional<std::chrono::milliseconds> advance;
+        if (timers.next_relevant_delay) {
+            advance = *timers.next_relevant_delay;
+        }
+        if (wants_dom_stability && !activity_tracker_.dom_stable(options.stable_window)) {
+            const auto snapshot = activity_tracker_.snapshot();
+            auto stable_remaining = options.stable_window - (snapshot.clock - snapshot.last_mutation_clock);
+            if (stable_remaining.count() < 0) {
+                stable_remaining = std::chrono::milliseconds{0};
+            }
+            if (!advance || stable_remaining < *advance) {
+                advance = stable_remaining;
+            }
+        }
+
+        if (!advance) {
+            break;
+        }
+
+        const int ran = run_timers(*advance);
+        if (ran < 0) {
+            break;
+        }
+        if (ran == 0 && advance->count() == 0) {
+            break;
+        }
+    }
+
+    clear_deadline();
+    flush_dom_bridge_perf();
+    emit_script_perf("run_until_ready", perf_start, static_cast<std::uint64_t>(iterations));
+    return ready;
+}
+
 DomDocument& JsRuntime::document()
 {
     return *document_;
+}
+
+PageActivityTracker& JsRuntime::activity_tracker()
+{
+    return activity_tracker_;
 }
 
 void JsRuntime::set_computed_style_resolver(ComputedStyleResolver resolver)

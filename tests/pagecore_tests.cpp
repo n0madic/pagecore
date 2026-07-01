@@ -691,6 +691,7 @@ void test_wrapper_cache_prunes_only_on_forget()
 void test_timer_wait_budget()
 {
     pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Load;
     options.wait_time = std::chrono::milliseconds(5);
 
     pagecore::Page page(options);
@@ -703,6 +704,10 @@ void test_timer_wait_budget()
 </body></html>
 )HTML");
 
+    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
+            "wait-until=load should not run timer callbacks during load");
+
+    page.run_until_idle();
     require(!page.outer_html("#timer[data-fired='yes']").has_value(),
             "timer should not fire before the configured wait budget");
 
@@ -2099,6 +2104,111 @@ void test_xhr_and_fetch_load_through_resource_loader()
     require(fetch_request->body == "fetch-body", "fetch should pass the request body to ResourceLoader");
     require(has_header(*fetch_request, "content-type", "text/plain"),
             "fetch should pass request headers to ResourceLoader");
+}
+
+void test_page_readiness_wait_until_load_skips_timers()
+{
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Load;
+    options.wait_time = std::chrono::milliseconds(50);
+    options.stable_window = std::chrono::milliseconds(5);
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    setTimeout(() => document.body.setAttribute('data-timer', 'ran'), 0);
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        !page.outer_html("body[data-timer='ran']").has_value(),
+        "wait-until=load should not run timer callbacks during load");
+
+    const bool ready = page.run_until_ready(pagecore::PageReadinessOptions{
+        pagecore::WaitUntil::Ready,
+        std::chrono::milliseconds(50),
+        std::chrono::milliseconds(5),
+    });
+    require(ready, "run_until_ready should complete after the pending timer drains");
+    require(
+        page.outer_html("body[data-timer='ran']").has_value(),
+        "explicit run_until_ready should run pending relevant timer callbacks");
+}
+
+void test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/data.json", R"JSON({"value":"ok"})JSON", "application/json");
+
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Ready;
+    options.wait_time = std::chrono::milliseconds(50);
+    options.stable_window = std::chrono::milliseconds(10);
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    setTimeout(() => {
+      fetch('/data.json')
+        .then((response) => response.json())
+        .then((data) => document.body.setAttribute('data-ready-fetch', data.value));
+    }, 0);
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-ready-fetch='ok']").has_value(),
+        "wait-until=ready should wait for timer-scheduled fetch and the resulting DOM mutation");
+    require(
+        has_request_kind(*loader, "https://example.test/data.json", pagecore::ResourceKind::Other),
+        "timer-scheduled fetch should load through ResourceLoader before readiness completes");
+}
+
+void test_page_readiness_image_and_stylesheet_load_events()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/pixel.png", "png-bytes", "image/png");
+    loader->add("https://example.test/style.css", "body { color: rgb(1, 2, 3); }", "text/css");
+
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Ready;
+    options.wait_time = std::chrono::milliseconds(50);
+    options.stable_window = std::chrono::milliseconds(5);
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head></head><body>
+  <script>
+    const img = new Image();
+    img.onload = () => document.body.setAttribute('data-img-load', img.complete ? 'ok' : 'bad');
+    img.onerror = () => document.body.setAttribute('data-img-load', 'error');
+    img.src = '/pixel.png';
+
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/style.css';
+    link.onload = () => document.body.setAttribute('data-link-load', 'ok');
+    link.onerror = () => document.body.setAttribute('data-link-load', 'error');
+    document.head.appendChild(link);
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-img-load='ok'][data-link-load='ok']").has_value(),
+        "wait-until=ready should wait for image and stylesheet load events");
+    require(
+        has_request_kind(*loader, "https://example.test/pixel.png", pagecore::ResourceKind::Image),
+        "image load lifecycle should request image resources");
+    require(
+        has_request_kind(*loader, "https://example.test/style.css", pagecore::ResourceKind::Stylesheet),
+        "stylesheet load lifecycle should request stylesheet resources");
 }
 
 void test_js_resource_policy_block_all_keeps_parser_scripts()
@@ -5894,6 +6004,9 @@ int main()
         test_target_pseudo_class_selector_fallback();
         test_request_response_fetch_object_shims();
         test_xhr_and_fetch_load_through_resource_loader();
+        test_page_readiness_wait_until_load_skips_timers();
+        test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable();
+        test_page_readiness_image_and_stylesheet_load_events();
         test_js_resource_policy_block_all_keeps_parser_scripts();
         test_js_resource_policy_same_origin_blocks_cross_origin_loads();
         test_js_resource_budgets_limit_count_bytes_and_time();

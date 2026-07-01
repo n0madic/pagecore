@@ -956,6 +956,7 @@ struct Page::Impl {
     void execute_scripts()
     {
         ensure_js();
+        js->activity_tracker().reset(document.mutation_version());
         for (const auto& script : collect_scripts()) {
             js->execute("document.__markScriptStarted(" + std::to_string(script.node) + ");", "<pagecore-script-state>");
             if (script.module) {
@@ -987,7 +988,12 @@ struct Page::Impl {
             "if (typeof __pagecore_fireDOMContentLoaded === 'function') __pagecore_fireDOMContentLoaded();\n"
             "if (typeof __pagecore_fireLoad === 'function') __pagecore_fireLoad();",
             "<pagecore-lifecycle>");
-        js->run_until_idle();
+        js->activity_tracker().mark_load_fired();
+        js->run_until_ready(PageReadinessOptions{
+            options.wait_until,
+            options.wait_time,
+            options.stable_window,
+        });
     }
 
     std::string render_base_url(const RenderOptions& render_options) const
@@ -1896,6 +1902,14 @@ void Page::run_until_idle()
     if (impl_->js) {
         impl_->js->run_until_idle();
     }
+}
+
+bool Page::run_until_ready(PageReadinessOptions options)
+{
+    if (!impl_->js) {
+        return true;
+    }
+    return impl_->js->run_until_ready(options);
 }
 
 DomDocument& Page::document()

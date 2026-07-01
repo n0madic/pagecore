@@ -16,7 +16,7 @@
     deps: ['core', 'events', 'dom'],
     install(ctx, api) {
       const { global, host } = ctx;
-      const { defineValue, assertNode, absoluteURL } = api.core;
+      const { defineValue, assertNode, absoluteURL, activityBegin, activityEnd } = api.core;
       const {
         DOMException,
         EventTarget,
@@ -774,6 +774,7 @@
             this._requestHeaders = new Headers();
             this._responseHeaders = new Headers();
             this._aborted = false;
+            this._activityPending = false;
           }
 
           open(method, url, async = true) {
@@ -812,12 +813,17 @@
             this._fire('readystatechange');
             this._fire('abort');
             this._fire('loadend');
+            this._endActivity();
           }
 
           send(body = null) {
             if (this.readyState !== XMLHttpRequest.OPENED) throw new DOMException('XMLHttpRequest is not open.', 'InvalidStateError');
+            this._beginActivity();
             const run = () => {
-              if (this._aborted) return;
+              if (this._aborted) {
+                this._endActivity();
+                return;
+              }
               let loaded = null;
               try {
                 loaded = loadHostResource(this._url, 'other', {
@@ -835,7 +841,10 @@
                   ? (this.responseText ? JSON.parse(this.responseText) : null)
                   : this.responseText;
               } catch (error) {
-                if (this._aborted) return;
+                if (this._aborted) {
+                  this._endActivity();
+                  return;
+                }
                 this.status = 0;
                 this.statusText = '';
                 this.response = '';
@@ -844,10 +853,14 @@
                 this._fire('readystatechange');
                 this._fire('error');
                 this._fire('loadend');
+                this._endActivity();
                 return;
               }
 
-              if (this._aborted) return;
+              if (this._aborted) {
+                this._endActivity();
+                return;
+              }
               this.readyState = XMLHttpRequest.HEADERS_RECEIVED;
               this._fire('readystatechange');
 
@@ -858,11 +871,24 @@
               this._fire('readystatechange');
               this._fire('load');
               this._fire('loadend');
+              this._endActivity();
             };
 
             void body;
             if (this._async) global.setTimeout(run, 0);
             else run();
+          }
+
+          _beginActivity() {
+            if (this._activityPending) return;
+            this._activityPending = true;
+            activityBegin('xhr-fetch');
+          }
+
+          _endActivity() {
+            if (!this._activityPending) return;
+            this._activityPending = false;
+            activityEnd('xhr-fetch');
           }
 
           _fire(type) {
@@ -1122,6 +1148,7 @@
       function performanceNow() {
         return timerNow;
       }
+      ctx.pagecoreNow = performanceNow;
 
       function runTimers(advanceMs = 0) {
         const deadline = timerNow + normalizeDelay(advanceMs);
@@ -1158,6 +1185,22 @@
         }
       }
 
+      function timerSnapshot(horizonMs = 0) {
+        const horizon = timerNow + normalizeDelay(horizonMs);
+        let relevant = 0;
+        let nextDue = Infinity;
+        for (const timer of timers.values()) {
+          if (timer.interval || timer.due > horizon) continue;
+          relevant++;
+          if (timer.due < nextDue) nextDue = timer.due;
+        }
+        return {
+          now: timerNow,
+          relevant,
+          nextDelay: nextDue === Infinity ? -1 : Math.max(0, nextDue - timerNow)
+        };
+      }
+
       return {
         DOMRectReadOnly,
         DOMRect,
@@ -1191,7 +1234,8 @@
         requestAnimationFrameShim,
         requestIdleCallbackShim,
         performanceNow,
-        runTimers
+        runTimers,
+        timerSnapshot
       };
     }
   };

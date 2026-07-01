@@ -54,7 +54,9 @@ void usage(const char* argv0)
         << "  --viewport WIDTHxHEIGHT  render viewport, default 1280x720\n"
         << "  --full-page              expand the viewport height to the full page content height before rendering\n"
         << "  --scale NUMBER           render scale factor, default 1\n"
-        << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 15000\n"
+        << "  --wait-until MODE        load, network-idle, dom-stable, or ready; default ready\n"
+        << "  --wait-ms NUMBER         page readiness hard budget, default 15000\n"
+        << "  --stable-window-ms NUMBER DOM quiet window for dom-stable/ready, default 350\n"
         << "  --js-resource-policy MODE allow, same-origin, or none for JS-initiated fetch/XHR/dynamic scripts; default allow\n"
         << "  --max-js-resource-loads NUMBER stop JS-initiated resource loads after this many actual loads\n"
         << "  --max-js-resource-bytes NUMBER stop JS-initiated resource loads after this many response bytes\n"
@@ -156,6 +158,23 @@ pagecore::JsResourceLoadPolicy parse_js_resource_policy(const std::string& value
         return pagecore::JsResourceLoadPolicy::BlockAll;
     }
     throw std::runtime_error("js-resource-policy must be one of: allow, same-origin, none");
+}
+
+pagecore::WaitUntil parse_wait_until(const std::string& value)
+{
+    if (value == "load") {
+        return pagecore::WaitUntil::Load;
+    }
+    if (value == "network-idle") {
+        return pagecore::WaitUntil::NetworkIdle;
+    }
+    if (value == "dom-stable") {
+        return pagecore::WaitUntil::DomStable;
+    }
+    if (value == "ready") {
+        return pagecore::WaitUntil::Ready;
+    }
+    throw std::runtime_error("wait-until must be one of: load, network-idle, dom-stable, ready");
 }
 
 const char* output_format_name(OutputFormat format)
@@ -306,7 +325,11 @@ int main(int argc, char** argv)
                 render_options.viewport.device_scale_factor = scale;
             }
             else if (arg == "--scale") render_options.viewport.device_scale_factor = parse_positive_float(next(), "scale");
+            else if (arg == "--wait-until") load_options.wait_until = parse_wait_until(next());
             else if (arg == "--wait-ms") load_options.wait_time = std::chrono::milliseconds(parse_nonnegative_int(next(), "wait-ms"));
+            else if (arg == "--stable-window-ms") {
+                load_options.stable_window = std::chrono::milliseconds(parse_nonnegative_int(next(), "stable-window-ms"));
+            }
             else if (arg == "--js-resource-policy") load_options.js_resource_load_policy = parse_js_resource_policy(next());
             else if (arg == "--max-js-resource-loads") {
                 load_options.max_js_resource_loads = static_cast<std::size_t>(parse_nonnegative_int(next(), "max-js-resource-loads"));

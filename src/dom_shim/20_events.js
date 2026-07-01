@@ -20,6 +20,8 @@
         DOM_EXCEPTION_CODES,
         DOM_EXCEPTION_LEGACY_CONSTANTS,
         defineValue,
+        activityBegin,
+        activityEnd,
         isNodeWrapper
       } = api.core;
 
@@ -526,11 +528,16 @@
 
           if (mutationFlushQueued) return;
           mutationFlushQueued = true;
+          activityBegin('mutation-observer');
           Promise.resolve().then(() => {
-            mutationFlushQueued = false;
-            for (const observer of [...mutationObservers]) {
-              const records = observer.takeRecords();
-              if (records.length > 0) observer._callback(records, observer);
+            try {
+              mutationFlushQueued = false;
+              for (const observer of [...mutationObservers]) {
+                const records = observer.takeRecords();
+                if (records.length > 0) observer._callback(records, observer);
+              }
+            } finally {
+              activityEnd('mutation-observer');
             }
           });
         }

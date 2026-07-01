@@ -28,6 +28,8 @@
         liveId,
         memo,
         toArray,
+        activityBegin,
+        activityEnd,
         loadHostResource
       } = api.core;
       const {
@@ -169,6 +171,7 @@
         const src = script.getAttribute('src');
         if (src) {
           const url = absoluteURL(src);
+          activityBegin('dynamic-script');
           const run = () => {
             try {
               const loaded = loadHostResource(url, 'script');
@@ -176,6 +179,8 @@
             } catch (error) {
               reportDynamicScriptError(error);
               script.dispatchEvent(new Event('error'));
+            } finally {
+              activityEnd('dynamic-script');
             }
           };
           if (typeof global.setTimeout === 'function') global.setTimeout(run, 0);
@@ -193,6 +198,75 @@
         if (node.localName === 'script') executeDynamicScript(node);
         if (node.querySelectorAll) {
           for (const script of node.querySelectorAll('script')) executeDynamicScript(script);
+        }
+      }
+
+      function relContainsStylesheet(value) {
+        return String(value || '').toLowerCase().split(/\s+/).includes('stylesheet');
+      }
+
+      function setInternalValue(target, property, value) {
+        Object.defineProperty(target, property, {
+          value,
+          writable: true,
+          configurable: true
+        });
+      }
+
+      function scheduleElementResourceLoad(element) {
+        if (!element || !element.localName) return;
+        let kind = '';
+        let url = '';
+
+        if (element.localName === 'img') {
+          const src = element.getAttribute('src') || '';
+          if (!src) return;
+          kind = 'image';
+          url = absoluteURL(src);
+        } else if (element.localName === 'link') {
+          if (!element.isConnected || !relContainsStylesheet(element.getAttribute('rel')) || element.disabled) return;
+          const href = element.getAttribute('href') || '';
+          if (!href) return;
+          kind = 'stylesheet';
+          url = absoluteURL(href);
+        } else {
+          return;
+        }
+
+        if (!url) return;
+        const key = `${kind}\n${url}`;
+        if (element.__pagecoreResourceLoadKey === key) return;
+        setInternalValue(element, '__pagecoreResourceLoadKey', key);
+        if (element.localName === 'img') {
+          element.complete = false;
+        }
+
+        activityBegin('dom-resource');
+        const run = () => {
+          try {
+            const loaded = loadHostResource(url, kind);
+            if (kind === 'stylesheet') {
+              stylesheetTextCache.set(url, loaded && loaded.body ? loaded.body : '');
+            }
+            if (element.localName === 'img') element.complete = true;
+            element.dispatchEvent(new Event('load'));
+          } catch (_error) {
+            if (element.localName === 'img') element.complete = true;
+            element.dispatchEvent(new Event('error'));
+          } finally {
+            activityEnd('dom-resource');
+          }
+        };
+        if (typeof global.setTimeout === 'function') global.setTimeout(run, 0);
+        else run();
+      }
+
+      function scheduleResourceLoadsInSubtree(node) {
+        if (!node) return;
+        scheduleElementResourceLoad(node);
+        if (node.querySelectorAll) {
+          for (const image of node.querySelectorAll('img')) scheduleElementResourceLoad(image);
+          for (const link of node.querySelectorAll('link')) scheduleElementResourceLoad(link);
         }
       }
 
@@ -301,6 +375,7 @@
                 nextSibling: null,
                 attributeName: null
               });
+              for (const node of addedNodes) scheduleResourceLoadsInSubtree(node);
               return child;
             }
             if (child && child.__fragmentParent) child.__fragmentParent.removeChild(child);
@@ -317,6 +392,7 @@
               attributeName: null
             });
             executeDynamicScriptsInSubtree(result);
+            scheduleResourceLoadsInSubtree(result);
             return result;
           }
 
@@ -339,6 +415,7 @@
                 nextSibling: referenceChild || null,
                 attributeName: null
               });
+              for (const node of addedNodes) scheduleResourceLoadsInSubtree(node);
               return child;
             }
             if (child && child.__fragmentParent) child.__fragmentParent.removeChild(child);
@@ -356,6 +433,7 @@
               attributeName: null
             });
             executeDynamicScriptsInSubtree(result);
+            scheduleResourceLoadsInSubtree(result);
             return result;
           }
 
@@ -394,6 +472,7 @@
               attributeName: null
             });
             executeDynamicScriptsInSubtree(child);
+            scheduleResourceLoadsInSubtree(child);
             return result;
           }
 
@@ -2388,6 +2467,7 @@
               attributeName: null
             });
             markScriptsStartedInSubtree(this);
+            scheduleResourceLoadsInSubtree(this);
           }
           get outerHTML() { return bridge.outerHTML(this._liveId()); }
           get style() { return memo(this, '__style', () => styleDeclaration(this)); }
@@ -2426,6 +2506,9 @@
               oldValue
             });
             if (oldValue !== newValue) notifyCustomElementAttributeChanged(this, attributeName, oldValue, newValue);
+            if (oldValue !== newValue && ['src', 'href', 'rel', 'disabled'].includes(attributeName.toLowerCase())) {
+              scheduleElementResourceLoad(this);
+            }
             return result;
           }
           removeAttribute(name) {
@@ -2442,6 +2525,9 @@
               oldValue
             });
             if (oldValue !== null) notifyCustomElementAttributeChanged(this, attributeName, oldValue, null);
+            if (oldValue !== null && ['disabled'].includes(attributeName.toLowerCase())) {
+              scheduleElementResourceLoad(this);
+            }
             return result;
           }
           toggleAttribute(name, force = undefined) {
@@ -3355,6 +3441,7 @@
           } else node = new Node(id);
 
           wrapperCache.set(id, node);
+          if (type === 1) scheduleElementResourceLoad(node);
           return node;
         }
 

@@ -222,16 +222,23 @@ rejected by budget emit `render_resource_blocked`.
 Use `tools/perf_trace_summary.js /tmp/pagecore-trace.jsonl` to print phase
 totals, resource-load groups, and the slowest resource events.
 
-`LoadOptions::wait_time` controls timer draining after scripts and lifecycle
-events. A zero wait budget (`pagecore_cli --wait-ms 0`) still runs synchronous
-scripts and microtasks, but leaves `setTimeout`/`setInterval` callbacks pending
-instead of executing zero-delay timers during load.
+Page readiness is controlled by `LoadOptions::wait_until`,
+`LoadOptions::wait_time`, and `LoadOptions::stable_window`, exposed in the CLI
+as `--wait-until load|network-idle|dom-stable|ready`, `--wait-ms`, and
+`--stable-window-ms`. The default is `ready`: after scripts and lifecycle
+events, PageCore waits for JS-initiated `fetch`/XHR, dynamic classic scripts,
+image/stylesheet load events, relevant one-shot timers, drained microtasks and
+MutationObserver delivery, and a quiet DOM mutation window. `--wait-ms` is the
+overall hard budget. A zero wait budget still runs synchronous scripts and
+microtasks, but leaves timer callbacks pending. Embedders can call
+`Page::run_until_ready(PageReadinessOptions)` explicitly; `run_until_idle()`
+remains a lower-level deterministic timer drain helper.
 `LoadOptions::js_resource_load_policy` controls only JS-initiated resource
-loads during script execution and idle draining. The CLI exposes it as
-`--js-resource-policy allow|same-origin|none`: `allow` preserves the default
-behavior, `same-origin` rejects cross-origin `fetch`/XHR/dynamic script loads,
-and `none` rejects all such JS-initiated loads. Top-level document loading and
-parser-discovered external scripts are unaffected.
+loads during script execution and readiness/event-loop processing. The CLI
+exposes it as `--js-resource-policy allow|same-origin|none`: `allow` preserves
+the default behavior, `same-origin` rejects cross-origin `fetch`/XHR/dynamic
+script loads, and `none` rejects all such JS-initiated loads. Top-level
+document loading and parser-discovered external scripts are unaffected.
 The same JS-initiated loads can also be capped with
 `max_js_resource_loads`, `max_js_resource_bytes`, and
 `max_js_resource_time` (`--max-js-resource-loads`,

@@ -447,6 +447,7 @@ add_library(pagecore
     src/image_io.cpp
     src/js_runtime.cpp
     src/page.cpp
+    src/page_activity_tracker.cpp
     src/resource_loader.cpp
 )
 add_dependencies(pagecore pagecore_dom_shim)

@@ -3,6 +3,7 @@
 #include "pagecore/dom.hpp"
 #include "pagecore/page.hpp"
 #include "pagecore/render.hpp"
+#include "page_activity_tracker.hpp"
 
 #include <chrono>
 #include <functional>
@@ -42,8 +43,10 @@ public:
     void execute_module(std::string_view script, std::string_view filename);
     std::string evaluate(std::string_view script, std::string_view filename = "<eval>");
     void run_until_idle();
+    bool run_until_ready(PageReadinessOptions options);
 
     DomDocument& document();
+    PageActivityTracker& activity_tracker();
     ResourceResponse load_resource(
         std::string_view url,
         std::string_view kind,
@@ -80,6 +83,12 @@ private:
         std::uint64_t calls = 0;
     };
 
+    struct TimerSnapshot {
+        std::chrono::milliseconds now{0};
+        std::size_t relevant_count = 0;
+        std::optional<std::chrono::milliseconds> next_relevant_delay;
+    };
+
     JSRuntime* runtime_ = nullptr;
     JSContext* context_ = nullptr;
     DomDocument* document_ = nullptr;
@@ -93,6 +102,7 @@ private:
     std::size_t js_resource_load_count_ = 0;
     std::size_t js_resource_load_bytes_ = 0;
     long long js_resource_load_elapsed_us_ = 0;
+    PageActivityTracker activity_tracker_;
     std::chrono::steady_clock::time_point deadline_{};
     bool deadline_active_ = false;
 
@@ -102,6 +112,11 @@ private:
     void start_deadline();
     void clear_deadline();
     void drain_jobs();
+    int drain_jobs_logged();
+    int run_timers(std::chrono::milliseconds advance);
+    TimerSnapshot timer_snapshot(std::chrono::milliseconds horizon);
+    void sync_activity_state(std::chrono::milliseconds timer_horizon);
+    bool readiness_satisfied(WaitUntil wait_until, std::chrono::milliseconds stable_window) const;
     void check_exception(JSValue value, std::string_view source_name = {});
     void emit_script_perf(std::string_view name, std::chrono::steady_clock::time_point start, std::uint64_t count);
     std::optional<std::string> js_resource_budget_block_reason() const;

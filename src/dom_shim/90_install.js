@@ -16,7 +16,7 @@
     deps: ['core', 'events', 'dom', 'web', 'forms', 'streams', 'compat'],
     install(ctx, api) {
       const { global, host, bridge } = ctx;
-      const { defineValue, setDocumentReadyState } = api.core;
+      const { defineValue, setDocumentReadyState, activityBegin, activityEnd } = api.core;
       const {
         DOMException,
         Window,
@@ -173,7 +173,8 @@
         requestAnimationFrameShim,
         requestIdleCallbackShim,
         performanceNow,
-        runTimers
+        runTimers,
+        timerSnapshot
       } = api.web;
       const {
         FormData
@@ -485,19 +486,28 @@
         };
         global.Audio = Audio;
         global.Option = Option;
-        global.fetch = (input, init = {}) => Promise.resolve().then(() => {
+        global.fetch = (input, init = {}) => {
           const request = new Request(input, init);
-          const loaded = loadHostResource(request.url, 'other', {
-            method: request.method,
-            body: bodyText(request.body),
-            headers: request.headers
+          activityBegin('xhr-fetch');
+          return Promise.resolve().then(() => {
+            const loaded = loadHostResource(request.url, 'other', {
+              method: request.method,
+              body: bodyText(request.body),
+              headers: request.headers
+            });
+            return new Response(loaded.body || '', {
+              status: Number(loaded.status || 200),
+              headers: responseHeadersFromHost(loaded),
+              url: loaded.url || request.url
+            });
+          }).then((response) => {
+            activityEnd('xhr-fetch');
+            return response;
+          }, (error) => {
+            activityEnd('xhr-fetch');
+            throw error;
           });
-          return new Response(loaded.body || '', {
-            status: Number(loaded.status || 200),
-            headers: responseHeadersFromHost(loaded),
-            url: loaded.url || request.url
-          });
-        });
+        };
         global.__pagecore_install_wpt_hook = installWptHook;
         installWptHook();
         global.__pagecore_fireDOMContentLoaded = () => {
@@ -531,6 +541,7 @@
         }
 
         global.__pagecore_run_timers = runTimers;
+        global.__pagecore_timer_snapshot = timerSnapshot;
 
       return {};
     }

@@ -118,6 +118,7 @@
 
       function afterMutation(value, record = null) {
         syncMutationCache();
+        activityMarkMutation();
         if (record && ctx.suppressMutationRecords === 0 && typeof ctx.queueMutation === 'function') ctx.queueMutation(record);
         return value;
       }
@@ -167,6 +168,30 @@
         return ids.map((id) => ctx.wrapNode(id)).filter(Boolean);
       }
 
+      function activityBegin(kind) {
+        try {
+          if (ctx.host && typeof ctx.host.activityBegin === 'function') ctx.host.activityBegin(kind);
+        } catch (_activityError) {
+        }
+      }
+
+      function activityEnd(kind) {
+        try {
+          if (ctx.host && typeof ctx.host.activityEnd === 'function') ctx.host.activityEnd(kind);
+        } catch (_activityError) {
+        }
+      }
+
+      function activityMarkMutation() {
+        try {
+          if (ctx.host && typeof ctx.host.activityMarkMutation === 'function') {
+            const clock = typeof ctx.pagecoreNow === 'function' ? ctx.pagecoreNow() : undefined;
+            ctx.host.activityMarkMutation(ctx.bridge.mutationVersion(), clock);
+          }
+        } catch (_activityError) {
+        }
+      }
+
       function absoluteURL(value) {
         const text = String(value ?? '');
         if (!text) return '';
@@ -206,6 +231,9 @@
         liveId,
         memo,
         toArray,
+        activityBegin,
+        activityEnd,
+        activityMarkMutation,
         absoluteURL,
         loadHostResource
       };
