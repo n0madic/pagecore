@@ -106,26 +106,158 @@ void collect_subtree(lxb_dom_node_t* node, std::vector<lxb_dom_node_t*>& out)
 
 constexpr std::string_view kLayoutIdAttribute = "data-pc-sid";
 
-// Bypasses lxb_dom_element_set/remove_attribute's normal call sites
-// (DomDocument::set_attribute/remove_attribute), which bump mutation_version
-// — this round-trip must stay invisible to layout-cache keys.
-void set_layout_id_attribute(lxb_dom_element_t* element, NodeId id)
+struct LayoutIdRestore {
+    lxb_dom_element_t* element = nullptr;
+    bool had_attribute = false;
+    std::string value;
+};
+
+// Bypasses DomDocument::set_attribute/remove_attribute, which bump
+// mutation_version: layout tagging is an internal serialization detail and must
+// stay invisible to layout-cache keys.
+void set_layout_id_attribute(lxb_dom_element_t* element, NodeId id, std::vector<LayoutIdRestore>& restore)
 {
+    size_t old_len = 0;
+    const auto* old_value = lxb_dom_element_get_attribute(
+        element,
+        reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
+        kLayoutIdAttribute.size(),
+        &old_len);
+
+    restore.push_back(LayoutIdRestore{
+        element,
+        old_value != nullptr,
+        old_value == nullptr ? std::string() : to_string(old_value, old_len),
+    });
+
     const std::string value = std::to_string(id);
-    lxb_dom_element_set_attribute(
+    auto* attr = lxb_dom_element_set_attribute(
         element,
         reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
         kLayoutIdAttribute.size(),
         reinterpret_cast<const lxb_char_t*>(value.data()),
         value.size());
+    if (attr == nullptr) {
+        throw std::runtime_error("failed to set transient layout id attribute");
+    }
 }
 
-void remove_layout_id_attribute(lxb_dom_element_t* element)
+void restore_layout_id_attributes(std::vector<LayoutIdRestore>& restore)
 {
-    lxb_dom_element_remove_attribute(
-        element,
-        reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
-        kLayoutIdAttribute.size());
+    for (auto it = restore.rbegin(); it != restore.rend(); ++it) {
+        if (it->element == nullptr) {
+            continue;
+        }
+        if (it->had_attribute) {
+            lxb_dom_element_set_attribute(
+                it->element,
+                reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
+                kLayoutIdAttribute.size(),
+                reinterpret_cast<const lxb_char_t*>(it->value.data()),
+                it->value.size());
+        } else {
+            lxb_dom_element_remove_attribute(
+                it->element,
+                reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
+                kLayoutIdAttribute.size());
+        }
+    }
+    restore.clear();
+}
+
+bool is_document_like_node(lxb_dom_node_t* node)
+{
+    return node != nullptr
+        && (node->type == LXB_DOM_NODE_TYPE_DOCUMENT
+            || node->type == LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT);
+}
+
+bool is_html_tag(lxb_dom_node_t* node, lxb_tag_id_t tag)
+{
+    return node != nullptr && node->ns == LXB_NS_HTML && node->local_name == tag;
+}
+
+bool should_detach_layout_node(lxb_dom_node_t* node, bool omit_js_disabled_content)
+{
+    if (node == nullptr) {
+        return true;
+    }
+    if (omit_js_disabled_content && is_html_tag(node, LXB_TAG_NOSCRIPT)) {
+        return true;
+    }
+    return node->type == LXB_DOM_NODE_TYPE_TEXT && is_html_tag(node->parent, LXB_TAG_HEAD);
+}
+
+void push_children_reverse(std::vector<lxb_dom_node_t*>& stack, lxb_dom_node_t* parent)
+{
+    for (auto* child = parent == nullptr ? nullptr : parent->last_child; child != nullptr; child = child->prev) {
+        stack.push_back(child);
+    }
+}
+
+struct DetachedLayoutNode {
+    lxb_dom_node_t* node = nullptr;
+    lxb_dom_node_t* parent = nullptr;
+    lxb_dom_node_t* prev = nullptr;
+    lxb_dom_node_t* next = nullptr;
+};
+
+void collect_layout_detach_nodes(
+    lxb_dom_node_t* root,
+    bool omit_js_disabled_content,
+    std::vector<lxb_dom_node_t*>& out)
+{
+    std::vector<lxb_dom_node_t*> stack;
+    if (is_document_like_node(root)) {
+        push_children_reverse(stack, root);
+    } else if (root != nullptr) {
+        stack.push_back(root);
+    }
+
+    while (!stack.empty()) {
+        auto* node = stack.back();
+        stack.pop_back();
+        if (should_detach_layout_node(node, omit_js_disabled_content)) {
+            out.push_back(node);
+            continue;
+        }
+        push_children_reverse(stack, node);
+    }
+}
+
+void detach_layout_nodes(
+    const std::vector<lxb_dom_node_t*>& nodes,
+    std::vector<DetachedLayoutNode>& detached)
+{
+    detached.reserve(detached.size() + nodes.size());
+    for (auto* node : nodes) {
+        if (node == nullptr || node->parent == nullptr) {
+            continue;
+        }
+        detached.push_back(DetachedLayoutNode{node, node->parent, node->prev, node->next});
+        lxb_dom_node_remove_wo_events(node);
+    }
+}
+
+void restore_detached_layout_nodes(std::vector<DetachedLayoutNode>& detached)
+{
+    for (auto it = detached.rbegin(); it != detached.rend(); ++it) {
+        auto* node = it->node;
+        auto* parent = it->parent;
+        if (node == nullptr || parent == nullptr || node->parent != nullptr) {
+            continue;
+        }
+        if (it->next != nullptr && it->next->parent == parent) {
+            lxb_dom_node_insert_before_wo_events(it->next, node);
+            continue;
+        }
+        if (it->prev != nullptr && it->prev->parent == parent) {
+            lxb_dom_node_insert_after_wo_events(it->prev, node);
+            continue;
+        }
+        lxb_dom_node_insert_child_wo_events(parent, node);
+    }
+    detached.clear();
 }
 
 struct SelectorResults {
@@ -738,35 +870,45 @@ std::string DomDocument::serialize_html() const
     return out;
 }
 
-std::string DomDocument::serialize_html_for_layout() const
+std::string DomDocument::serialize_html_for_layout(bool omit_js_disabled_content) const
 {
     std::vector<lxb_dom_node_t*> nodes;
     collect_subtree(lxb_dom_interface_node(impl_->document), nodes);
 
-    std::vector<lxb_dom_element_t*> tagged;
-    tagged.reserve(nodes.size());
-    for (auto* node : nodes) {
-        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
-            continue;
-        }
-        auto* element = lxb_dom_interface_element(node);
-        set_layout_id_attribute(element, impl_->id_for(node));
-        tagged.push_back(element);
-    }
-
     std::string html;
+    std::vector<LayoutIdRestore> layout_id_restore;
+    std::vector<lxb_dom_node_t*> detach_nodes;
+    std::vector<DetachedLayoutNode> detached;
+
     try {
-        html = serialize_html();
-    } catch (...) {
-        for (auto* element : tagged) {
-            remove_layout_id_attribute(element);
+        for (auto* node : nodes) {
+            if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+                continue;
+            }
+            set_layout_id_attribute(lxb_dom_interface_element(node), impl_->id_for(node), layout_id_restore);
         }
+
+        collect_layout_detach_nodes(
+            lxb_dom_interface_node(impl_->document),
+            omit_js_disabled_content,
+            detach_nodes);
+        detach_layout_nodes(detach_nodes, detached);
+
+        const auto status = lxb_html_serialize_tree_cb(
+            lxb_dom_interface_node(impl_->document),
+            append_serialized,
+            &html);
+        if (status != LXB_STATUS_OK) {
+            throw std::runtime_error("failed to serialize layout HTML document");
+        }
+    } catch (...) {
+        restore_detached_layout_nodes(detached);
+        restore_layout_id_attributes(layout_id_restore);
         throw;
     }
 
-    for (auto* element : tagged) {
-        remove_layout_id_attribute(element);
-    }
+    restore_detached_layout_nodes(detached);
+    restore_layout_id_attributes(layout_id_restore);
 
     return html;
 }

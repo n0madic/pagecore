@@ -76,7 +76,7 @@ struct ResourcePolicy {
     bool allow_file_from_network = false;
     std::size_t max_response_bytes = 10 * 1024 * 1024;
     std::chrono::milliseconds timeout{10000};
-    std::vector<std::string> allowed_schemes{"http", "https", "file"};
+    std::vector<std::string> allowed_schemes{"http", "https", "file", "data"};
     // Additional host names or literal IPs to reject (case-insensitive).
     std::vector<std::string> blocked_hosts{};
     // When non-empty, confine file:// reads to this directory (symlink escapes

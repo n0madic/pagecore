@@ -23,6 +23,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -214,6 +215,29 @@ std::string png_body(pagecore::Color color, int width = 2, int height = 2)
 
     const auto png = pagecore::encode_png_rgba(image);
     return std::string(reinterpret_cast<const char*>(png.data()), png.size());
+}
+
+std::string base64_encode(std::string_view bytes)
+{
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::string out;
+    out.reserve(((bytes.size() + 2) / 3) * 4);
+
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const std::uint32_t a = static_cast<unsigned char>(bytes[i]);
+        const std::uint32_t b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
+        const std::uint32_t c = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
+        const std::uint32_t chunk = (a << 16) | (b << 8) | c;
+
+        out.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
+        out.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
+        out.push_back(i + 1 < bytes.size() ? kAlphabet[(chunk >> 6) & 0x3f] : '=');
+        out.push_back(i + 2 < bytes.size() ? kAlphabet[chunk & 0x3f] : '=');
+    }
+
+    return out;
 }
 
 #if defined(PAGECORE_ENABLE_RENDERING)
@@ -2048,6 +2072,31 @@ void test_resource_url_resolution_normalizes_dot_segments()
         pagecore::resolve_url("https://example.test/app/page.html", "cdn.example.test/assets/pixel.png")
             == "https://cdn.example.test/assets/pixel.png",
         "host-like URL resolution should avoid treating the hostname as a relative path segment");
+    require(
+        pagecore::resolve_url("https://example.test/app/page.html", "data:image/svg+xml,%3Csvg%3E%3C/svg%3E")
+            == "data:image/svg+xml,%3Csvg%3E%3C/svg%3E",
+        "opaque data URLs should not be path-normalized");
+}
+
+void test_resource_loader_decodes_data_urls()
+{
+    pagecore::CurlResourceLoader curl_loader("pagecore-test");
+    const auto svg = curl_loader.load(pagecore::ResourceRequest{
+        "data:image/svg+xml,%3Csvg%3E%3C/svg%3E",
+        pagecore::ResourceKind::Image,
+    });
+    require(svg.status == 200, "data URL should load with a successful status");
+    require(svg.mime_type == "image/svg+xml", "data URL should expose the media type");
+    require(svg.body == "<svg></svg>", "data URL should percent-decode its payload");
+
+    pagecore::MemoryResourceLoader memory_loader;
+    const auto png = memory_loader.load(pagecore::ResourceRequest{
+        "data:image/png;base64,QUJDRA==",
+        pagecore::ResourceKind::Image,
+    });
+    require(png.status == 200, "memory loader should handle inline data URLs directly");
+    require(png.mime_type == "image/png", "base64 data URL should expose the image media type");
+    require(png.body == "ABCD", "base64 data URL should decode its payload");
 }
 
 void test_resource_policy_errors()
@@ -3777,6 +3826,66 @@ void test_page_render_decodes_and_draws_png_images()
     require(image_has_pixel(rendered, pagecore::Color{240, 20, 30, 255}), "Page::render should draw decoded PNG pixels");
 }
 
+void test_page_render_decodes_and_draws_data_url_images()
+{
+    const std::string data_url =
+        "data:image/png;base64," + base64_encode(png_body(pagecore::Color{24, 160, 220, 255}));
+
+    pagecore::Page page;
+    page.load_html(
+        "<html><body><img src=\"" + data_url + "\" style=\"width: 24px; height: 24px\"></body></html>",
+        "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_decoded_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_decoded_image = has_decoded_image
+                || (image->url == data_url && image->image && image->image->width == 2 && image->image->height == 2);
+        }
+    }
+    require(has_decoded_image, "display list should carry decoded data URL image pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_pixel(rendered, pagecore::Color{24, 160, 220, 255}),
+            "Page::render should draw decoded data URL image pixels");
+}
+
+void test_page_render_decodes_css_data_url_background_images()
+{
+    const std::string data_url =
+        "data:image/png;base64," + base64_encode(png_body(pagecore::Color{210, 32, 90, 255}));
+
+    pagecore::Page page;
+    page.load_html(
+        "<html><head><style>"
+        "#box { width: 24px; height: 24px; background-image: url("
+            + data_url
+            + "); background-size: 24px 24px; background-repeat: no-repeat; }"
+        "</style></head><body><div id=\"box\"></div></body></html>",
+        "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{80, 60, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_background_image = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* image = std::get_if<pagecore::ImageCommand>(&command)) {
+            has_background_image = has_background_image
+                || (image->url == data_url && image->image && image->image->width == 2 && image->image->height == 2);
+        }
+    }
+    require(has_background_image, "CSS background-image should decode data URL image pixels");
+
+    const auto rendered = page.render(options);
+    require(image_has_pixel(rendered, pagecore::Color{210, 32, 90, 255}),
+            "Page::render should draw CSS data URL background pixels");
+}
+
 void test_page_render_decodes_and_draws_jpeg_images()
 {
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -4104,6 +4213,23 @@ void test_page_render_hides_noscript_when_javascript_is_enabled()
     const auto scripting_disabled = scripting_disabled_page.render(options);
     require(pixel_matches(scripting_disabled, 5, 5, pagecore::Color{240, 20, 30, 255}),
             "noscript fallback should remain visible when JavaScript is disabled");
+}
+
+void test_layout_serialization_preserves_user_layout_id_attribute()
+{
+    pagecore::Page page;
+    page.load_html(
+        "<html><body><div id='x' data-pc-sid='author-value' style='width:10px;height:10px'></div></body></html>",
+        "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{60, 40, 1.0f};
+    (void) page.display_list(options);
+
+    const std::string html = page.serialize_html();
+    require(
+        html.find("data-pc-sid=\"author-value\"") != std::string::npos,
+        "layout serialization must restore an author-provided data-pc-sid attribute");
 }
 
 void test_visual_fixture_regression()
@@ -4554,6 +4680,7 @@ int main()
         test_non_javascript_script_types_are_not_executed();
         test_resource_request_kind_and_cache();
         test_resource_url_resolution_normalizes_dot_segments();
+        test_resource_loader_decodes_data_urls();
         test_resource_policy_errors();
         test_resource_policy_blocks_private_hosts();
         test_resource_scheme_not_allowed();
@@ -4614,6 +4741,8 @@ int main()
         test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();
         test_page_render_decodes_and_draws_png_images();
+        test_page_render_decodes_and_draws_data_url_images();
+        test_page_render_decodes_css_data_url_background_images();
         test_page_render_decodes_and_draws_jpeg_images();
         test_page_render_decodes_and_draws_webp_images();
         test_page_render_decodes_and_draws_gif_images();
@@ -4623,6 +4752,7 @@ int main()
         test_page_render_clips_background_to_border_radius();
         test_page_render_clips_background_image_to_border_radius();
         test_page_render_hides_noscript_when_javascript_is_enabled();
+        test_layout_serialization_preserves_user_layout_id_attribute();
         test_visual_fixture_regression();
         test_geometry_box_model_apis_reflect_real_layout();
         test_geometry_offset_top_left_relative_to_offset_parent();

@@ -74,7 +74,10 @@ public:
     // data-pc-sid="<NodeId>" attribute first, so a downstream HTML consumer
     // (e.g. a layout engine) can be queried back by NodeId. The attribute is
     // removed before this call returns and never bumps mutation_version().
-    std::string serialize_html_for_layout() const;
+    // When omit_js_disabled_content is true, the layout serialization also
+    // skips <noscript> subtrees and direct text children of <head>, matching the
+    // rendered DOM that JavaScript-enabled pages should expose to litehtml.
+    std::string serialize_html_for_layout(bool omit_js_disabled_content = false) const;
 
     NodeId append_child(NodeId parent, NodeId child);
     NodeId insert_before(NodeId parent, NodeId child, NodeId reference_child);

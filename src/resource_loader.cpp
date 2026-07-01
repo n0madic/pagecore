@@ -149,6 +149,11 @@ bool is_file_scheme(std::string_view scheme)
     return scheme == "file";
 }
 
+bool is_data_scheme(std::string_view scheme)
+{
+    return scheme == "data";
+}
+
 bool scheme_allowed(std::string_view scheme, const ResourcePolicy& policy)
 {
     return std::find(policy.allowed_schemes.begin(), policy.allowed_schemes.end(), scheme) != policy.allowed_schemes.end();
@@ -448,6 +453,230 @@ void enforce_response_policy(const ResourceRequest& request, const ResourceRespo
     if (policy.max_response_bytes > 0 && response.body.size() > policy.max_response_bytes) {
         throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
     }
+}
+
+int hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + ch - 'a';
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 10 + ch - 'A';
+    }
+    return -1;
+}
+
+void append_data_byte(std::string& out, char byte, const ResourceRequest& request, const ResourcePolicy& policy)
+{
+    if (policy.max_response_bytes > 0 && out.size() + 1 > policy.max_response_bytes) {
+        throw ResourceError(ResourceErrorCode::TooLarge, request.url, "data URL resource exceeds max response size");
+    }
+    out.push_back(byte);
+}
+
+std::string percent_decode_data_payload(
+    std::string_view input,
+    const ResourceRequest& request,
+    const ResourcePolicy& policy)
+{
+    std::string out;
+    out.reserve(input.size());
+
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        const char ch = input[i];
+        if (ch == '%') {
+            if (i + 2 >= input.size()) {
+                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL percent escape");
+            }
+            const int hi = hex_value(input[i + 1]);
+            const int lo = hex_value(input[i + 2]);
+            if (hi < 0 || lo < 0) {
+                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL percent escape");
+            }
+            append_data_byte(out, static_cast<char>((hi << 4) | lo), request, policy);
+            i += 2;
+            continue;
+        }
+        append_data_byte(out, ch, request, policy);
+    }
+
+    return out;
+}
+
+int base64_value(unsigned char ch)
+{
+    if (ch >= 'A' && ch <= 'Z') {
+        return ch - 'A';
+    }
+    if (ch >= 'a' && ch <= 'z') {
+        return 26 + ch - 'a';
+    }
+    if (ch >= '0' && ch <= '9') {
+        return 52 + ch - '0';
+    }
+    if (ch == '+') {
+        return 62;
+    }
+    if (ch == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+std::string base64_decode_data_payload(
+    std::string_view input,
+    const ResourceRequest& request,
+    const ResourcePolicy& policy)
+{
+    std::string out;
+    out.reserve((input.size() / 4) * 3);
+
+    std::array<int, 4> quartet{};
+    int quartet_size = 0;
+    int padding = 0;
+    bool finished = false;
+
+    const auto emit_quartet = [&] {
+        if (quartet[0] < 0 || quartet[1] < 0) {
+            throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
+        }
+
+        append_data_byte(out, static_cast<char>((quartet[0] << 2) | (quartet[1] >> 4)), request, policy);
+        if (quartet[2] >= 0) {
+            append_data_byte(
+                out,
+                static_cast<char>(((quartet[1] & 0x0f) << 4) | (quartet[2] >> 2)),
+                request,
+                policy);
+            if (quartet[3] >= 0) {
+                append_data_byte(
+                    out,
+                    static_cast<char>(((quartet[2] & 0x03) << 6) | quartet[3]),
+                    request,
+                    policy);
+            }
+        } else if (quartet[3] >= 0) {
+            throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 padding");
+        }
+
+        if (padding > 0) {
+            finished = true;
+        }
+        quartet_size = 0;
+        padding = 0;
+    };
+
+    for (unsigned char ch : input) {
+        if (std::isspace(ch)) {
+            continue;
+        }
+        if (finished) {
+            throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
+        }
+
+        if (ch == '=') {
+            if (quartet_size < 2 || padding >= 2) {
+                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 padding");
+            }
+            quartet[quartet_size++] = -1;
+            ++padding;
+        } else {
+            if (padding > 0) {
+                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 padding");
+            }
+            const int value = base64_value(ch);
+            if (value < 0) {
+                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
+            }
+            quartet[quartet_size++] = value;
+        }
+
+        if (quartet_size == 4) {
+            emit_quartet();
+        }
+    }
+
+    if (quartet_size == 0) {
+        return out;
+    }
+    if (padding > 0 || quartet_size == 1) {
+        throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
+    }
+
+    if (quartet_size == 2) {
+        append_data_byte(out, static_cast<char>((quartet[0] << 2) | (quartet[1] >> 4)), request, policy);
+    } else if (quartet_size == 3) {
+        append_data_byte(out, static_cast<char>((quartet[0] << 2) | (quartet[1] >> 4)), request, policy);
+        append_data_byte(
+            out,
+            static_cast<char>(((quartet[1] & 0x0f) << 4) | (quartet[2] >> 2)),
+            request,
+            policy);
+    }
+
+    return out;
+}
+
+ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePolicy& policy)
+{
+    const auto colon = request.url.find(':');
+    if (colon == std::string::npos) {
+        throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL");
+    }
+
+    const std::string_view data_url(request.url);
+    const std::string_view content = data_url.substr(colon + 1);
+    const auto comma = content.find(',');
+    if (comma == std::string_view::npos) {
+        throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL: missing comma");
+    }
+
+    const std::string_view metadata = content.substr(0, comma);
+    const std::string_view payload = content.substr(comma + 1);
+    const auto first_semicolon = metadata.find(';');
+
+    std::string mime_type = first_semicolon == std::string_view::npos
+        ? std::string(metadata)
+        : std::string(metadata.substr(0, first_semicolon));
+    if (mime_type.empty()) {
+        mime_type = "text/plain";
+    } else {
+        mime_type = to_lower(mime_type);
+    }
+
+    bool base64 = false;
+    std::size_t parameter_start = first_semicolon == std::string_view::npos
+        ? metadata.size()
+        : first_semicolon + 1;
+    while (parameter_start < metadata.size()) {
+        const auto parameter_end = metadata.find(';', parameter_start);
+        const std::string_view parameter = metadata.substr(
+            parameter_start,
+            parameter_end == std::string_view::npos ? std::string_view::npos : parameter_end - parameter_start);
+        if (to_lower(parameter) == "base64") {
+            base64 = true;
+        }
+        if (parameter_end == std::string_view::npos) {
+            break;
+        }
+        parameter_start = parameter_end + 1;
+    }
+
+    ResourceResponse response{
+        request.url,
+        base64
+            ? base64_decode_data_payload(payload, request, policy)
+            : percent_decode_data_payload(payload, request, policy),
+        200,
+        std::move(mime_type),
+        request.kind,
+        false,
+    };
+    enforce_response_policy(request, response, policy);
+    return response;
 }
 
 std::string extension_of(std::string_view url)
@@ -886,6 +1115,10 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     const std::string url_string(request.url);
     const std::string scheme = scheme_of(url_string);
 
+    if (is_data_scheme(scheme)) {
+        return load_data_url(request, policy_);
+    }
+
     if (!is_network_scheme(scheme)) {
         ResourceResponse response{
             url_string,
@@ -966,6 +1199,11 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
         try {
             enforce_request_policy(requests[i], policy_);
             const std::string scheme = scheme_of(requests[i].url);
+            if (is_data_scheme(scheme)) {
+                responses[i] = load_data_url(requests[i], policy_);
+                done[i] = true;
+                continue;
+            }
             if (!is_network_scheme(scheme)) {
                 ResourceResponse response{
                     requests[i].url,
@@ -1082,6 +1320,10 @@ void MemoryResourceLoader::add(std::string url, std::string body, std::string mi
 ResourceResponse MemoryResourceLoader::load(const ResourceRequest& request)
 {
     enforce_request_policy(request, policy_);
+
+    if (is_data_scheme(scheme_of(request.url))) {
+        return load_data_url(request, policy_);
+    }
 
     const std::string key(request.url);
     auto it = resources_.find(key);
@@ -1224,6 +1466,10 @@ std::string resolve_url(std::string_view base_url, std::string_view candidate)
     }
 
     if (has_url_scheme(candidate)) {
+        const std::string scheme = scheme_of(candidate);
+        if (!is_network_scheme(scheme) && !is_file_scheme(scheme)) {
+            return std::string(candidate);
+        }
         return normalize_url_path(std::string(candidate));
     }
 

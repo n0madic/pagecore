@@ -72,93 +72,6 @@ bool is_module_script_type(const std::optional<std::string>& type)
     return type && normalized_script_type(*type) == "module";
 }
 
-bool starts_with_at(std::string_view value, std::size_t offset, std::string_view prefix)
-{
-    return offset <= value.size()
-        && prefix.size() <= value.size() - offset
-        && value.substr(offset, prefix.size()) == prefix;
-}
-
-std::string remove_head_direct_text_nodes(std::string html)
-{
-    std::string lower(html);
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-
-    const std::size_t head_start = lower.find("<head");
-    if (head_start == std::string::npos) {
-        return html;
-    }
-    const std::size_t head_open_end = lower.find('>', head_start);
-    const std::size_t head_close = lower.find("</head", head_open_end == std::string::npos ? head_start : head_open_end);
-    if (head_open_end == std::string::npos || head_close == std::string::npos || head_open_end >= head_close) {
-        return html;
-    }
-
-    std::string out;
-    out.reserve(html.size());
-    out.append(html, 0, head_open_end + 1);
-
-    std::size_t pos = head_open_end + 1;
-    while (pos < head_close) {
-        if (html[pos] != '<') {
-            pos = html.find('<', pos);
-            if (pos == std::string::npos || pos > head_close) {
-                pos = head_close;
-            }
-            continue;
-        }
-
-        if (starts_with_at(lower, pos, "<!--")) {
-            const std::size_t comment_end = lower.find("-->", pos + 4);
-            const std::size_t end = comment_end == std::string::npos ? head_close : std::min(head_close, comment_end + 3);
-            out.append(html, pos, end - pos);
-            pos = end;
-            continue;
-        }
-
-        const std::size_t tag_end = lower.find('>', pos);
-        if (tag_end == std::string::npos || tag_end >= head_close) {
-            break;
-        }
-
-        out.append(html, pos, tag_end + 1 - pos);
-
-        std::size_t name_start = pos + 1;
-        if (name_start < tag_end && lower[name_start] == '/') {
-            pos = tag_end + 1;
-            continue;
-        }
-        while (name_start < tag_end && std::isspace(static_cast<unsigned char>(lower[name_start]))) {
-            ++name_start;
-        }
-        std::size_t name_end = name_start;
-        while (name_end < tag_end
-            && (std::isalnum(static_cast<unsigned char>(lower[name_end])) || lower[name_end] == '-')) {
-            ++name_end;
-        }
-
-        const std::string_view name(lower.data() + name_start, name_end - name_start);
-        if (name == "script" || name == "style" || name == "title") {
-            const std::string closing = "</" + std::string(name);
-            const std::size_t closing_start = lower.find(closing, tag_end + 1);
-            if (closing_start != std::string::npos && closing_start < head_close) {
-                const std::size_t closing_end = lower.find('>', closing_start);
-                const std::size_t end = closing_end == std::string::npos ? head_close : std::min(head_close, closing_end + 1);
-                out.append(html, tag_end + 1, end - (tag_end + 1));
-                pos = end;
-                continue;
-            }
-        }
-
-        pos = tag_end + 1;
-    }
-
-    out.append(html, head_close, std::string::npos);
-    return out;
-}
-
 // Identifies the inputs that fully determine a built styled document (the
 // litehtml document backing both the rendered DisplayList and
 // getComputedStyle()). If these match a previous build, the cached engine is
@@ -190,7 +103,7 @@ struct GeometryCacheEntry {
 // comments, quoted/unquoted targets, and multi-value declarations. `@import`
 // targets are returned as stylesheets; `src:` declarations (web fonts) are
 // skipped because the engine renders text with system fonts and never downloads
-// font files. Callers still resolve and filter (data:/blob:) the raw targets.
+// font files. Callers still resolve and filter the raw targets.
 std::vector<CssUrlRef> extract_css_urls(std::string_view css)
 {
     std::vector<CssUrlRef> out;
@@ -510,36 +423,7 @@ struct Page::Impl {
 
     std::string serialized_html_for_render() const
     {
-        std::string html = remove_head_direct_text_nodes(document.serialize_html_for_layout());
-
-        DomDocument render_document;
-        render_document.parse(html);
-        const NodeId root = render_document.document_node();
-
-        const NodeId head = render_document.head();
-        if (head != kInvalidNodeId) {
-            const auto children = render_document.child_nodes(head);
-            for (NodeId child : children) {
-                if (render_document.node_type(child) == 3) {
-                    render_document.remove_child(head, child);
-                }
-            }
-        }
-
-        if (options.enable_js) {
-            for (NodeId noscript : render_document.query_selector_all(root, "noscript")) {
-                if (!render_document.is_connected(noscript)) {
-                    continue;
-                }
-
-                const NodeId parent = render_document.parent_node(noscript);
-                if (parent != kInvalidNodeId) {
-                    render_document.remove_child(parent, noscript);
-                }
-            }
-        }
-
-        return render_document.serialize_html();
+        return document.serialize_html_for_layout(options.enable_js);
     }
 
     // The document's effective base URL for resolving sub-resources, honouring a
@@ -559,8 +443,9 @@ struct Page::Impl {
     }
 
     // Resolves a raw sub-resource reference against `resolve_base`, drops
-    // non-fetchable targets (data:/blob:/fragment), de-duplicates by kind+URL, and
-    // appends a request whose referrer matches the litehtml container's.
+    // targets that do not benefit from prefetching (data:/blob:/fragment),
+    // de-duplicates by kind+URL, and appends a request whose referrer matches
+    // the litehtml container's.
     void add_subresource(
         std::vector<ResourceRequest>& requests,
         std::unordered_set<std::string>& seen,
