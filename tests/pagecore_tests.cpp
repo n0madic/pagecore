@@ -4431,6 +4431,35 @@ void test_geometry_offset_parent_finds_nearest_positioned_ancestor()
         "offsetParent should walk to the nearest positioned ancestor, not just parentElement");
 }
 
+void test_geometry_offset_parent_cache_invalidates_after_style_mutation()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="outer" style="position:relative; width:300px; height:200px;">
+    <div id="wrapper">
+      <div id="target" style="position:absolute; top:7px; left:9px; width:20px; height:10px;"></div>
+    </div>
+  </div>
+  <script>
+    const outer = document.getElementById('outer');
+    const wrapper = document.getElementById('wrapper');
+    const target = document.getElementById('target');
+
+    const before = target.offsetParent === outer;
+    wrapper.setAttribute('style', 'position:relative;');
+    const after = target.offsetParent === wrapper && target.offsetTop === 7 && target.offsetLeft === 9;
+
+    document.body.setAttribute('data-offset-parent-cache-check', before && after ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-offset-parent-cache-check='ok']").has_value(),
+        "offsetParent cache should invalidate after a style mutation changes the positioned ancestor");
+}
+
 // window.innerWidth/innerHeight/devicePixelRatio (and screen.*) used to be
 // flat values fixed at install() time; they must now reflect whatever
 // viewport the page was most recently rendered with.
@@ -4827,6 +4856,7 @@ int main()
         test_geometry_box_model_apis_reflect_real_layout();
         test_geometry_offset_top_left_relative_to_offset_parent();
         test_geometry_offset_parent_finds_nearest_positioned_ancestor();
+        test_geometry_offset_parent_cache_invalidates_after_style_mutation();
         test_window_viewport_reflects_last_render_options();
         test_geometry_apis_return_zero_for_display_none();
         test_element_geometry_reuses_cached_layout();

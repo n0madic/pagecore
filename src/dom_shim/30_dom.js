@@ -1718,8 +1718,12 @@
           return list;
         }
 
+        function computedDisplayForVersion(element, version) {
+          return computedStylePropertyForVersion(element, 'display', version);
+        }
+
         function computedDisplay(element) {
-          return computedStyleFor(element).display;
+          return computedDisplayForVersion(element, bridge.mutationVersion());
         }
 
         function selectorTokens(selector) {
@@ -1896,15 +1900,24 @@
         // bridge and rebuilt the full ~30-property cascade every time, even
         // when nothing had changed since the last read.
         const computedStyleValuesCache = new WeakMap();
-        function computedStyleValuesFor(element) {
+        function computedStyleValuesForVersion(element, version) {
           if (!(element instanceof Element)) return Object.create(null);
-          const version = bridge.mutationVersion();
           let entry = computedStyleValuesCache.get(element);
           if (entry === undefined || entry.version !== version) {
             entry = { version, values: bridge.computedStyle(element.__id) };
             computedStyleValuesCache.set(element, entry);
           }
           return entry.values;
+        }
+
+        function computedStyleValuesFor(element) {
+          return computedStyleValuesForVersion(element, bridge.mutationVersion());
+        }
+
+        function computedStylePropertyForVersion(element, name, version) {
+          const property = cssPropertyName(name);
+          if (!property) return '';
+          return computedStyleValuesForVersion(element, version)[property] || '';
         }
 
         function computedStyleFor(element) {
@@ -1983,15 +1996,60 @@
         // traversalCache/liveChildNodeList. Returns null for elements that
         // don't participate in layout (display:none, or layout() hasn't run).
         const elementGeometryCache = new WeakMap();
-        function elementGeometry(element) {
+        function elementGeometryForVersion(element, version) {
           if (!(element instanceof Element)) return null;
-          const version = bridge.mutationVersion();
           let entry = elementGeometryCache.get(element);
           if (entry === undefined || entry.version !== version) {
             entry = { version, geometry: bridge.elementGeometry(element.__id) };
             elementGeometryCache.set(element, entry);
           }
           return entry.geometry;
+        }
+
+        function elementGeometry(element) {
+          return elementGeometryForVersion(element, bridge.mutationVersion());
+        }
+
+        const offsetParentCache = new WeakMap();
+        function resolveOffsetParent(element, version) {
+          if (!(element instanceof HTMLElement) || !isNodeWrapper(element)) return null;
+          if (!element.isConnected || element.hidden || computedDisplayForVersion(element, version) === 'none') return null;
+          for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+            const position = computedStylePropertyForVersion(ancestor, 'position', version);
+            if (position && position !== 'static') return ancestor;
+          }
+          const root = element.getRootNode ? element.getRootNode() : null;
+          return (root instanceof ShadowRoot ? root.host : null) || document.body || null;
+        }
+
+        function offsetParentFor(element, version = bridge.mutationVersion()) {
+          if (!(element instanceof HTMLElement)) return null;
+          let entry = offsetParentCache.get(element);
+          if (entry === undefined || entry.version !== version) {
+            entry = { version, parent: resolveOffsetParent(element, version) };
+            offsetParentCache.set(element, entry);
+          }
+          return entry.parent;
+        }
+
+        const offsetGeometryCache = new WeakMap();
+        function offsetGeometry(element) {
+          if (!(element instanceof Element)) {
+            return { geometry: null, parentGeometry: null };
+          }
+          const version = bridge.mutationVersion();
+          let entry = offsetGeometryCache.get(element);
+          if (entry === undefined || entry.version !== version) {
+            const geometry = elementGeometryForVersion(element, version);
+            const parent = geometry ? offsetParentFor(element, version) : null;
+            entry = {
+              version,
+              geometry,
+              parentGeometry: parent ? elementGeometryForVersion(parent, version) : null
+            };
+            offsetGeometryCache.set(element, entry);
+          }
+          return entry;
         }
 
         function getCookieString() {
@@ -2392,15 +2450,13 @@
             return geometry ? Math.round(geometry.borderHeight) : 0;
           }
           get offsetTop() {
-            const geometry = elementGeometry(this);
+            const { geometry, parentGeometry } = offsetGeometry(this);
             if (!geometry) return 0;
-            const parentGeometry = this.offsetParent ? elementGeometry(this.offsetParent) : null;
             return Math.round(geometry.borderY - (parentGeometry ? parentGeometry.borderY : 0));
           }
           get offsetLeft() {
-            const geometry = elementGeometry(this);
+            const { geometry, parentGeometry } = offsetGeometry(this);
             if (!geometry) return 0;
-            const parentGeometry = this.offsetParent ? elementGeometry(this.offsetParent) : null;
             return Math.round(geometry.borderX - (parentGeometry ? parentGeometry.borderX : 0));
           }
           get clientWidth() {
@@ -2435,14 +2491,7 @@
           get innerText() { return isNodeWrapper(this) ? this.textContent || '' : ''; }
           set innerText(value) { if (isNodeWrapper(this)) this.textContent = String(value ?? ''); }
           get offsetParent() {
-            if (!isNodeWrapper(this)) return null;
-            if (!this.isConnected || this.hidden || computedDisplay(this) === 'none') return null;
-            for (let ancestor = this.parentElement; ancestor; ancestor = ancestor.parentElement) {
-              const position = computedStyleFor(ancestor).position;
-              if (position && position !== 'static') return ancestor;
-            }
-            const root = this.getRootNode ? this.getRootNode() : null;
-            return (root instanceof ShadowRoot ? root.host : null) || document.body || null;
+            return offsetParentFor(this);
           }
         }
         class HTMLFormControlElement extends HTMLElement {
