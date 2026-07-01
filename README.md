@@ -17,7 +17,7 @@ Small modular web engine for headless automation, embedding, offscreen rendering
 - Performance note: replacing that render sub-resource discovery with one custom DOM traversal was measured and reverted. The attempted change removed the separate `base[href]`, `img[src]`, `link[rel=stylesheet][href]`, `[style]`, and `style` selector walks, but a 10k-node display-list benchmark showed no end-to-end win and a small regression (`2.60s`, `2.58s`, `2.56s` before vs. `2.64s`, `2.61s`, `2.63s` after; display-list output was byte-identical). Keep the selector-based discovery unless a replacement demonstrates both an isolated discovery-stage win and a full render-pipeline win.
 - `ResourcePolicy` is secure by default: `block_private_hosts` rejects loopback/private/link-local/cloud-metadata targets (enforced on literal-IP URLs and, via a connect-time socket callback, on the post-DNS address, closing DNS-rebinding and redirect-to-internal SSRF), `allow_file_from_network` is off so a network-origin document cannot read local files, and `file_root` optionally sandboxes `file://` reads (symlink/`..` escapes are rejected; only regular files within the size limit are served). The initial transfer and redirects are pinned to the allowed scheme set.
 - The DOM shim removes the raw native `__dom`/`__host` bridges from the page-visible global after install, so page script must go through the wrapper layer instead of the C++ API directly. `crypto.getRandomValues`/`randomUUID` are backed by the host OS CSPRNG, not `Math.random`.
-- `Page`, JS script loading, litehtml stylesheet imports, and image placeholders use the same resource pipeline.
+- `Page`, JS script loading, litehtml stylesheet imports, and image placeholders use the same resource pipeline. `LoadOptions::js_resource_load_policy` and JS resource budgets can optionally restrict only JS-initiated `fetch`/XHR/dynamic-script resource loads while leaving the top-level document and parser-discovered scripts unchanged.
 - Rendering is adapter-shaped. `include/pagecore/render.hpp` defines a backend-neutral `DisplayList` boundary between layout engines and raster backends.
 - `Page::display_list(RenderOptions)` serializes the JS-mutated Lexbor DOM, runs the configured layout engine, and returns backend-neutral commands. The result is memoized: repeated `display_list`/`render` calls reuse the cached list while the document layout mutation version, viewport, scale, base URL, and external-resource flag are unchanged (the cache is invalidated by layout-affecting DOM mutations, `load_html`, and `set_resource_loader`/`set_layout_engine_factory`, but not by service-only DOM mutations such as `data-*`/`aria-*` attributes unless current CSS contains matching attribute selectors). `Page::layout(RenderOptions)` still returns a freshly built engine for callers that need the engine itself.
 - `getComputedStyle()` is backed by the same litehtml engine that produces the rendered `DisplayList`, not a separate cascade: `Page::computed_style(NodeId)` lazily builds (or reuses) a litehtml document keyed on the same `(layout_mutation_version, viewport, base_url)` as the render cache, runs litehtml's cascade without a full layout pass (`compute_styles_only()`), and reads back computed values through typed `litehtml::css_properties` getters mapped to CSSOM strings (`LayoutEngine::computed_style`, `src/litehtml_layout.cpp`). Single-property JS reads use `Page::computed_style_property(NodeId, property)`/`LayoutEngine::computed_style_property()` and are cached by the lighter layout mutation version rather than by every DOM mutation; enumeration, `length`, `item()`, and `cssText` still materialize the full computed-style object. If repeated post-mutation single-property reads prove that styled-document rebuilds are expensive, this lazy-property path enters bounded mode: it stops forcing more litehtml rebuilds and returns an inline `style=""` value when present, then the last exact value for that node/property, then conservative CSS defaults for common probe properties. A first single-property read on a newly appended subtree in a large document can also preflight into that bounded path before paying the first litehtml rebuild. Full `Page::computed_style()` remains exact. Element identity across the JS/C++ boundary uses a transient `data-pc-sid="<NodeId>"` attribute injected only while building this document (`DomDocument::serialize_html_for_layout`); it never bumps `mutation_version` and never appears in the rendered output. The CSSOM model itself (`CSSStyleDeclaration`, `CSSStyleSheet`, `CSSStyleRule`, `el.style`, `insertRule`/`deleteRule`, `document.styleSheets`) is independent of this and unaffected.
@@ -211,15 +211,32 @@ instead of forcing another styled-document rebuild. A prefix of
 `preflight_append_child:` or `preflight_heavy_structural:` means the read was
 bounded before paying the first rebuild for a large, dynamically mutated
 document.
-`resource_load` events may include `url` and `property`; top-level document
-loads are emitted as `document_load`, initial parser-discovered external scripts
-as `initial_script_load_all` plus one `initial_script_response` per response,
-and JS-initiated `fetch`/XHR loads as `js_load_resource`.
+`resource_load` events may include `url`, `property`, and `reason`; top-level
+document loads are emitted as `document_load`, initial parser-discovered
+external scripts as `initial_script_load_all` plus one
+`initial_script_response` per response, JS-initiated `fetch`/XHR/dynamic script
+loads as `js_load_resource`, and policy- or budget-rejected JS loads as
+`js_load_resource_blocked`.
+Use `tools/perf_trace_summary.js /tmp/pagecore-trace.jsonl` to print phase
+totals, resource-load groups, and the slowest resource events.
 
 `LoadOptions::wait_time` controls timer draining after scripts and lifecycle
 events. A zero wait budget (`pagecore_cli --wait-ms 0`) still runs synchronous
 scripts and microtasks, but leaves `setTimeout`/`setInterval` callbacks pending
 instead of executing zero-delay timers during load.
+`LoadOptions::js_resource_load_policy` controls only JS-initiated resource
+loads during script execution and idle draining. The CLI exposes it as
+`--js-resource-policy allow|same-origin|none`: `allow` preserves the default
+behavior, `same-origin` rejects cross-origin `fetch`/XHR/dynamic script loads,
+and `none` rejects all such JS-initiated loads. Top-level document loading and
+parser-discovered external scripts are unaffected.
+The same JS-initiated loads can also be capped with
+`max_js_resource_loads`, `max_js_resource_bytes`, and
+`max_js_resource_time` (`--max-js-resource-loads`,
+`--max-js-resource-bytes`, `--max-js-resource-time-ms`). These limits are
+checked before each JS-initiated load; counts and elapsed time are accumulated
+for actual loader calls, and bytes are accumulated from successful response
+bodies.
 
 ## Embedding
 

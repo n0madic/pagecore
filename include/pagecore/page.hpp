@@ -13,11 +13,21 @@
 
 namespace pagecore {
 
+enum class JsResourceLoadPolicy {
+    Allow,
+    SameOriginOnly,
+    BlockAll,
+};
+
 struct LoadOptions {
     bool enable_js = true;
     std::chrono::milliseconds wait_time{15000};
     std::chrono::milliseconds js_timeout{30000};
     std::size_t js_memory_limit_bytes = 256 * 1024 * 1024;
+    JsResourceLoadPolicy js_resource_load_policy = JsResourceLoadPolicy::Allow;
+    std::optional<std::size_t> max_js_resource_loads;
+    std::optional<std::size_t> max_js_resource_bytes;
+    std::optional<std::chrono::milliseconds> max_js_resource_time;
     std::string user_agent = "PageCore/0.1";
     std::string base_url;
     std::function<void(std::string_view severity, std::string_view message)> console_log;

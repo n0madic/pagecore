@@ -90,6 +90,9 @@ private:
     ElementGeometryResolver element_geometry_resolver_;
     ViewportResolver viewport_resolver_;
     std::unordered_map<std::string, DomBridgePerfAggregate> dom_bridge_perf_;
+    std::size_t js_resource_load_count_ = 0;
+    std::size_t js_resource_load_bytes_ = 0;
+    long long js_resource_load_elapsed_us_ = 0;
     std::chrono::steady_clock::time_point deadline_{};
     bool deadline_active_ = false;
 
@@ -101,6 +104,8 @@ private:
     void drain_jobs();
     void check_exception(JSValue value, std::string_view source_name = {});
     void emit_script_perf(std::string_view name, std::chrono::steady_clock::time_point start, std::uint64_t count);
+    std::optional<std::string> js_resource_budget_block_reason() const;
+    void record_js_resource_load(long long elapsed_us, std::size_t bytes);
 };
 
 } // namespace pagecore

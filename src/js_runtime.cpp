@@ -9,6 +9,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -251,6 +252,110 @@ long long elapsed_us_since(std::chrono::steady_clock::time_point start)
 {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start).count();
+}
+
+std::string lower_ascii(std::string_view value)
+{
+    std::string out(value);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return out;
+}
+
+std::string network_origin(std::string_view url)
+{
+    const auto scheme_pos = url.find("://");
+    if (scheme_pos == std::string_view::npos) {
+        return {};
+    }
+
+    std::string scheme = lower_ascii(url.substr(0, scheme_pos));
+    if (scheme != "http" && scheme != "https") {
+        return {};
+    }
+
+    std::string_view authority = url.substr(scheme_pos + 3);
+    const auto authority_end = authority.find_first_of("/?#");
+    if (authority_end != std::string_view::npos) {
+        authority = authority.substr(0, authority_end);
+    }
+    const auto at = authority.find_last_of('@');
+    if (at != std::string_view::npos) {
+        authority = authority.substr(at + 1);
+    }
+
+    std::string host;
+    std::string port;
+    if (!authority.empty() && authority.front() == '[') {
+        const auto close = authority.find(']');
+        host = lower_ascii(close == std::string_view::npos ? authority.substr(1) : authority.substr(1, close - 1));
+        if (close != std::string_view::npos && close + 1 < authority.size() && authority[close + 1] == ':') {
+            port = std::string(authority.substr(close + 2));
+        }
+    } else {
+        const auto colon = authority.find(':');
+        host = lower_ascii(colon == std::string_view::npos ? authority : authority.substr(0, colon));
+        if (colon != std::string_view::npos) {
+            port = std::string(authority.substr(colon + 1));
+        }
+    }
+
+    if (host.empty()) {
+        return {};
+    }
+    if ((scheme == "http" && port == "80") || (scheme == "https" && port == "443")) {
+        port.clear();
+    }
+
+    std::string origin = scheme + "://" + host;
+    if (!port.empty()) {
+        origin += ":" + port;
+    }
+    return origin;
+}
+
+bool js_resource_load_blocked(
+    JsResourceLoadPolicy policy,
+    std::string_view base_url,
+    std::string_view request_url)
+{
+    switch (policy) {
+    case JsResourceLoadPolicy::Allow:
+        return false;
+    case JsResourceLoadPolicy::BlockAll:
+        return true;
+    case JsResourceLoadPolicy::SameOriginOnly: {
+        const std::string base_origin = network_origin(base_url);
+        const std::string request_origin = network_origin(request_url);
+        return !base_origin.empty() && !request_origin.empty() && base_origin != request_origin;
+    }
+    }
+    return false;
+}
+
+std::string js_resource_policy_name(JsResourceLoadPolicy policy)
+{
+    switch (policy) {
+    case JsResourceLoadPolicy::Allow:
+        return "allow";
+    case JsResourceLoadPolicy::SameOriginOnly:
+        return "same-origin";
+    case JsResourceLoadPolicy::BlockAll:
+        return "none";
+    }
+    return "unknown";
+}
+
+PerfEvent js_resource_blocked_event(
+    const ResourceRequest& request,
+    std::string reason)
+{
+    PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource_blocked", 0, 0};
+    event.property = resource_kind_name(request.kind);
+    event.url = request.url;
+    event.reason = std::move(reason);
+    return event;
 }
 
 template <typename Func>
@@ -1394,6 +1499,31 @@ void JsRuntime::emit_script_perf(
     emit_perf_trace(options_.perf_trace, PerfPhase::Script, name, elapsed_us_since(start), count);
 }
 
+std::optional<std::string> JsRuntime::js_resource_budget_block_reason() const
+{
+    if (options_.max_js_resource_loads && js_resource_load_count_ >= *options_.max_js_resource_loads) {
+        return "budget:max_js_resource_loads";
+    }
+    if (options_.max_js_resource_bytes && js_resource_load_bytes_ >= *options_.max_js_resource_bytes) {
+        return "budget:max_js_resource_bytes";
+    }
+    if (options_.max_js_resource_time) {
+        const auto max_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            *options_.max_js_resource_time).count();
+        if (js_resource_load_elapsed_us_ >= max_us) {
+            return "budget:max_js_resource_time_ms";
+        }
+    }
+    return std::nullopt;
+}
+
+void JsRuntime::record_js_resource_load(long long elapsed_us, std::size_t bytes)
+{
+    ++js_resource_load_count_;
+    js_resource_load_bytes_ += bytes;
+    js_resource_load_elapsed_us_ += std::max<long long>(0, elapsed_us);
+}
+
 ResourceResponse JsRuntime::load_resource(
     std::string_view url,
     std::string_view kind,
@@ -1415,16 +1545,37 @@ ResourceResponse JsRuntime::load_resource(
         std::move(headers),
     };
 
+    if (js_resource_load_blocked(options_.js_resource_load_policy, base, request.url)) {
+        emit_perf_trace(
+            options_.perf_trace,
+            js_resource_blocked_event(request, "policy:" + js_resource_policy_name(options_.js_resource_load_policy)));
+        throw ResourceError(
+            ResourceErrorCode::NetworkDisabled,
+            request.url,
+            "JS resource load blocked by policy: " + js_resource_policy_name(options_.js_resource_load_policy));
+    }
+    if (auto budget_reason = js_resource_budget_block_reason()) {
+        emit_perf_trace(options_.perf_trace, js_resource_blocked_event(request, *budget_reason));
+        throw ResourceError(
+            ResourceErrorCode::NetworkDisabled,
+            request.url,
+            "JS resource load blocked by budget: " + *budget_reason);
+    }
+
     const auto perf_start = std::chrono::steady_clock::now();
     try {
         auto response = loader_->load(request);
-        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us_since(perf_start), response.body.size()};
+        const long long elapsed_us = elapsed_us_since(perf_start);
+        record_js_resource_load(elapsed_us, response.body.size());
+        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, response.body.size()};
         event.property = resource_kind_name(request.kind);
         event.url = request.url;
         emit_perf_trace(options_.perf_trace, std::move(event));
         return response;
     } catch (...) {
-        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us_since(perf_start), 0};
+        const long long elapsed_us = elapsed_us_since(perf_start);
+        record_js_resource_load(elapsed_us, 0);
+        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, 0};
         event.property = resource_kind_name(request.kind);
         event.url = request.url;
         emit_perf_trace(options_.perf_trace, std::move(event));

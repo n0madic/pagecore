@@ -55,6 +55,10 @@ void usage(const char* argv0)
         << "  --full-page              expand the viewport height to the full page content height before rendering\n"
         << "  --scale NUMBER           render scale factor, default 1\n"
         << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 15000\n"
+        << "  --js-resource-policy MODE allow, same-origin, or none for JS-initiated fetch/XHR/dynamic scripts; default allow\n"
+        << "  --max-js-resource-loads NUMBER stop JS-initiated resource loads after this many actual loads\n"
+        << "  --max-js-resource-bytes NUMBER stop JS-initiated resource loads after this many response bytes\n"
+        << "  --max-js-resource-time-ms NUMBER stop JS-initiated resource loads after this much cumulative load time\n"
         << "  --js-timeout-ms NUMBER   per-script execution deadline, default 30000\n"
         << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n"
         << "  --perf-trace PATH|-      write perf trace JSONL; '-' writes to stderr\n";
@@ -135,6 +139,20 @@ OutputFormat parse_output_format(const std::string& value)
         return OutputFormat::Pdf;
     }
     throw std::runtime_error("format must be one of: html, png, pdf");
+}
+
+pagecore::JsResourceLoadPolicy parse_js_resource_policy(const std::string& value)
+{
+    if (value == "allow") {
+        return pagecore::JsResourceLoadPolicy::Allow;
+    }
+    if (value == "same-origin") {
+        return pagecore::JsResourceLoadPolicy::SameOriginOnly;
+    }
+    if (value == "none") {
+        return pagecore::JsResourceLoadPolicy::BlockAll;
+    }
+    throw std::runtime_error("js-resource-policy must be one of: allow, same-origin, none");
 }
 
 const char* output_format_name(OutputFormat format)
@@ -234,6 +252,10 @@ void write_perf_event_jsonl(std::ostream& out, const pagecore::PerfEvent& event)
         out << ",\"url\":";
         write_json_string(out, event.url);
     }
+    if (!event.reason.empty()) {
+        out << ",\"reason\":";
+        write_json_string(out, event.reason);
+    }
     out << "}\n";
 }
 
@@ -282,6 +304,17 @@ int main(int argc, char** argv)
             }
             else if (arg == "--scale") render_options.viewport.device_scale_factor = parse_positive_float(next(), "scale");
             else if (arg == "--wait-ms") load_options.wait_time = std::chrono::milliseconds(parse_nonnegative_int(next(), "wait-ms"));
+            else if (arg == "--js-resource-policy") load_options.js_resource_load_policy = parse_js_resource_policy(next());
+            else if (arg == "--max-js-resource-loads") {
+                load_options.max_js_resource_loads = static_cast<std::size_t>(parse_nonnegative_int(next(), "max-js-resource-loads"));
+            }
+            else if (arg == "--max-js-resource-bytes") {
+                load_options.max_js_resource_bytes = static_cast<std::size_t>(parse_nonnegative_int(next(), "max-js-resource-bytes"));
+            }
+            else if (arg == "--max-js-resource-time-ms") {
+                load_options.max_js_resource_time =
+                    std::chrono::milliseconds(parse_nonnegative_int(next(), "max-js-resource-time-ms"));
+            }
             else if (arg == "--js-timeout-ms") load_options.js_timeout = std::chrono::milliseconds(parse_positive_int(next(), "js-timeout-ms"));
             else if (arg == "--js-memory-mb") {
                 load_options.js_memory_limit_bytes = static_cast<std::size_t>(parse_positive_int(next(), "js-memory-mb")) * 1024 * 1024;

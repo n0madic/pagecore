@@ -36,6 +36,7 @@ struct PerfEvent {
     std::string layout_mutation_reason;
     std::string property;
     std::string url;
+    std::string reason;
 };
 
 using PerfTraceCallback = std::function<void(const PerfEvent&)>;

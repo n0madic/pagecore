@@ -2101,6 +2101,215 @@ void test_xhr_and_fetch_load_through_resource_loader()
             "fetch should pass request headers to ResourceLoader");
 }
 
+void test_js_resource_policy_block_all_keeps_parser_scripts()
+{
+    pagecore::LoadOptions options;
+    options.wait_time = std::chrono::milliseconds(5);
+    options.js_resource_load_policy = pagecore::JsResourceLoadPolicy::BlockAll;
+
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/boot.js",
+        R"JS(
+document.body.setAttribute('data-parser-script', 'ran');
+
+fetch('/api.json').then(
+  () => document.body.setAttribute('data-fetch', 'loaded'),
+  () => document.body.setAttribute('data-fetch', 'blocked')
+);
+
+const xhr = new XMLHttpRequest();
+xhr.open('GET', '/xhr.json');
+xhr.onload = () => document.body.setAttribute('data-xhr', 'loaded');
+xhr.onerror = () => document.body.setAttribute('data-xhr', 'blocked');
+xhr.send();
+
+const script = document.createElement('script');
+script.src = '/dynamic.js';
+script.onload = () => document.body.setAttribute('data-dynamic-script', 'loaded');
+script.onerror = () => document.body.setAttribute('data-dynamic-script', 'blocked');
+document.body.appendChild(script);
+)JS",
+        "text/javascript");
+    loader->add("https://example.test/api.json", "{}", "application/json");
+    loader->add("https://example.test/xhr.json", "{}", "application/json");
+    loader->add(
+        "https://example.test/dynamic.js",
+        "document.body.setAttribute('data-dynamic-script', 'loaded');",
+        "text/javascript");
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html(
+        "<html><body><script src='/boot.js'></script></body></html>",
+        "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-parser-script='ran']").has_value(),
+        "parser-discovered scripts should still load when JS resource loads are blocked");
+    require(page.outer_html("body[data-fetch='blocked']").has_value(), "fetch should reject when policy blocks JS loads");
+    require(page.outer_html("body[data-xhr='blocked']").has_value(), "XHR should fire error when policy blocks JS loads");
+    require(
+        page.outer_html("body[data-dynamic-script='blocked']").has_value(),
+        "dynamic external scripts should dispatch error when policy blocks JS loads");
+    require(
+        find_request(*loader, "https://example.test/boot.js") != nullptr,
+        "parser script should reach the resource loader");
+    require(
+        find_request(*loader, "https://example.test/api.json") == nullptr
+            && find_request(*loader, "https://example.test/xhr.json") == nullptr
+            && find_request(*loader, "https://example.test/dynamic.js") == nullptr,
+        "blocked JS-initiated loads should not reach the resource loader");
+}
+
+void test_js_resource_policy_same_origin_blocks_cross_origin_loads()
+{
+    pagecore::LoadOptions options;
+    options.wait_time = std::chrono::milliseconds(5);
+    options.js_resource_load_policy = pagecore::JsResourceLoadPolicy::SameOriginOnly;
+
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/boot.js",
+        R"JS(
+fetch('/same.json').then(
+  () => document.body.setAttribute('data-same-origin', 'loaded'),
+  () => document.body.setAttribute('data-same-origin', 'blocked')
+);
+fetch('https://cdn.test/third.json').then(
+  () => document.body.setAttribute('data-cross-origin', 'loaded'),
+  () => document.body.setAttribute('data-cross-origin', 'blocked')
+);
+)JS",
+        "text/javascript");
+    loader->add("https://example.test/same.json", "{}", "application/json");
+    loader->add("https://cdn.test/third.json", "{}", "application/json");
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html(
+        "<html><body><script src='/boot.js'></script></body></html>",
+        "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-same-origin='loaded']").has_value(),
+        "same-origin JS resource loads should be allowed");
+    require(
+        page.outer_html("body[data-cross-origin='blocked']").has_value(),
+        "cross-origin JS resource loads should be blocked");
+    require(
+        find_request(*loader, "https://example.test/same.json") != nullptr,
+        "same-origin JS resource load should reach the resource loader");
+    require(
+        find_request(*loader, "https://cdn.test/third.json") == nullptr,
+        "cross-origin JS resource load should not reach the resource loader");
+}
+
+void test_js_resource_budgets_limit_count_bytes_and_time()
+{
+    {
+        pagecore::LoadOptions options;
+        options.max_js_resource_loads = 1;
+
+        auto loader = std::make_shared<RecordingResourceLoader>();
+        loader->add("https://example.test/a.json", "A", "application/json");
+        loader->add("https://example.test/b.json", "B", "application/json");
+
+        pagecore::Page page(options);
+        page.set_resource_loader(loader);
+        page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('/a.json').then(
+      () => document.body.setAttribute('data-a', 'loaded'),
+      () => document.body.setAttribute('data-a', 'blocked')
+    );
+    fetch('/b.json').then(
+      () => document.body.setAttribute('data-b', 'loaded'),
+      () => document.body.setAttribute('data-b', 'blocked')
+    );
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+        require(page.outer_html("body[data-a='loaded'][data-b='blocked']").has_value(),
+                "max_js_resource_loads should allow the first JS load and block the second");
+        require(find_request(*loader, "https://example.test/a.json") != nullptr,
+                "first JS resource load should reach the loader");
+        require(find_request(*loader, "https://example.test/b.json") == nullptr,
+                "JS resource loads blocked by count budget should not reach the loader");
+    }
+
+    {
+        pagecore::LoadOptions options;
+        options.max_js_resource_bytes = 2;
+
+        auto loader = std::make_shared<RecordingResourceLoader>();
+        loader->add("https://example.test/a.json", "OK", "application/json");
+        loader->add("https://example.test/b.json", "B", "application/json");
+
+        pagecore::Page page(options);
+        page.set_resource_loader(loader);
+        page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('/a.json').then(
+      () => document.body.setAttribute('data-a', 'loaded'),
+      () => document.body.setAttribute('data-a', 'blocked')
+    );
+    fetch('/b.json').then(
+      () => document.body.setAttribute('data-b', 'loaded'),
+      () => document.body.setAttribute('data-b', 'blocked')
+    );
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+        require(page.outer_html("body[data-a='loaded'][data-b='blocked']").has_value(),
+                "max_js_resource_bytes should block later JS loads after the byte budget is spent");
+        require(find_request(*loader, "https://example.test/a.json") != nullptr,
+                "first JS resource load should reach the loader before byte budget is spent");
+        require(find_request(*loader, "https://example.test/b.json") == nullptr,
+                "JS resource loads blocked by byte budget should not reach the loader");
+    }
+
+    {
+        std::vector<pagecore::PerfEvent> events;
+        pagecore::LoadOptions options;
+        options.max_js_resource_time = std::chrono::milliseconds(0);
+        options.perf_trace = [&](const pagecore::PerfEvent& event) {
+            events.push_back(event);
+        };
+
+        auto loader = std::make_shared<RecordingResourceLoader>();
+        loader->add("https://example.test/a.json", "A", "application/json");
+
+        pagecore::Page page(options);
+        page.set_resource_loader(loader);
+        page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('/a.json').then(
+      () => document.body.setAttribute('data-a', 'loaded'),
+      () => document.body.setAttribute('data-a', 'blocked')
+    );
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+        require(page.outer_html("body[data-a='blocked']").has_value(),
+                "max_js_resource_time=0 should block JS loads before they start");
+        require(find_request(*loader, "https://example.test/a.json") == nullptr,
+                "JS resource loads blocked by time budget should not reach the loader");
+        const auto blocked = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+            return event.phase == pagecore::PerfPhase::ResourceLoad
+                && event.name == "js_load_resource_blocked"
+                && event.reason == "budget:max_js_resource_time_ms";
+        });
+        require(blocked != events.end(), "budget-blocked JS resource loads should report a trace reason");
+    }
+}
+
 void test_xhr_event_handler_exceptions_are_reported()
 {
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -5599,6 +5808,9 @@ int main()
         test_target_pseudo_class_selector_fallback();
         test_request_response_fetch_object_shims();
         test_xhr_and_fetch_load_through_resource_loader();
+        test_js_resource_policy_block_all_keeps_parser_scripts();
+        test_js_resource_policy_same_origin_blocks_cross_origin_loads();
+        test_js_resource_budgets_limit_count_bytes_and_time();
         test_xhr_event_handler_exceptions_are_reported();
         test_non_javascript_script_types_are_not_executed();
         test_dynamic_script_insertion_executes_classic_scripts();
