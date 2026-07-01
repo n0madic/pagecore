@@ -1018,13 +1018,6 @@
           return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10, 16).join('')}`;
         }
 
-        function observerStub() {
-          this.observe = function() {};
-          this.unobserve = function() {};
-          this.disconnect = function() {};
-          this.takeRecords = function() { return []; };
-        }
-
         function installWptHook() {
           if (global.__pagecore_wpt_installed) return;
           global.__pagecore_wpt_installed = true;
@@ -1191,7 +1184,6 @@
         makeMediaQueryList,
         getRandomValues,
         randomUUID,
-        observerStub,
         installWptHook,
         setTimeoutShim,
         clearTimer,

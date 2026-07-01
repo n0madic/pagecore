@@ -15,8 +15,7 @@
     name: 'compat',
     deps: ['events', 'dom'],
     install(ctx, api) {
-      const { global } = ctx;
-      const { DOMException, EventTarget } = api.events;
+      const { DOMException } = api.events;
       const { document } = api.dom;
 
       const nativeBase64Encode = ctx.host && typeof ctx.host.base64Encode === 'function'
@@ -144,47 +143,6 @@
         return option;
       }
 
-      function unsupportedWorkerError(kind) {
-        return new DOMException(`${kind} are not supported by this PageCore runtime.`, 'NotSupportedError');
-      }
-
-      class Worker extends EventTarget {
-        constructor() {
-          super();
-          throw unsupportedWorkerError('Dedicated workers');
-        }
-      }
-
-      class SharedWorker extends EventTarget {
-        constructor() {
-          super();
-          throw unsupportedWorkerError('Shared workers');
-        }
-      }
-
-      class ServiceWorkerContainer extends EventTarget {
-        constructor() {
-          super();
-          this.controller = null;
-        }
-
-        get ready() {
-          return Promise.reject(unsupportedWorkerError('Service workers'));
-        }
-
-        register() {
-          return Promise.reject(unsupportedWorkerError('Service workers'));
-        }
-
-        getRegistration() {
-          return Promise.resolve(undefined);
-        }
-
-        getRegistrations() {
-          return Promise.resolve([]);
-        }
-      }
-
       function createIntlFallback(existing = undefined) {
         const intl = existing || {};
 
@@ -283,16 +241,12 @@
         return intl;
       }
 
-      void global;
       return {
         CSS,
         btoa,
         atob,
         Audio,
         Option,
-        Worker,
-        SharedWorker,
-        ServiceWorkerContainer,
         createIntlFallback
       };
     }

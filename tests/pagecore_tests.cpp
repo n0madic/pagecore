@@ -806,6 +806,12 @@ void test_browser_like_web_api_shims()
       checks.push(localStorage.getItem('k') === 'v');
       checks.push(sessionStorage.length === 1);
       checks.push(matchMedia('(min-width: 1px)').media === '(min-width: 1px)');
+      checks.push(!('Worker' in window));
+      checks.push(!('SharedWorker' in window));
+      checks.push(!('serviceWorker' in navigator));
+      checks.push(!('IntersectionObserver' in window));
+      checks.push(!('ResizeObserver' in window));
+      checks.push(!('PerformanceObserver' in window));
 
       document.title = 'Shim Title';
       checks.push(document.title === 'Shim Title');

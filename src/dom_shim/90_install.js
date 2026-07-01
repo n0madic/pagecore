@@ -166,7 +166,6 @@
         makeMediaQueryList,
         getRandomValues,
         randomUUID,
-        observerStub,
         installWptHook,
         setTimeoutShim,
         clearTimer,
@@ -200,9 +199,6 @@
         atob,
         Audio,
         Option,
-        Worker,
-        SharedWorker,
-        ServiceWorkerContainer,
         createIntlFallback
       } = api.compat;
 
@@ -372,8 +368,7 @@
           javaEnabled: () => false,
           mediaDevices: {
             getSupportedConstraints: () => ({})
-          },
-          serviceWorker: new ServiceWorkerContainer()
+          }
         };
         global.Intl = createIntlFallback(global.Intl);
         global.location = locationFromURL(host.baseURL || '');
@@ -437,8 +432,6 @@
         global.scroll = () => {};
         global.open = () => null;
         global.close = () => {};
-        global.Worker = Worker;
-        global.SharedWorker = SharedWorker;
         global.postMessage = (message) => {
           global.dispatchEvent(new MessageEvent('message', { data: message, origin: global.location.origin, source: global }));
         };
@@ -474,9 +467,6 @@
         global.cancelIdleCallback = clearTimer;
         global.getComputedStyle = (element) => computedStyleFor(element);
         global.matchMedia = makeMediaQueryList;
-        global.IntersectionObserver = observerStub;
-        global.ResizeObserver = observerStub;
-        global.PerformanceObserver = observerStub;
         global.performance = {
           now: performanceNow,
           timeOrigin: Date.now(),

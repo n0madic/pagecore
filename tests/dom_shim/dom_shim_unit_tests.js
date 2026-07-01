@@ -580,7 +580,7 @@ test('forms FormData collects successful controls in document order', () => {
   assert.deepStrictEqual(data.getAll('title'), ['updated', 'again']);
 });
 
-test('compat installs browser utilities without silent worker support', async () => {
+test('compat installs browser utilities', async () => {
   const { compat } = installDomEnvironment();
 
   assert.strictEqual(compat.btoa('abc'), 'YWJj');
@@ -603,13 +603,9 @@ test('compat installs browser utilities without silent worker support', async ()
   assert.strictEqual(option.localName, 'option');
   assert.strictEqual(option.value, 'value');
   assert.strictEqual(option.selected, true);
-  assert.throws(() => new compat.Worker('/worker.js'), /NotSupportedError/);
 
   const intl = compat.createIntlFallback({});
   assert.strictEqual(new intl.PluralRules().select(2), 'other');
-  await assert.rejects(
-    () => new compat.ServiceWorkerContainer().register('/sw.js'),
-    /NotSupportedError/);
 });
 
 test('streams support default read/write flows and reject BYOB mode explicitly', async () => {
