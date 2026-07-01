@@ -22,6 +22,7 @@ struct DomDocument::Impl {
     mutable std::unordered_map<NodeId, lxb_dom_node_t*> id_to_node;
     mutable NodeId next_id = 1;
     std::uint64_t mutation_version = 1;
+    std::uint64_t layout_mutation_version = 1;
     // Bumped only when a tracked node id is invalidated (forgotten) or the
     // document is reparsed — i.e. exactly when a JS wrapper may become stale.
     // Lets the wrapper layer skip its O(N) prune scan on ordinary mutations
@@ -47,7 +48,7 @@ struct DomDocument::Impl {
     static void clear_user_data_subtree(lxb_dom_node_t* node);
     bool has_node(NodeId id) const;
     void forget_node(lxb_dom_node_t* node);
-    void mark_mutated();
+    void mark_mutated(bool affects_layout = true);
 
     lxb_css_selector_list_t* compiled_selector(std::string_view selector);
     std::vector<NodeId> run_selector(lxb_dom_node_t* root, std::string_view selector, bool first_only);

@@ -9,6 +9,7 @@
 #include <lexbor/html/interfaces/element.h>
 #include <lexbor/html/serialize.h>
 
+#include <cctype>
 #include <stdexcept>
 #include <utility>
 
@@ -59,6 +60,41 @@ std::string character_data(lxb_dom_node_t* node)
 
     auto* data = lxb_dom_interface_character_data(node);
     return to_string(data->data.data, data->data.length);
+}
+
+std::string ascii_lower(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        out.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return out;
+}
+
+bool starts_with(std::string_view value, std::string_view prefix)
+{
+    return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
+}
+
+bool attribute_affects_layout(std::string_view name)
+{
+    const std::string lower = ascii_lower(name);
+
+    // Service metadata is commonly churned by JS frameworks and analytics. We
+    // intentionally keep it out of the layout cache key; CSS that explicitly
+    // depends on these attributes will need selector-aware invalidation later.
+    if (starts_with(lower, "data-")
+        || starts_with(lower, "aria-")
+        || lower == "role"
+        || starts_with(lower, "on")) {
+        return false;
+    }
+
+    // Unknown non-service attributes are conservatively layout-affecting:
+    // selectors may match [attr], and resource/layout semantics often live in
+    // ordinary attributes such as href, src, width, height, hidden, or media.
+    return true;
 }
 
 // Iterative pre-order traversal — recursion here would overflow the native
@@ -436,9 +472,12 @@ void DomDocument::Impl::forget_node(lxb_dom_node_t* node)
     ++forget_version;
 }
 
-void DomDocument::Impl::mark_mutated()
+void DomDocument::Impl::mark_mutated(bool affects_layout)
 {
     ++mutation_version;
+    if (affects_layout) {
+        ++layout_mutation_version;
+    }
 }
 
 void DomDocument::Impl::clear_user_data_subtree(lxb_dom_node_t* node)
@@ -495,10 +534,12 @@ void DomDocument::parse(std::string_view html)
     // forget version bumps so the wrapper layer prunes ids from the old document.
     NodeId carried_next_id = 1;
     std::uint64_t carried_mutation_version = 1;
+    std::uint64_t carried_layout_mutation_version = 1;
     std::uint64_t carried_forget_version = 1;
     if (impl_ != nullptr) {
         carried_next_id = impl_->next_id;
         carried_mutation_version = impl_->mutation_version;
+        carried_layout_mutation_version = impl_->layout_mutation_version;
         carried_forget_version = impl_->forget_version;
     }
 
@@ -506,6 +547,7 @@ void DomDocument::parse(std::string_view html)
     impl_ = new Impl();
     impl_->next_id = carried_next_id;
     impl_->mutation_version = carried_mutation_version + 1;
+    impl_->layout_mutation_version = carried_layout_mutation_version + 1;
     impl_->forget_version = carried_forget_version + 1;
 
     const auto status = lxb_html_document_parse(
@@ -676,6 +718,11 @@ std::uint64_t DomDocument::mutation_version() const
     return impl_ == nullptr ? 0 : impl_->mutation_version;
 }
 
+std::uint64_t DomDocument::layout_mutation_version() const
+{
+    return impl_ == nullptr ? 0 : impl_->layout_mutation_version;
+}
+
 std::uint64_t DomDocument::forget_version() const
 {
     return impl_ == nullptr ? 0 : impl_->forget_version;
@@ -741,7 +788,7 @@ void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_vi
         throw std::runtime_error("failed to set DOM attribute");
     }
 
-    impl_->mark_mutated();
+    impl_->mark_mutated(attribute_affects_layout(name));
 }
 
 void DomDocument::remove_attribute(NodeId id, std::string_view name)
@@ -757,7 +804,7 @@ void DomDocument::remove_attribute(NodeId id, std::string_view name)
     }
 
     if (had_attribute) {
-        impl_->mark_mutated();
+        impl_->mark_mutated(attribute_affects_layout(name));
     }
 }
 

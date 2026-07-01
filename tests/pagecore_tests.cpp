@@ -2991,6 +2991,47 @@ void test_deep_clone_assigns_fresh_subtree_ids()
     require(doc.text_content(clone_span) == "y", "cloned span mutation must apply");
 }
 
+void test_dom_layout_mutation_version_ignores_service_attributes()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='x' class='a' style='width:10px'></div></body></html>");
+
+    const pagecore::NodeId node = doc.get_element_by_id("x");
+    require(node != pagecore::kInvalidNodeId, "fixture #x must resolve");
+
+    const auto initial_mutation_version = doc.mutation_version();
+    const auto initial_layout_version = doc.layout_mutation_version();
+
+    doc.set_attribute(node, "data-state", "ready");
+    require(
+        doc.mutation_version() == initial_mutation_version + 1,
+        "service attribute writes still bump the DOM mutation version");
+    require(
+        doc.layout_mutation_version() == initial_layout_version,
+        "data-* writes must not invalidate layout/style cache");
+
+    doc.set_attribute(node, "aria-label", "Ready");
+    require(
+        doc.layout_mutation_version() == initial_layout_version,
+        "aria-* writes must not invalidate layout/style cache");
+
+    doc.remove_attribute(node, "data-state");
+    require(
+        doc.layout_mutation_version() == initial_layout_version,
+        "removing data-* must not invalidate layout/style cache");
+
+    doc.set_attribute(node, "class", "b");
+    require(
+        doc.layout_mutation_version() == initial_layout_version + 1,
+        "class writes must invalidate layout/style cache");
+
+    const auto class_layout_version = doc.layout_mutation_version();
+    doc.set_text_content(node, "changed");
+    require(
+        doc.layout_mutation_version() == class_layout_version + 1,
+        "text mutations must invalidate layout/style cache");
+}
+
 void test_query_selector_cache_returns_all_and_first()
 {
     pagecore::DomDocument doc;
@@ -3349,10 +3390,37 @@ void test_page_display_list_is_memoized()
     (void) page.display_list(other);
     require(counting->count == 2, "changing the viewport must rebuild the layout");
 
-    // Mutating the DOM bumps the document mutation version and invalidates the cache.
+    // Layout-affecting DOM mutations bump the layout mutation version and
+    // invalidate the cache.
     page.eval("document.getElementById('x').textContent = 'changed and considerably longer text'");
     (void) page.display_list(options);
     require(counting->count == 3, "a DOM mutation must rebuild the layout");
+}
+
+void test_page_display_list_ignores_service_attribute_mutations()
+{
+    auto counting = std::make_shared<CountingLayoutEngineFactory>(
+        pagecore::create_litehtml_layout_engine_factory());
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(counting);
+    page.load_html(
+        "<html><body><div id='x' class='a' style='width:50px;height:20px'>hi</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(counting->count == 1, "first display_list must build layout once");
+
+    page.eval("document.getElementById('x').setAttribute('data-state', 'ready')");
+    (void) page.display_list(options);
+    require(counting->count == 1, "data-* mutation must reuse the cached layout");
+
+    page.eval("document.getElementById('x').setAttribute('class', 'b')");
+    (void) page.display_list(options);
+    require(counting->count == 2, "class mutation must rebuild cached layout");
 }
 
 void test_page_display_list_pipeline_with_external_css()
@@ -3708,9 +3776,9 @@ void test_render_resource_cache_persists_across_rebuilds()
     require(fetch_count("https://example.test/style.css") == 1, "stylesheet fetched once on the first render");
     require(fetch_count("https://example.test/pixel.png") == 1, "image fetched once on the first render");
 
-    // A DOM mutation bumps mutation_version, invalidating the styled-document
-    // cache so the next render rebuilds the litehtml document from scratch.
-    page.eval("document.getElementById('b').setAttribute('data-x', '1')");
+    // A layout-affecting DOM mutation invalidates the styled-document cache so
+    // the next render rebuilds the litehtml document from scratch.
+    page.eval("document.getElementById('b').setAttribute('class', 'changed')");
     (void) page.display_list(options);
 
     // The persistent sub-resource cache survives the rebuild: the stylesheet and
@@ -4719,6 +4787,7 @@ int main()
 #endif
         test_deep_dom_traversal_is_iterative();
         test_deep_clone_assigns_fresh_subtree_ids();
+        test_dom_layout_mutation_version_ignores_service_attributes();
         test_query_selector_cache_returns_all_and_first();
         test_described_traversal_wraps_children_correctly();
         test_child_node_list_cache_reflects_mutations();
@@ -4731,6 +4800,7 @@ int main()
         test_js_exception_message_includes_source_name();
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_page_display_list_is_memoized();
+        test_page_display_list_ignores_service_attribute_mutations();
         test_page_display_list_pipeline_with_external_css();
         test_page_display_list_hides_head_text_nodes();
         test_page_display_list_resolves_litehtml_relative_base_urls();

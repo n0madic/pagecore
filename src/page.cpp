@@ -80,7 +80,7 @@ bool is_module_script_type(const std::optional<std::string>& type)
 // memoized against DOM state, viewport, and base URL, not against external
 // resource contents.
 struct StyledDocumentCacheKey {
-    std::uint64_t mutation_version = 0;
+    std::uint64_t layout_mutation_version = 0;
     int viewport_width = 0;
     int viewport_height = 0;
     float device_scale_factor = 0.0f;
@@ -577,7 +577,7 @@ struct Page::Impl {
     StyledDocumentCacheKey styled_document_cache_key(const RenderOptions& render_options) const
     {
         return StyledDocumentCacheKey{
-            document.mutation_version(),
+            document.layout_mutation_version(),
             render_options.viewport.width,
             render_options.viewport.height,
             render_options.viewport.device_scale_factor,
