@@ -2827,6 +2827,45 @@ void test_non_javascript_script_types_are_not_executed()
             "non-JavaScript script types should be skipped instead of parsed by QuickJS");
 }
 
+void test_static_classic_async_defer_scripts_use_pagecore_dom_order()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/async.js",
+        "window.__staticOrder = (window.__staticOrder || '') + 'A';",
+        "text/javascript");
+    loader->add(
+        "https://example.test/defer.js",
+        "window.__staticOrder = (window.__staticOrder || '') + 'D';",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>window.__staticOrder = '1';</script>
+  <script async src="/async.js"></script>
+  <script defer src="/defer.js"></script>
+  <script>
+    window.__staticOrder += '4';
+    document.addEventListener('DOMContentLoaded', () => {
+      document.body.setAttribute('data-static-order-at-dcl', window.__staticOrder);
+    });
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.eval("window.__staticOrder") == "1AD4",
+            "static classic async/defer scripts should follow PageCore DOM-order execution");
+    require(
+        page.outer_html("body[data-static-order-at-dcl='1AD4']").has_value(),
+        "DOMContentLoaded should fire after PageCore static script execution");
+    require(has_request_kind(*loader, "https://example.test/async.js", pagecore::ResourceKind::Script),
+            "static async classic script should still load as a script resource");
+    require(has_request_kind(*loader, "https://example.test/defer.js", pagecore::ResourceKind::Script),
+            "static defer classic script should still load as a script resource");
+}
+
 void test_dynamic_script_insertion_executes_classic_scripts()
 {
     auto loader = std::make_shared<RecordingResourceLoader>();
@@ -2847,6 +2886,14 @@ document.body.setAttribute('data-dynamic-external', document.currentScript.src);
         R"JS(
 document.body.setAttribute('data-late-handler-script', 'ok');
 )JS",
+        "text/javascript");
+    loader->add(
+        "https://example.test/ordered-one.js",
+        "window.__dynamicOrdered = (window.__dynamicOrdered || '') + '1';",
+        "text/javascript");
+    loader->add(
+        "https://example.test/ordered-two.js",
+        "window.__dynamicOrdered = (window.__dynamicOrdered || '') + '2'; document.body.setAttribute('data-dynamic-ordered', window.__dynamicOrdered);",
         "text/javascript");
 
     pagecore::Page page;
@@ -2871,6 +2918,18 @@ document.body.setAttribute('data-late-handler-script', 'ok');
     const inline = document.createElement('script');
     inline.text = "document.body.setAttribute('data-dynamic-inline', document.currentScript && document.currentScript.localName);";
     document.body.appendChild(inline);
+
+    const orderedOne = document.createElement('script');
+    document.body.setAttribute('data-dynamic-default-async', String(orderedOne.async));
+    orderedOne.async = false;
+    document.body.setAttribute('data-dynamic-explicit-async', String(orderedOne.async));
+    orderedOne.src = '/ordered-one.js';
+    document.head.appendChild(orderedOne);
+
+    const orderedTwo = document.createElement('script');
+    orderedTwo.async = false;
+    orderedTwo.src = '/ordered-two.js';
+    document.head.appendChild(orderedTwo);
 
     const holder = document.createElement('div');
     holder.innerHTML = '<script>document.body.setAttribute("data-innerhtml-script", "bad");</' + 'script>';
@@ -2902,8 +2961,54 @@ document.body.setAttribute('data-late-handler-script', 'ok');
         has_request_kind(*loader, "https://example.test/late-handler.js", pagecore::ResourceKind::Script),
         "external dynamic scripts should start asynchronously enough for post-insertion onload handlers");
     require(
+        page.outer_html("body[data-dynamic-default-async='true'][data-dynamic-explicit-async='false'][data-dynamic-ordered='12']")
+            .has_value(),
+        "DOM-created classic scripts should default to async and async=false scripts should execute in insertion order");
+    require(
+        has_request_kind(*loader, "https://example.test/ordered-one.js", pagecore::ResourceKind::Script)
+            && has_request_kind(*loader, "https://example.test/ordered-two.js", pagecore::ResourceKind::Script),
+        "ordered dynamic classic scripts should load as script resources");
+    require(
         !page.outer_html("body[data-innerhtml-script='bad']").has_value(),
         "scripts created by innerHTML should remain inert when their container is inserted");
+}
+
+void test_dynamic_module_scripts_are_not_executed()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/dynamic-module.js",
+        "document.body.setAttribute('data-dynamic-module-external', 'bad');",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const externalModule = document.createElement('script');
+    externalModule.type = 'module';
+    externalModule.src = '/dynamic-module.js';
+    externalModule.onload = () => document.body.setAttribute('data-dynamic-module-load', 'bad');
+    externalModule.onerror = () => document.body.setAttribute('data-dynamic-module-error', 'bad');
+    document.head.appendChild(externalModule);
+
+    const inlineModule = document.createElement('script');
+    inlineModule.type = 'module';
+    inlineModule.text = "document.body.setAttribute('data-dynamic-module-inline', 'bad');";
+    document.body.appendChild(inlineModule);
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(!has_request_kind(*loader, "https://example.test/dynamic-module.js", pagecore::ResourceKind::Script),
+            "dynamic module scripts should not be fetched by the classic dynamic script path");
+    require(
+        !page.outer_html("body[data-dynamic-module-external='bad']").has_value()
+            && !page.outer_html("body[data-dynamic-module-inline='bad']").has_value()
+            && !page.outer_html("body[data-dynamic-module-load='bad']").has_value()
+            && !page.outer_html("body[data-dynamic-module-error='bad']").has_value(),
+        "dynamic module scripts are intentionally not executed yet");
 }
 
 void test_resource_request_kind_and_cache()
@@ -6700,7 +6805,9 @@ int main()
         test_js_resource_budgets_limit_count_bytes_and_time();
         test_xhr_event_handler_exceptions_are_reported();
         test_non_javascript_script_types_are_not_executed();
+        test_static_classic_async_defer_scripts_use_pagecore_dom_order();
         test_dynamic_script_insertion_executes_classic_scripts();
+        test_dynamic_module_scripts_are_not_executed();
         test_resource_request_kind_and_cache();
         test_resource_url_resolution_normalizes_dot_segments();
         test_resource_loader_decodes_data_urls();

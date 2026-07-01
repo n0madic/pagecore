@@ -483,6 +483,31 @@ test('events exposes standard DOMException legacy constants', () => {
   assert.strictEqual(error.code, 8);
 });
 
+test('dom HTMLScriptElement tracks dynamic async state', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const script = document.createElement('script');
+  const div = document.createElement('div');
+
+  assert.strictEqual(script.async, true);
+  assert.strictEqual(script.hasAttribute('async'), false);
+
+  script.async = false;
+  assert.strictEqual(script.async, false);
+  assert.strictEqual(script.hasAttribute('async'), false);
+
+  script.async = true;
+  assert.strictEqual(script.async, true);
+  assert.strictEqual(script.hasAttribute('async'), true);
+  assert.strictEqual(script.defer, false);
+
+  script.defer = true;
+  assert.strictEqual(script.defer, true);
+  assert.strictEqual(script.hasAttribute('defer'), true);
+  assert.strictEqual('async' in div, false);
+  assert.strictEqual('defer' in div, false);
+});
+
 test('dom TreeWalker and NodeIterator traverse with filters', () => {
   const { dom } = installDomEnvironment();
   const { document, NodeFilter } = dom;

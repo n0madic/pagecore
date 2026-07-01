@@ -61,6 +61,8 @@
       let cssomVersion = 0;
       let stylesheetListMutationVersion = -1;
       let nextDynamicScriptId = 0;
+      const orderedDynamicScripts = [];
+      let orderedDynamicScriptRunning = false;
 
       function layoutMutationVersion() {
         return typeof bridge.layoutMutationVersion === 'function'
@@ -112,6 +114,19 @@
           || type === 'text/jscript';
       }
 
+      function isOrderedDynamicScript(script) {
+        return Object.prototype.hasOwnProperty.call(script, '__pagecoreScriptForceAsync')
+          && script.__pagecoreScriptForceAsync === false
+          && !script.hasAttribute('async');
+      }
+
+      function markDomCreatedScript(script) {
+        if (script && script.localName === 'script'
+            && !Object.prototype.hasOwnProperty.call(script, '__pagecoreScriptForceAsync')) {
+          defineValue(script, '__pagecoreScriptForceAsync', true);
+        }
+      }
+
       function scriptErrorMessage(error) {
         if (error && typeof error.stack === 'string' && error.stack) return error.stack;
         if (error && typeof error.message === 'string' && error.message) return error.message;
@@ -148,6 +163,37 @@
         }
       }
 
+      function runDynamicExternalScript(script, url) {
+        try {
+          const loaded = loadHostResource(url, 'script');
+          executeDynamicScriptSource(script, loaded && loaded.body ? loaded.body : '', (loaded && loaded.url) || url);
+        } catch (error) {
+          reportDynamicScriptError(error);
+          script.dispatchEvent(new Event('error'));
+        }
+      }
+
+      function scheduleTask(callback) {
+        if (typeof global.setTimeout === 'function') global.setTimeout(callback, 0);
+        else callback();
+      }
+
+      function drainOrderedDynamicScripts() {
+        if (orderedDynamicScriptRunning) return;
+        const next = orderedDynamicScripts.shift();
+        if (!next) return;
+        orderedDynamicScriptRunning = true;
+        scheduleTask(() => {
+          try {
+            runDynamicExternalScript(next.script, next.url);
+          } finally {
+            orderedDynamicScriptRunning = false;
+            activityEnd('dynamic-script');
+            drainOrderedDynamicScripts();
+          }
+        });
+      }
+
       function markScriptStarted(script) {
         if (script && script.localName === 'script') {
           defineValue(script, '__pagecoreScriptStarted', true);
@@ -171,19 +217,18 @@
         if (src) {
           const url = absoluteURL(src);
           activityBegin('dynamic-script');
-          const run = () => {
+          if (isOrderedDynamicScript(script)) {
+            orderedDynamicScripts.push({ script, url });
+            drainOrderedDynamicScripts();
+            return;
+          }
+          scheduleTask(() => {
             try {
-              const loaded = loadHostResource(url, 'script');
-              executeDynamicScriptSource(script, loaded && loaded.body ? loaded.body : '', (loaded && loaded.url) || url);
-            } catch (error) {
-              reportDynamicScriptError(error);
-              script.dispatchEvent(new Event('error'));
+              runDynamicExternalScript(script, url);
             } finally {
               activityEnd('dynamic-script');
             }
-          };
-          if (typeof global.setTimeout === 'function') global.setTimeout(run, 0);
-          else run();
+          });
           return;
         }
 
@@ -2429,10 +2474,6 @@
           }
           get nonce() { return this.getAttribute('nonce') || ''; }
           set nonce(value) { this.setAttribute('nonce', String(value)); }
-          get async() { return this.hasAttribute('async'); }
-          set async(value) { this.toggleAttribute('async', Boolean(value)); }
-          get defer() { return this.hasAttribute('defer'); }
-          set defer(value) { this.toggleAttribute('defer', Boolean(value)); }
           get hidden() { return this.hasAttribute('hidden'); }
           set hidden(value) { this.toggleAttribute('hidden', Boolean(value)); }
           get classList() { return memo(this, '__classList', () => new DOMTokenList(this, 'class')); }
@@ -2922,6 +2963,14 @@
         class HTMLProgressElement extends HTMLElement {}
         class HTMLQuoteElement extends HTMLElement {}
         class HTMLScriptElement extends HTMLElement {
+          get async() { return this.hasAttribute('async') || this.__pagecoreScriptForceAsync === true; }
+          set async(value) {
+            const enabled = Boolean(value);
+            defineValue(this, '__pagecoreScriptForceAsync', enabled);
+            this.toggleAttribute('async', enabled);
+          }
+          get defer() { return this.hasAttribute('defer'); }
+          set defer(value) { this.toggleAttribute('defer', Boolean(value)); }
           get text() { return this.textContent || ''; }
           set text(value) { this.textContent = String(value ?? ''); }
         }
@@ -3255,7 +3304,9 @@
               const customElement = ctx.customElementsRegistry._construct(localName, id);
               if (customElement) return customElement;
             }
-            return wrapNode(id);
+            const element = wrapNode(id);
+            markDomCreatedScript(element);
+            return element;
           }
           createElementNS(namespaceURI, qualifiedName) {
             const namespace = String(namespaceURI || '');
@@ -3267,6 +3318,7 @@
             }
             const element = wrapNode(id);
             applyElementNamespace(element, namespace);
+            markDomCreatedScript(element);
             return element;
           }
           createTextNode(text) { return wrapNode(bridge.createTextNode(String(text ?? ''))); }
