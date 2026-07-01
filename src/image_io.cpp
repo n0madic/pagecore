@@ -1,6 +1,7 @@
 #include "pagecore/image_io.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -136,6 +137,12 @@ std::vector<std::uint8_t> zlib_store(const std::vector<std::uint8_t>& data)
 
 std::vector<std::uint8_t> encode_png_rgba(const RenderedImage& image)
 {
+    return encode_png_rgba(image, {});
+}
+
+std::vector<std::uint8_t> encode_png_rgba(const RenderedImage& image, const PerfTraceCallback& perf_trace)
+{
+    const auto t0 = std::chrono::steady_clock::now();
     const auto scanlines = make_scanlines(image);
 
     std::vector<std::uint8_t> ihdr;
@@ -153,12 +160,20 @@ std::vector<std::uint8_t> encode_png_rgba(const RenderedImage& image)
     append_chunk(png, "IHDR", ihdr);
     append_chunk(png, "IDAT", zlib_store(scanlines));
     append_chunk(png, "IEND", {});
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    emit_perf_trace(perf_trace, PerfPhase::PngEncode, "encode_png_rgba", elapsed_us, png.size());
     return png;
 }
 
 void write_png_rgba(const RenderedImage& image, const std::string& path)
 {
-    const auto png = encode_png_rgba(image);
+    write_png_rgba(image, path, {});
+}
+
+void write_png_rgba(const RenderedImage& image, const std::string& path, const PerfTraceCallback& perf_trace)
+{
+    const auto png = encode_png_rgba(image, perf_trace);
     std::ofstream out(path, std::ios::binary);
     if (!out) {
         throw std::runtime_error("failed to open PNG output file: " + path);

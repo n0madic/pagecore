@@ -168,6 +168,36 @@ build/pagecore_cli \
   --viewport 1280x720
 ```
 
+Performance tracing can be enabled from the CLI with `--perf-trace PATH`. The
+trace is newline-delimited JSON; use `--perf-trace -` to write events to stderr
+without corrupting stdout output:
+
+```sh
+build/pagecore_cli \
+  --file ./page.html \
+  --format png \
+  --output /tmp/pagecore-shot.png \
+  --viewport 1280x720 \
+  --perf-trace /tmp/pagecore-trace.jsonl
+```
+
+Each event has the shape:
+
+```json
+{"phase":"litehtml_layout","name":"layout","elapsed_us":21438,"count":3211}
+```
+
+Current phases are `serialize_html`, `subresource_scan`, `litehtml_load_html`,
+`litehtml_layout`, `computed_style`, `geometry`, `raster`, and `png_encode`.
+`count` is phase-specific: serialized HTML bytes, discovered first-wave
+subresources, bytes passed to litehtml, display-list command count, returned
+computed-style property count, geometry reads, rasterized command count, or
+encoded PNG bytes. Timings are wall-clock elapsed microseconds for the traced
+operation and are not exclusive: for example, a `geometry` read can include a
+forced `load_html`/`layout` rebuild, which will also emit its own events.
+`--full-page` may emit multiple load/layout events because it probes content
+height, then renders again with the expanded viewport.
+
 ## Embedding
 
 The project also builds a C++ library target. When used as a CMake
@@ -211,3 +241,28 @@ entry point, `ResourceLoader` controls network/file access, and
 `render.hpp` exposes the backend-neutral `DisplayList`, `LayoutEngine`, and
 `RasterBackend` boundaries. See `examples/embed_minimal.cpp` for a minimal
 in-memory page load with JavaScript execution.
+
+Embedders can collect the same performance events through
+`pagecore::PerfTraceCallback` from `include/pagecore/perf.hpp`:
+
+```cpp
+pagecore::PerfTraceCallback perf_trace = [](const pagecore::PerfEvent& event) {
+    std::cerr << pagecore::perf_phase_name(event.phase)
+              << " " << event.elapsed_us << "us"
+              << " count=" << event.count << "\n";
+};
+
+pagecore::LoadOptions load_options;
+load_options.perf_trace = perf_trace;
+page.load_html(html, load_options);
+
+pagecore::RenderOptions render_options;
+render_options.perf_trace = perf_trace;
+auto image = page.render(render_options);
+pagecore::write_png_rgba(image, "/tmp/pagecore-shot.png", perf_trace);
+```
+
+`LoadOptions::perf_trace` observes load-time work and is also used as the
+fallback trace sink for later render/style/geometry work. Set
+`RenderOptions::perf_trace` when a specific `display_list()`, `render()`, or
+layout-related read should use a different sink.

@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -54,7 +55,8 @@ void usage(const char* argv0)
         << "  --scale NUMBER           render scale factor, default 1\n"
         << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 15000\n"
         << "  --js-timeout-ms NUMBER   per-script execution deadline, default 30000\n"
-        << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n";
+        << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n"
+        << "  --perf-trace PATH|-      write perf trace JSONL; '-' writes to stderr\n";
 }
 
 // Largest render dimension we accept; well above any real viewport but
@@ -159,6 +161,52 @@ void write_text_file(const std::string& path, const std::string& text)
     }
 }
 
+void write_json_string(std::ostream& out, std::string_view value)
+{
+    out << '"';
+    for (char ch : value) {
+        switch (ch) {
+        case '\\':
+            out << "\\\\";
+            break;
+        case '"':
+            out << "\\\"";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(ch) < 0x20) {
+                out << "\\u00";
+                const char* hex = "0123456789abcdef";
+                out << hex[(static_cast<unsigned char>(ch) >> 4) & 0x0f];
+                out << hex[static_cast<unsigned char>(ch) & 0x0f];
+            } else {
+                out << ch;
+            }
+            break;
+        }
+    }
+    out << '"';
+}
+
+void write_perf_event_jsonl(std::ostream& out, const pagecore::PerfEvent& event)
+{
+    out << "{\"phase\":";
+    write_json_string(out, pagecore::perf_phase_name(event.phase));
+    out << ",\"name\":";
+    write_json_string(out, event.name);
+    out << ",\"elapsed_us\":" << event.elapsed_us
+        << ",\"count\":" << event.count
+        << "}\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -170,6 +218,7 @@ int main(int argc, char** argv)
         std::string eval;
         std::string output;
         std::string display_list_dump;
+        std::string perf_trace_path;
         OutputFormat output_format = OutputFormat::Html;
         pagecore::RenderOptions render_options;
         pagecore::LoadOptions load_options;
@@ -207,6 +256,7 @@ int main(int argc, char** argv)
             else if (arg == "--js-memory-mb") {
                 load_options.js_memory_limit_bytes = static_cast<std::size_t>(parse_positive_int(next(), "js-memory-mb")) * 1024 * 1024;
             }
+            else if (arg == "--perf-trace") perf_trace_path = next();
             else if (arg == "--stdin") stdin_input = true;
             else if (arg == "--full-page") full_page = true;
             else if (arg == "--help" || arg == "-h") {
@@ -215,6 +265,25 @@ int main(int argc, char** argv)
             } else {
                 throw std::runtime_error("unknown argument: " + arg);
             }
+        }
+
+        std::unique_ptr<std::ofstream> perf_trace_file;
+        std::ostream* perf_trace_stream = nullptr;
+        if (!perf_trace_path.empty()) {
+            if (perf_trace_path == "-") {
+                perf_trace_stream = &std::cerr;
+            } else {
+                perf_trace_file = std::make_unique<std::ofstream>(perf_trace_path, std::ios::binary);
+                if (!*perf_trace_file) {
+                    throw std::runtime_error("failed to open perf trace file: " + perf_trace_path);
+                }
+                perf_trace_stream = perf_trace_file.get();
+            }
+            pagecore::PerfTraceCallback perf_trace = [perf_trace_stream](const pagecore::PerfEvent& event) {
+                write_perf_event_jsonl(*perf_trace_stream, event);
+            };
+            load_options.perf_trace = perf_trace;
+            render_options.perf_trace = std::move(perf_trace);
         }
 
         pagecore::Page page(load_options);
@@ -272,7 +341,7 @@ int main(int argc, char** argv)
             }
 
             if (output_format == OutputFormat::Png) {
-                pagecore::write_png_rgba(page.render(render_options), output);
+                pagecore::write_png_rgba(page.render(render_options), output, render_options.perf_trace);
             } else if (output_format == OutputFormat::Pdf) {
                 pagecore::write_pdf(page.display_list(render_options), output);
             }

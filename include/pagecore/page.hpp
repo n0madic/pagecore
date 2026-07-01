@@ -21,6 +21,7 @@ struct LoadOptions {
     std::string user_agent = "PageCore/0.1";
     std::string base_url;
     std::function<void(std::string_view severity, std::string_view message)> console_log;
+    PerfTraceCallback perf_trace;
 };
 
 class ResourceLoader;

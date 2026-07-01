@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pagecore/perf.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -24,6 +26,7 @@ struct RenderOptions {
     Viewport viewport;
     bool load_external_resources = true;
     std::string base_url;
+    PerfTraceCallback perf_trace;
 };
 
 struct RenderedImage {

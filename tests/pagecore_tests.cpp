@@ -4825,6 +4825,63 @@ void test_geometry_apis_return_zero_for_display_none()
         "geometry APIs should still return zeros for display:none elements");
 }
 
+void test_perf_trace_records_render_geometry_and_png_phases()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = trace;
+
+    pagecore::Page page(load_options);
+    page.load_html(
+        "<html><body style='margin:0'><div id='box' style='width:24px;height:12px;background:#f00'></div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions render_options;
+    render_options.viewport = pagecore::Viewport{80, 60, 1.0f};
+    render_options.perf_trace = trace;
+
+    (void) page.display_list(render_options);
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#box");
+    require(box != pagecore::kInvalidNodeId, "expected to find #box");
+    (void) page.computed_style(box);
+    (void) page.element_geometry(box);
+
+    const auto image = page.render(render_options);
+    const auto png = pagecore::encode_png_rgba(image, trace);
+    require(!png.empty(), "PNG encoding should produce bytes");
+
+    auto has_phase = [&](pagecore::PerfPhase phase) {
+        return std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+            return event.phase == phase;
+        });
+    };
+    auto count_for = [&](pagecore::PerfPhase phase) {
+        std::uint64_t count = 0;
+        for (const auto& event : events) {
+            if (event.phase == phase) {
+                count = std::max(count, event.count);
+            }
+        }
+        return count;
+    };
+
+    require(has_phase(pagecore::PerfPhase::SerializeHtml), "perf trace should record HTML serialization");
+    require(has_phase(pagecore::PerfPhase::SubresourceScan), "perf trace should record subresource scanning");
+    require(has_phase(pagecore::PerfPhase::LitehtmlLoadHtml), "perf trace should record litehtml load_html");
+    require(has_phase(pagecore::PerfPhase::LitehtmlLayout), "perf trace should record litehtml layout");
+    require(has_phase(pagecore::PerfPhase::ComputedStyle), "perf trace should record computed style reads");
+    require(has_phase(pagecore::PerfPhase::Geometry), "perf trace should record geometry reads");
+    require(has_phase(pagecore::PerfPhase::Raster), "perf trace should record rasterization");
+    require(has_phase(pagecore::PerfPhase::PngEncode), "perf trace should record PNG encoding");
+    require(count_for(pagecore::PerfPhase::SerializeHtml) > 0, "serialize trace count should report bytes");
+    require(count_for(pagecore::PerfPhase::PngEncode) == png.size(), "PNG trace count should report encoded bytes");
+}
+
 // Decorates a LayoutEngine to count real layout() passes (distinct from
 // CountingLayoutEngineFactory's engine-creation count above), so the geometry
 // cache-reuse guarantee can be checked directly rather than just inferred.
@@ -5180,6 +5237,7 @@ int main()
         test_geometry_offset_parent_cache_invalidates_after_style_mutation();
         test_window_viewport_reflects_last_render_options();
         test_geometry_apis_return_zero_for_display_none();
+        test_perf_trace_records_render_geometry_and_png_phases();
         test_element_geometry_reuses_cached_layout();
         test_element_geometry_bounded_mode_returns_cached_geometry();
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();

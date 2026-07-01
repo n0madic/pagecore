@@ -112,6 +112,40 @@ struct GeometryCacheEntry {
     std::optional<ElementGeometry> geometry;
 };
 
+class PerfScope final {
+public:
+    PerfScope(const PerfTraceCallback& callback, PerfPhase phase, std::string_view name, std::uint64_t count = 0)
+        : callback_(callback)
+        , phase_(phase)
+        , name_(name)
+        , count_(count)
+        , start_(std::chrono::steady_clock::now())
+    {
+    }
+
+    ~PerfScope()
+    {
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start_).count();
+        try {
+            emit_perf_trace(callback_, phase_, name_, elapsed_us, count_);
+        } catch (...) {
+        }
+    }
+
+    void set_count(std::uint64_t count)
+    {
+        count_ = count;
+    }
+
+private:
+    const PerfTraceCallback& callback_;
+    PerfPhase phase_;
+    std::string_view name_;
+    std::uint64_t count_ = 0;
+    std::chrono::steady_clock::time_point start_;
+};
+
 // Extracts url(...) targets from a CSS source so they can be prefetched. Handles
 // comments, quoted/unquoted targets, and multi-value declarations. `@import`
 // targets are returned as stylesheets; `src:` declarations (web fonts) are
@@ -442,9 +476,17 @@ struct Page::Impl {
         return options.base_url;
     }
 
-    std::string serialized_html_for_render() const
+    const PerfTraceCallback& perf_trace_for(const RenderOptions& render_options) const
     {
-        return document.serialize_html_for_layout(options.enable_js);
+        return render_options.perf_trace ? render_options.perf_trace : options.perf_trace;
+    }
+
+    std::string serialized_html_for_render(const RenderOptions& render_options) const
+    {
+        PerfScope trace(perf_trace_for(render_options), PerfPhase::SerializeHtml, "serialize_html_for_layout");
+        std::string html = document.serialize_html_for_layout(options.enable_js);
+        trace.set_count(html.size());
+        return html;
     }
 
     // The document's effective base URL for resolving sub-resources, honouring a
@@ -689,7 +731,11 @@ struct Page::Impl {
 
         std::vector<ResourceRequest> wave1;
         std::unordered_set<std::string> seen;
-        collect_dom_subresources(effective_base, wave1, seen);
+        {
+            PerfScope trace(perf_trace_for(render_options), PerfPhase::SubresourceScan, "collect_dom_subresources");
+            collect_dom_subresources(effective_base, wave1, seen);
+            trace.set_count(wave1.size());
+        }
         if (wave1.empty()) {
             return cache;
         }
@@ -811,8 +857,16 @@ struct Page::Impl {
         layout->set_viewport(render_options.viewport);
         layout->set_resource_loader(std::move(render_loader));
         layout->set_font_environment(std::move(font_environment));
-        layout->load_html(serialized_html_for_render(), render_base_url(render_options));
-        layout->layout();
+        std::string html = serialized_html_for_render(render_options);
+        {
+            PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
+            layout->load_html(html, render_base_url(render_options));
+        }
+        {
+            PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLayout, "layout");
+            layout->layout();
+            trace.set_count(layout->display_list().commands.size());
+        }
         return layout;
     }
 
@@ -844,7 +898,11 @@ struct Page::Impl {
         engine->set_font_environment(std::move(font_environment));
         {
             const auto t0 = std::chrono::steady_clock::now();
-            engine->load_html(serialized_html_for_render(), render_base_url(render_options));
+            std::string html = serialized_html_for_render(render_options);
+            {
+                PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
+                engine->load_html(html, render_base_url(render_options));
+            }
             const auto rebuild_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             if (rebuild_us > kExpensiveStyledDocumentUs) {
@@ -868,7 +926,11 @@ struct Page::Impl {
         auto& engine = ensure_styled_document(render_options);
         if (!styled_document_laid_out) {
             const auto t0 = std::chrono::steady_clock::now();
-            engine.layout();
+            {
+                PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLayout, "layout");
+                engine.layout();
+                trace.set_count(engine.display_list().commands.size());
+            }
             const auto layout_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             if (layout_us > kExpensiveStyledDocumentUs) {
@@ -887,13 +949,17 @@ struct Page::Impl {
 
     std::optional<ComputedStyle> computed_style(NodeId node)
     {
+        PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style", 1);
         auto& engine = ensure_styled_document(last_render_options);
         engine.compute_styles_only();
-        return engine.computed_style(std::to_string(node));
+        auto style = engine.computed_style(std::to_string(node));
+        trace.set_count(style ? style->properties.size() : 0);
+        return style;
     }
 
     std::optional<ElementGeometry> element_geometry(NodeId node)
     {
+        PerfScope trace(perf_trace_for(last_render_options), PerfPhase::Geometry, "element_geometry", 1);
         sync_geometry_cache_for_forget_version();
         if (!document.is_connected(node)) {
             last_known_geometry.erase(node);
@@ -1025,7 +1091,10 @@ RenderedImage Page::render(RenderOptions render_options) const
 
 RenderedImage Page::render(RasterBackend& backend, RenderOptions render_options) const
 {
-    return backend.render(display_list(std::move(render_options)));
+    PerfTraceCallback perf_trace = render_options.perf_trace ? render_options.perf_trace : impl_->options.perf_trace;
+    DisplayList display = display_list(render_options);
+    PerfScope trace(perf_trace, PerfPhase::Raster, "raster", display.commands.size());
+    return backend.render(display);
 }
 
 std::optional<std::string> Page::text_content(std::string_view selector)
