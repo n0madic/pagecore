@@ -624,6 +624,13 @@ JSValue bridge_mutation_version(JSContext* ctx, JSValue, int, JSValue*)
     });
 }
 
+JSValue bridge_layout_mutation_version(JSContext* ctx, JSValue, int, JSValue*)
+{
+    return bridge_call(ctx, [ctx](JsRuntime& js) {
+        return JS_NewFloat64(ctx, static_cast<double>(js.document().layout_mutation_version()));
+    });
+}
+
 JSValue bridge_forget_version(JSContext* ctx, JSValue, int, JSValue*)
 {
     return bridge_call(ctx, [ctx](JsRuntime& js) {
@@ -644,6 +651,15 @@ JSValue bridge_computed_style(JSContext* ctx, JSValue, int argc, JSValue* argv)
             }
         }
         return result;
+    });
+}
+
+JSValue bridge_computed_style_property(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 2) throw std::runtime_error("computedStyleProperty requires a node id and property name");
+        auto value = js.computed_style_property(to_node_id(ctx, argv[0]), to_string(ctx, argv[1]));
+        return value ? js_string(ctx, *value) : js_string(ctx, "");
     });
 }
 
@@ -1065,8 +1081,10 @@ void JsRuntime::install()
     set_function(context_, dom, "contains", bridge_contains, 2);
     set_function(context_, dom, "isConnected", bridge_is_connected, 1);
     set_function(context_, dom, "mutationVersion", bridge_mutation_version, 0);
+    set_function(context_, dom, "layoutMutationVersion", bridge_layout_mutation_version, 0);
     set_function(context_, dom, "forgetVersion", bridge_forget_version, 0);
     set_function(context_, dom, "computedStyle", bridge_computed_style, 1);
+    set_function(context_, dom, "computedStyleProperty", bridge_computed_style_property, 2);
     set_function(context_, dom, "elementGeometry", bridge_element_geometry, 1);
     set_function(context_, dom, "viewport", bridge_viewport, 0);
     set_function(context_, dom, "getAttribute", bridge_get_attribute, 2);
@@ -1250,6 +1268,19 @@ std::optional<ComputedStyle> JsRuntime::computed_style(NodeId node)
         return std::nullopt;
     }
     return computed_style_resolver_(node);
+}
+
+void JsRuntime::set_computed_style_property_resolver(ComputedStylePropertyResolver resolver)
+{
+    computed_style_property_resolver_ = std::move(resolver);
+}
+
+std::optional<std::string> JsRuntime::computed_style_property(NodeId node, std::string_view property)
+{
+    if (!computed_style_property_resolver_) {
+        return std::nullopt;
+    }
+    return computed_style_property_resolver_(node, property);
 }
 
 void JsRuntime::set_element_geometry_resolver(ElementGeometryResolver resolver)

@@ -3260,9 +3260,24 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
         doc.layout_mutation_version() == initial_layout_version,
         "removing data-* must not invalidate layout/style cache");
 
-    doc.set_attribute(node, "class", "b");
+    doc.set_layout_sensitive_attributes({"data-state"});
+    doc.set_attribute(node, "data-state", "ready");
     require(
         doc.layout_mutation_version() == initial_layout_version + 1,
+        "data-* writes must invalidate layout/style cache when an attribute selector depends on them");
+    require(
+        doc.last_layout_mutation_reason() == "set_attribute:data-state",
+        "layout mutation reason should describe the attribute mutation");
+
+    const auto selected_layout_version = doc.layout_mutation_version();
+    doc.set_attribute(node, "aria-label", "Still service metadata");
+    require(
+        doc.layout_mutation_version() == selected_layout_version,
+        "unselected service attributes must still avoid layout/style invalidation");
+
+    doc.set_attribute(node, "class", "b");
+    require(
+        doc.layout_mutation_version() == selected_layout_version + 1,
         "class writes must invalidate layout/style cache");
 
     const auto class_layout_version = doc.layout_mutation_version();
@@ -3270,6 +3285,14 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
     require(
         doc.layout_mutation_version() == class_layout_version + 1,
         "text mutations must invalidate layout/style cache");
+
+    doc.parse("<html><body><script id='s'>var a = 1;</script><div id='x'>layout</div></body></html>");
+    const pagecore::NodeId script = doc.get_element_by_id("s");
+    const auto script_layout_version = doc.layout_mutation_version();
+    doc.set_text_content(script, "var a = 2;");
+    require(
+        doc.layout_mutation_version() == script_layout_version,
+        "script text mutations must not invalidate layout/style cache");
 }
 
 void test_query_selector_cache_returns_all_and_first()
@@ -3673,6 +3696,81 @@ void test_page_display_list_ignores_service_attribute_mutations()
     page.eval("document.getElementById('x').setAttribute('class', 'b')");
     (void) page.display_list(options);
     require(counting->count == 2, "class mutation must rebuild cached layout");
+}
+
+void test_page_display_list_rebuilds_for_service_attribute_selectors()
+{
+    auto counting = std::make_shared<CountingLayoutEngineFactory>(
+        pagecore::create_litehtml_layout_engine_factory());
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(counting);
+    page.load_html(
+        "<html><head><style>#x[data-state='ready'] { width:70px; }</style></head>"
+        "<body><div id='x' style='width:50px;height:20px'>hi</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(counting->count == 1, "first display_list must build layout once");
+
+    page.eval("document.getElementById('x').setAttribute('data-state', 'ready')");
+    (void) page.display_list(options);
+    require(counting->count == 2, "service attribute used by an inline selector must rebuild cached layout");
+}
+
+void test_page_display_list_rebuilds_for_external_service_attribute_selectors()
+{
+    auto counting = std::make_shared<CountingLayoutEngineFactory>(
+        pagecore::create_litehtml_layout_engine_factory());
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/style.css",
+        "#x[data-state='ready'] { width:70px; }",
+        "text/css");
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(counting);
+    page.set_resource_loader(loader);
+    page.load_html(
+        "<html><head><link rel='stylesheet' href='/style.css'></head>"
+        "<body><div id='x' style='width:50px;height:20px'>hi</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(counting->count == 1, "first display_list must build layout once");
+
+    page.eval("document.getElementById('x').setAttribute('data-state', 'ready')");
+    (void) page.display_list(options);
+    require(counting->count == 2, "service attribute used by an external selector must rebuild cached layout");
+}
+
+void test_page_display_list_ignores_script_text_mutations()
+{
+    auto counting = std::make_shared<CountingLayoutEngineFactory>(
+        pagecore::create_litehtml_layout_engine_factory());
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(counting);
+    page.load_html(
+        "<html><body><div id='x' style='width:50px;height:20px'>hi</div>"
+        "<script id='s'>var a = 1;</script></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(counting->count == 1, "first display_list must build layout once");
+
+    page.eval("document.getElementById('s').textContent = 'var a = 2;'");
+    (void) page.display_list(options);
+    require(counting->count == 1, "script text mutations must not invalidate cached layout");
 }
 
 void test_page_display_list_pipeline_with_external_css()
@@ -4886,6 +4984,59 @@ void test_perf_trace_records_render_geometry_and_png_phases()
     require(has_phase(pagecore::PerfPhase::PngEncode), "perf trace should record PNG encoding");
     require(count_for(pagecore::PerfPhase::SerializeHtml) > 0, "serialize trace count should report bytes");
     require(count_for(pagecore::PerfPhase::PngEncode) == png.size(), "PNG trace count should report encoded bytes");
+
+    auto computed = std::find_if(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ComputedStyle && event.name == "computed_style";
+    });
+    require(computed != events.end(), "perf trace should include the full computed style event");
+    require(computed->node_id && *computed->node_id == box, "computed style event should report node id");
+    require(computed->mutation_version.has_value(), "computed style event should report DOM mutation version");
+    require(computed->layout_mutation_version.has_value(), "computed style event should report layout mutation version");
+    require(
+        computed->styled_document_cache_hit.has_value(),
+        "computed style event should report styled-document cache hit state");
+    require(
+        !computed->styled_document_cache_reason.empty(),
+        "computed style event should report styled-document cache reason");
+}
+
+void test_computed_style_property_uses_layout_mutation_version_cache()
+{
+    std::vector<pagecore::PerfEvent> events;
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    pagecore::Page page(load_options);
+    page.load_html(
+        "<html><body><div id='x' style='display:block;width:24px;height:12px'></div></body></html>",
+        "https://example.test/");
+
+    page.eval(R"JS(
+      const x = document.getElementById('x');
+      const before = getComputedStyle(x).display;
+      x.setAttribute('data-state', 'ready');
+      const after = getComputedStyle(x).display;
+      document.body.setAttribute('data-style-cache', before + ':' + after);
+    )JS");
+
+    require(
+        page.outer_html("body[data-style-cache='block:block']").has_value(),
+        "computed style reads should still return values across service-only mutations");
+
+    int property_events = 0;
+    for (const auto& event : events) {
+        if (event.phase == pagecore::PerfPhase::ComputedStyle
+            && event.name == "computed_style_property"
+            && event.property == "display") {
+            ++property_events;
+        }
+    }
+    require(
+        property_events == 1,
+        "service-only DOM mutation must not invalidate layout-version keyed computed style property cache");
 }
 
 // Decorates a LayoutEngine to count real layout() passes (distinct from
@@ -5209,6 +5360,9 @@ int main()
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_page_display_list_is_memoized();
         test_page_display_list_ignores_service_attribute_mutations();
+        test_page_display_list_rebuilds_for_service_attribute_selectors();
+        test_page_display_list_rebuilds_for_external_service_attribute_selectors();
+        test_page_display_list_ignores_script_text_mutations();
         test_page_display_list_pipeline_with_external_css();
         test_page_display_list_hides_head_text_nodes();
         test_page_display_list_resolves_litehtml_relative_base_urls();
@@ -5244,6 +5398,7 @@ int main()
         test_window_viewport_reflects_last_render_options();
         test_geometry_apis_return_zero_for_display_none();
         test_perf_trace_records_render_geometry_and_png_phases();
+        test_computed_style_property_uses_layout_mutation_version_cache();
         test_element_geometry_reuses_cached_layout();
         test_element_geometry_bounded_mode_returns_cached_geometry();
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();

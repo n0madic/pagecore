@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
 #include <string_view>
 
 namespace pagecore {
@@ -22,6 +24,14 @@ struct PerfEvent {
     std::string_view name;
     long long elapsed_us = 0;
     std::uint64_t count = 0;
+
+    std::optional<std::uint64_t> node_id;
+    std::optional<std::uint64_t> mutation_version;
+    std::optional<std::uint64_t> layout_mutation_version;
+    std::optional<bool> styled_document_cache_hit;
+    std::string styled_document_cache_reason;
+    std::string layout_mutation_reason;
+    std::string property;
 };
 
 using PerfTraceCallback = std::function<void(const PerfEvent&)>;
@@ -51,6 +61,16 @@ inline std::string_view perf_phase_name(PerfPhase phase)
 
 inline void emit_perf_trace(
     const PerfTraceCallback& callback,
+    PerfEvent event)
+{
+    if (!callback) {
+        return;
+    }
+    callback(event);
+}
+
+inline void emit_perf_trace(
+    const PerfTraceCallback& callback,
     PerfPhase phase,
     std::string_view name,
     long long elapsed_us,
@@ -59,7 +79,7 @@ inline void emit_perf_trace(
     if (!callback) {
         return;
     }
-    callback(PerfEvent{phase, name, elapsed_us, count});
+    emit_perf_trace(callback, PerfEvent{phase, name, elapsed_us, count});
 }
 
 } // namespace pagecore

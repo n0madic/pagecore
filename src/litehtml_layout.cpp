@@ -827,6 +827,20 @@ public:
         return ComputedStyle{computed_style_properties(element)};
     }
 
+    std::optional<std::string> computed_style_property(std::string_view node_key, std::string_view property) override
+    {
+        if (!document_) {
+            return std::nullopt;
+        }
+        ensure_styles_computed();
+
+        auto element = find_tagged_element(node_key);
+        if (!element) {
+            return std::nullopt;
+        }
+        return computed_style_property_value(element, property);
+    }
+
     std::optional<ElementGeometry> element_geometry(std::string_view node_key) override
     {
         if (!document_) {
@@ -974,6 +988,73 @@ private:
         properties.emplace_back("opacity", "1");
 
         return properties;
+    }
+
+    std::optional<std::string> computed_style_property_value(
+        const litehtml::element::ptr& element,
+        std::string_view property) const
+    {
+        const litehtml::css_properties& css = element->css();
+        if (property == "display") return std::string(litehtml::style_display_strings[css.get_display()]);
+        if (property == "position") return std::string(litehtml::element_position_strings[css.get_position()]);
+        if (property == "float") return std::string(litehtml::element_float_strings[css.get_float()]);
+        if (property == "color") return format_color(css.get_color());
+        if (property == "background-color") return format_color(css.get_bg().m_color);
+        if (property == "font-size") return format_number(px(css.get_font_size())) + "px";
+
+        if (property == "font-family" || property == "font-weight" || property == "font-style") {
+            const auto* font = reinterpret_cast<const FontHandle*>(css.get_font());
+            if (property == "font-family") {
+                return font != nullptr ? font->font.family : container_.get_default_font_name();
+            }
+            if (property == "font-weight") {
+                return font != nullptr ? std::to_string(font->font.weight) : std::string("400");
+            }
+            return font != nullptr && font->font.italic ? std::string("italic") : std::string("normal");
+        }
+
+        if (property == "line-height") return format_number(px(css.line_height().computed_value)) + "px";
+        if (property == "width") return format_length(css.get_width(), "auto");
+        if (property == "height") return format_length(css.get_height(), "auto");
+        if (property == "min-width") return format_length(css.get_min_width(), "auto");
+        if (property == "min-height") return format_length(css.get_min_height(), "auto");
+        if (property == "max-width") return format_length(css.get_max_width(), "none");
+        if (property == "max-height") return format_length(css.get_max_height(), "none");
+
+        const litehtml::css_margins& margins = css.get_margins();
+        if (property == "margin-left") return format_length(margins.left, "auto");
+        if (property == "margin-right") return format_length(margins.right, "auto");
+        if (property == "margin-top") return format_length(margins.top, "auto");
+        if (property == "margin-bottom") return format_length(margins.bottom, "auto");
+
+        const litehtml::css_margins& padding = css.get_padding();
+        if (property == "padding-left") return format_length(padding.left, "0px");
+        if (property == "padding-right") return format_length(padding.right, "0px");
+        if (property == "padding-top") return format_length(padding.top, "0px");
+        if (property == "padding-bottom") return format_length(padding.bottom, "0px");
+
+        const litehtml::css_offsets& offsets = css.get_offsets();
+        if (property == "left") return format_length(offsets.left, "auto");
+        if (property == "right") return format_length(offsets.right, "auto");
+        if (property == "top") return format_length(offsets.top, "auto");
+        if (property == "bottom") return format_length(offsets.bottom, "auto");
+
+        if (property == "text-align") return std::string(litehtml::text_align_strings[css.get_text_align()]);
+        if (property == "visibility") return std::string(litehtml::visibility_strings[css.get_visibility()]);
+        if (property == "white-space") return std::string(litehtml::white_space_strings[css.get_white_space()]);
+        if (property == "overflow") return std::string(litehtml::overflow_strings[css.get_overflow()]);
+        if (property == "box-sizing") return std::string(litehtml::box_sizing_strings[css.get_box_sizing()]);
+        if (property == "z-index") return std::to_string(css.get_z_index());
+        if (property == "vertical-align") return std::string(litehtml::vertical_align_strings[css.get_vertical_align()]);
+        if (property == "text-indent") return format_length(css.get_text_indent(), "0px");
+        if (property == "list-style-type") return std::string(litehtml::list_style_type_strings[css.get_list_style_type()]);
+        if (property == "list-style-position") return std::string(litehtml::list_style_position_strings[css.get_list_style_position()]);
+        if (property == "list-style-image") {
+            return css.get_list_style_image().empty() ? std::string("none") : ("url(\"" + css.get_list_style_image() + "\")");
+        }
+        if (property == "opacity") return std::string("1");
+
+        return std::nullopt;
     }
 
     Viewport viewport_;

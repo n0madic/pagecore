@@ -53,6 +53,7 @@ public:
     std::optional<std::string> text_content(std::string_view selector);
     std::optional<std::string> outer_html(std::string_view selector);
     std::optional<ComputedStyle> computed_style(NodeId node) const;
+    std::optional<std::string> computed_style_property(NodeId node, std::string_view property) const;
     std::optional<ElementGeometry> element_geometry(NodeId node) const;
 
 private:

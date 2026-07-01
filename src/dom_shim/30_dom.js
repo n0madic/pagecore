@@ -61,6 +61,12 @@
       let stylesheetListMutationVersion = -1;
       let nextDynamicScriptId = 0;
 
+      function layoutMutationVersion() {
+        return typeof bridge.layoutMutationVersion === 'function'
+          ? bridge.layoutMutationVersion()
+          : bridge.mutationVersion();
+      }
+
       function locationFromURL(href) {
         let url = null;
         try {
@@ -1834,7 +1840,7 @@
         }
 
         function computedDisplay(element) {
-          return computedDisplayForVersion(element, bridge.mutationVersion());
+          return computedDisplayForVersion(element, layoutMutationVersion());
         }
 
         function selectorTokens(selector) {
@@ -2002,7 +2008,7 @@
         }
 
         // Per-element cache of litehtml's cascade result, keyed (per entry) by
-        // the bridge mutation version — same invalidation pattern as
+        // the bridge layout mutation version — same invalidation pattern as
         // elementGeometryCache/traversalCache below. Without this, every
         // getComputedStyle(el) call started a fresh cache (scoped to that
         // single call's closure), so reading multiple properties off one
@@ -2011,24 +2017,43 @@
         // bridge and rebuilt the full ~30-property cascade every time, even
         // when nothing had changed since the last read.
         const computedStyleValuesCache = new WeakMap();
-        function computedStyleValuesForVersion(element, version) {
+        function computedStyleEntryForVersion(element, version) {
           if (!(element instanceof Element)) return Object.create(null);
           let entry = computedStyleValuesCache.get(element);
           if (entry === undefined || entry.version !== version) {
-            entry = { version, values: bridge.computedStyle(element.__id) };
+            entry = {
+              version,
+              values: null,
+              properties: Object.create(null)
+            };
             computedStyleValuesCache.set(element, entry);
           }
+          return entry;
+        }
+
+        function computedStyleValuesForVersion(element, version) {
+          if (!(element instanceof Element)) return Object.create(null);
+          const entry = computedStyleEntryForVersion(element, version);
+          if (entry.values === null) entry.values = bridge.computedStyle(element.__id);
           return entry.values;
         }
 
         function computedStyleValuesFor(element) {
-          return computedStyleValuesForVersion(element, bridge.mutationVersion());
+          return computedStyleValuesForVersion(element, layoutMutationVersion());
         }
 
         function computedStylePropertyForVersion(element, name, version) {
           const property = cssPropertyName(name);
           if (!property) return '';
-          return computedStyleValuesForVersion(element, version)[property] || '';
+          if (!(element instanceof Element)) return '';
+          const entry = computedStyleEntryForVersion(element, version);
+          if (entry.values !== null) return entry.values[property] || '';
+          if (!Object.prototype.hasOwnProperty.call(entry.properties, property)) {
+            entry.properties[property] = typeof bridge.computedStyleProperty === 'function'
+              ? bridge.computedStyleProperty(element.__id, property)
+              : (computedStyleValuesForVersion(element, version)[property] || '');
+          }
+          return entry.properties[property] || '';
         }
 
         function computedStyleFor(element) {
@@ -2037,7 +2062,7 @@
           const propertyValue = (name) => {
             const property = cssPropertyName(name);
             if (!property) return '';
-            return styleValues()[property] || '';
+            return computedStylePropertyForVersion(element, property, layoutMutationVersion());
           };
           const declaration = Object.create(CSSStyleDeclaration.prototype);
           defineValue(declaration, 'item', (index) => propertyNames()[Number(index)] || '');
@@ -2103,7 +2128,7 @@
         }
 
         // Per-element cache of litehtml's box-model geometry, keyed (per entry)
-        // by the bridge mutation version — same invalidation pattern as
+        // by the bridge layout mutation version — same invalidation pattern as
         // traversalCache/liveChildNodeList. Returns null for elements that
         // don't participate in layout (display:none, or layout() hasn't run).
         const elementGeometryCache = new WeakMap();
@@ -2118,7 +2143,7 @@
         }
 
         function elementGeometry(element) {
-          return elementGeometryForVersion(element, bridge.mutationVersion());
+          return elementGeometryForVersion(element, layoutMutationVersion());
         }
 
         const offsetParentCache = new WeakMap();
@@ -2133,7 +2158,7 @@
           return (root instanceof ShadowRoot ? root.host : null) || document.body || null;
         }
 
-        function offsetParentFor(element, version = bridge.mutationVersion()) {
+        function offsetParentFor(element, version = layoutMutationVersion()) {
           if (!(element instanceof HTMLElement)) return null;
           let entry = offsetParentCache.get(element);
           if (entry === undefined || entry.version !== version) {
@@ -2148,7 +2173,7 @@
           if (!(element instanceof Element)) {
             return { geometry: null, parentGeometry: null };
           }
-          const version = bridge.mutationVersion();
+          const version = layoutMutationVersion();
           let entry = offsetGeometryCache.get(element);
           if (entry === undefined || entry.version !== version) {
             const geometry = elementGeometryForVersion(element, version);

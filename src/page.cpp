@@ -101,6 +101,11 @@ struct CssUrlRef {
     ResourceKind kind = ResourceKind::Image;
 };
 
+struct CssAttributeSelectorUsage {
+    std::unordered_set<std::string> names;
+    bool wildcard = false;
+};
+
 #if defined(PAGECORE_ENABLE_RENDERING)
 struct PendingFontRequest {
     WebFontSource source;
@@ -116,9 +121,7 @@ class PerfScope final {
 public:
     PerfScope(const PerfTraceCallback& callback, PerfPhase phase, std::string_view name, std::uint64_t count = 0)
         : callback_(callback)
-        , phase_(phase)
-        , name_(name)
-        , count_(count)
+        , event_{phase, name, 0, count}
         , start_(std::chrono::steady_clock::now())
     {
     }
@@ -128,23 +131,150 @@ public:
         const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start_).count();
         try {
-            emit_perf_trace(callback_, phase_, name_, elapsed_us, count_);
+            event_.elapsed_us = elapsed_us;
+            emit_perf_trace(callback_, event_);
         } catch (...) {
         }
     }
 
     void set_count(std::uint64_t count)
     {
-        count_ = count;
+        event_.count = count;
+    }
+
+    PerfEvent& event()
+    {
+        return event_;
     }
 
 private:
     const PerfTraceCallback& callback_;
-    PerfPhase phase_;
-    std::string_view name_;
-    std::uint64_t count_ = 0;
+    PerfEvent event_;
     std::chrono::steady_clock::time_point start_;
 };
+
+std::string ascii_lower_copy(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        out.push_back(static_cast<char>(std::tolower(ch)));
+    }
+    return out;
+}
+
+bool is_css_attribute_name_char(unsigned char ch)
+{
+    return std::isalnum(ch) || ch == '-' || ch == '_' || ch == ':';
+}
+
+void record_css_attribute_selector(std::string_view content, CssAttributeSelectorUsage& usage)
+{
+    std::size_t i = 0;
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) {
+        ++i;
+    }
+    if (i >= content.size()) {
+        usage.wildcard = true;
+        return;
+    }
+    if (content.find('\\') != std::string_view::npos) {
+        usage.wildcard = true;
+        return;
+    }
+
+    // Namespaced attribute selectors such as [svg|href] depend on the local
+    // attribute name for our invalidation purposes.
+    const auto pipe = content.find('|', i);
+    if (pipe != std::string_view::npos) {
+        i = pipe + 1;
+    }
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) {
+        ++i;
+    }
+
+    const std::size_t start = i;
+    while (i < content.size() && is_css_attribute_name_char(static_cast<unsigned char>(content[i]))) {
+        ++i;
+    }
+    if (i == start) {
+        usage.wildcard = true;
+        return;
+    }
+    usage.names.insert(ascii_lower_copy(content.substr(start, i - start)));
+}
+
+void collect_css_attribute_selectors(std::string_view css, CssAttributeSelectorUsage& usage)
+{
+    const std::size_t n = css.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const char ch = css[i];
+        if (ch == '/' && i + 1 < n && css[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(css[i] == '*' && css[i + 1] == '/')) {
+                ++i;
+            }
+            i = std::min(n, i + 1);
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            const char quote = ch;
+            ++i;
+            while (i < n) {
+                if (css[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (css[i] == quote) {
+                    break;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (ch != '[') {
+            continue;
+        }
+
+        const std::size_t start = i + 1;
+        bool closed = false;
+        ++i;
+        while (i < n) {
+            if (css[i] == '"' || css[i] == '\'') {
+                const char quote = css[i++];
+                while (i < n) {
+                    if (css[i] == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (css[i] == quote) {
+                        break;
+                    }
+                    ++i;
+                }
+            } else if (css[i] == ']') {
+                closed = true;
+                break;
+            }
+            ++i;
+        }
+        if (!closed) {
+            usage.wildcard = true;
+            return;
+        }
+        record_css_attribute_selector(css.substr(start, i - start), usage);
+    }
+}
+
+std::vector<std::string> css_attribute_selector_names(const CssAttributeSelectorUsage& usage)
+{
+    std::vector<std::string> names;
+    names.reserve(usage.names.size());
+    for (const auto& name : usage.names) {
+        names.push_back(name);
+    }
+    return names;
+}
 
 // Extracts url(...) targets from a CSS source so they can be prefetched. Handles
 // comments, quoted/unquoted targets, and multi-value declarations. `@import`
@@ -365,6 +495,8 @@ struct Page::Impl {
         if (!js) {
             js = std::make_unique<JsRuntime>(document, options, loader);
             js->set_computed_style_resolver([this](NodeId node) { return computed_style(node); });
+            js->set_computed_style_property_resolver(
+                [this](NodeId node, std::string_view property) { return computed_style_property(node, property); });
             js->set_element_geometry_resolver([this](NodeId node) { return element_geometry(node); });
             js->set_viewport_resolver([this] { return last_render_options.viewport; });
             js->install();
@@ -566,6 +698,19 @@ struct Page::Impl {
         }
     }
 
+    void collect_inline_style_attribute_selectors(CssAttributeSelectorUsage& usage)
+    {
+        const NodeId root = document.document_node();
+        for (NodeId style : document.query_selector_all(root, "style")) {
+            collect_css_attribute_selectors(document.text_content(style), usage);
+        }
+    }
+
+    void apply_layout_sensitive_attributes(const CssAttributeSelectorUsage& usage)
+    {
+        document.set_layout_sensitive_attributes(css_attribute_selector_names(usage), usage.wildcard);
+    }
+
 #if defined(PAGECORE_ENABLE_RENDERING)
     void add_font_request(
         std::vector<PendingFontRequest>& requests,
@@ -718,6 +863,10 @@ struct Page::Impl {
     // invalidate_display_list_cache).
     std::shared_ptr<ResourceLoader> prepare_render_loader(const RenderOptions& render_options)
     {
+        CssAttributeSelectorUsage attribute_usage;
+        collect_inline_style_attribute_selectors(attribute_usage);
+        apply_layout_sensitive_attributes(attribute_usage);
+
         if (!render_options.load_external_resources || !loader) {
             return nullptr;
         }
@@ -763,11 +912,13 @@ struct Page::Impl {
             if (sheet.status < 200 || sheet.status >= 400 || sheet.body.empty()) {
                 continue;
             }
+            collect_css_attribute_selectors(sheet.body, attribute_usage);
             const std::string sheet_base = sheet.url.empty() ? wave1[i].url : sheet.url;
             for (const auto& ref : extract_css_urls(sheet.body)) {
                 add_subresource(wave2, seen, sheet_base, effective_base, ref.url, ref.kind);
             }
         }
+        apply_layout_sensitive_attributes(attribute_usage);
 
         if (!wave2.empty()) {
             try {
@@ -789,6 +940,30 @@ struct Page::Impl {
             render_options.load_external_resources,
             render_base_url(render_options),
         };
+    }
+
+    std::string styled_document_cache_reason(const StyledDocumentCacheKey& key) const
+    {
+        if (!styled_document_valid) {
+            return "empty";
+        }
+        if (styled_document_key.layout_mutation_version != key.layout_mutation_version) {
+            return "layout_mutation_version_changed";
+        }
+        if (styled_document_key.viewport_width != key.viewport_width
+            || styled_document_key.viewport_height != key.viewport_height) {
+            return "viewport_changed";
+        }
+        if (styled_document_key.device_scale_factor != key.device_scale_factor) {
+            return "scale_changed";
+        }
+        if (styled_document_key.load_external_resources != key.load_external_resources) {
+            return "load_external_resources_changed";
+        }
+        if (styled_document_key.base_url != key.base_url) {
+            return "base_url_changed";
+        }
+        return "valid";
     }
 
     bool has_current_layout(const RenderOptions& render_options) const
@@ -949,12 +1124,39 @@ struct Page::Impl {
 
     std::optional<ComputedStyle> computed_style(NodeId node)
     {
+        const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
+        const std::string cache_reason = styled_document_cache_reason(key);
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style", 1);
+        trace.event().node_id = node;
+        trace.event().mutation_version = document.mutation_version();
+        trace.event().layout_mutation_version = document.layout_mutation_version();
+        trace.event().styled_document_cache_hit = cache_reason == "valid";
+        trace.event().styled_document_cache_reason = cache_reason;
+        trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
         auto& engine = ensure_styled_document(last_render_options);
         engine.compute_styles_only();
         auto style = engine.computed_style(std::to_string(node));
         trace.set_count(style ? style->properties.size() : 0);
         return style;
+    }
+
+    std::optional<std::string> computed_style_property(NodeId node, std::string_view property)
+    {
+        const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
+        const std::string cache_reason = styled_document_cache_reason(key);
+        PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style_property", 1);
+        trace.event().node_id = node;
+        trace.event().mutation_version = document.mutation_version();
+        trace.event().layout_mutation_version = document.layout_mutation_version();
+        trace.event().styled_document_cache_hit = cache_reason == "valid";
+        trace.event().styled_document_cache_reason = cache_reason;
+        trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
+        trace.event().property = std::string(property);
+        auto& engine = ensure_styled_document(last_render_options);
+        engine.compute_styles_only();
+        auto value = engine.computed_style_property(std::to_string(node), property);
+        trace.set_count(value ? 1 : 0);
+        return value;
     }
 
     std::optional<ElementGeometry> element_geometry(NodeId node)
@@ -1118,6 +1320,11 @@ std::optional<std::string> Page::outer_html(std::string_view selector)
 std::optional<ComputedStyle> Page::computed_style(NodeId node) const
 {
     return impl_->computed_style(node);
+}
+
+std::optional<std::string> Page::computed_style_property(NodeId node, std::string_view property) const
+{
+    return impl_->computed_style_property(node, property);
 }
 
 std::optional<ElementGeometry> Page::element_geometry(NodeId node) const

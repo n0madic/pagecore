@@ -53,6 +53,8 @@ public:
     bool is_connected(NodeId id) const;
     std::uint64_t mutation_version() const;
     std::uint64_t layout_mutation_version() const;
+    std::string last_layout_mutation_reason() const;
+    void set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard = false);
     // Monotonic counter bumped only when a node id is invalidated (forgotten via
     // innerHTML replacement) or the document is reparsed. Wrapper layers use it
     // to know when a cached id may have become stale.

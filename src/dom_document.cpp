@@ -77,24 +77,33 @@ bool starts_with(std::string_view value, std::string_view prefix)
     return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
 
-bool attribute_affects_layout(std::string_view name)
+bool is_service_attribute(std::string_view lower)
 {
-    const std::string lower = ascii_lower(name);
-
-    // Service metadata is commonly churned by JS frameworks and analytics. We
-    // intentionally keep it out of the layout cache key; CSS that explicitly
-    // depends on these attributes will need selector-aware invalidation later.
-    if (starts_with(lower, "data-")
+    return starts_with(lower, "data-")
         || starts_with(lower, "aria-")
         || lower == "role"
-        || starts_with(lower, "on")) {
-        return false;
-    }
+        || starts_with(lower, "on");
+}
 
-    // Unknown non-service attributes are conservatively layout-affecting:
-    // selectors may match [attr], and resource/layout semantics often live in
-    // ordinary attributes such as href, src, width, height, hidden, or media.
-    return true;
+bool is_always_layout_attribute(std::string_view lower)
+{
+    return lower == "class"
+        || lower == "id"
+        || lower == "style"
+        || lower == "hidden"
+        || lower == "src"
+        || lower == "srcset"
+        || lower == "sizes"
+        || lower == "href"
+        || lower == "rel"
+        || lower == "media"
+        || lower == "width"
+        || lower == "height"
+        || lower == "type"
+        || lower == "disabled"
+        || lower == "checked"
+        || lower == "selected"
+        || lower == "open";
 }
 
 // Iterative pre-order traversal — recursion here would overflow the native
@@ -472,11 +481,51 @@ void DomDocument::Impl::forget_node(lxb_dom_node_t* node)
     ++forget_version;
 }
 
-void DomDocument::Impl::mark_mutated(bool affects_layout)
+bool DomDocument::Impl::attribute_affects_layout(std::string_view name) const
+{
+    const std::string lower = ascii_lower(name);
+    if (is_service_attribute(lower)) {
+        return layout_sensitive_attribute_wildcard
+            || layout_sensitive_attributes.find(lower) != layout_sensitive_attributes.end();
+    }
+    if (is_always_layout_attribute(lower)) {
+        return true;
+    }
+
+    // Keep ordinary unknown attributes conservative: CSS selectors and resource
+    // semantics commonly depend on them, while service metadata churn is the hot
+    // path this split is intended to avoid.
+    return true;
+}
+
+bool DomDocument::Impl::node_affects_layout(lxb_dom_node_t* node) const
+{
+    if (node == nullptr) {
+        return true;
+    }
+    if (node->type == LXB_DOM_NODE_TYPE_COMMENT) {
+        return false;
+    }
+    if (node->type == LXB_DOM_NODE_TYPE_TEXT && is_html_tag(node->parent, LXB_TAG_HEAD)) {
+        return false;
+    }
+    for (auto* current = node; current != nullptr; current = current->parent) {
+        if (is_html_tag(current, LXB_TAG_SCRIPT)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void DomDocument::Impl::mark_mutated(bool affects_layout, std::string_view layout_reason)
 {
     ++mutation_version;
     if (affects_layout) {
         ++layout_mutation_version;
+        last_layout_mutation_reason.assign(layout_reason);
+        if (last_layout_mutation_reason.empty()) {
+            last_layout_mutation_reason = "unknown";
+        }
     }
 }
 
@@ -548,6 +597,7 @@ void DomDocument::parse(std::string_view html)
     impl_->next_id = carried_next_id;
     impl_->mutation_version = carried_mutation_version + 1;
     impl_->layout_mutation_version = carried_layout_mutation_version + 1;
+    impl_->last_layout_mutation_reason = "parse";
     impl_->forget_version = carried_forget_version + 1;
 
     const auto status = lxb_html_document_parse(
@@ -723,6 +773,26 @@ std::uint64_t DomDocument::layout_mutation_version() const
     return impl_ == nullptr ? 0 : impl_->layout_mutation_version;
 }
 
+std::string DomDocument::last_layout_mutation_reason() const
+{
+    return impl_ == nullptr ? std::string() : impl_->last_layout_mutation_reason;
+}
+
+void DomDocument::set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard)
+{
+    if (impl_ == nullptr) {
+        return;
+    }
+    impl_->layout_sensitive_attributes.clear();
+    impl_->layout_sensitive_attribute_wildcard = wildcard;
+    for (const auto& name : attribute_names) {
+        const std::string lower = ascii_lower(name);
+        if (!lower.empty()) {
+            impl_->layout_sensitive_attributes.insert(lower);
+        }
+    }
+}
+
 std::uint64_t DomDocument::forget_version() const
 {
     return impl_ == nullptr ? 0 : impl_->forget_version;
@@ -777,8 +847,9 @@ std::vector<DomDocument::Attribute> DomDocument::attributes(NodeId id) const
 
 void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_view value)
 {
+    auto* element = impl_->require_element(id);
     auto* attr = lxb_dom_element_set_attribute(
-        impl_->require_element(id),
+        element,
         reinterpret_cast<const lxb_char_t*>(name.data()),
         name.size(),
         reinterpret_cast<const lxb_char_t*>(value.data()),
@@ -788,14 +859,17 @@ void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_vi
         throw std::runtime_error("failed to set DOM attribute");
     }
 
-    impl_->mark_mutated(attribute_affects_layout(name));
+    impl_->mark_mutated(
+        impl_->node_affects_layout(lxb_dom_interface_node(element)) && impl_->attribute_affects_layout(name),
+        "set_attribute:" + ascii_lower(name));
 }
 
 void DomDocument::remove_attribute(NodeId id, std::string_view name)
 {
     const bool had_attribute = has_attribute(id, name);
+    auto* element = impl_->require_element(id);
     const auto status = lxb_dom_element_remove_attribute(
-        impl_->require_element(id),
+        element,
         reinterpret_cast<const lxb_char_t*>(name.data()),
         name.size());
 
@@ -804,7 +878,9 @@ void DomDocument::remove_attribute(NodeId id, std::string_view name)
     }
 
     if (had_attribute) {
-        impl_->mark_mutated(attribute_affects_layout(name));
+        impl_->mark_mutated(
+            impl_->node_affects_layout(lxb_dom_interface_node(element)) && impl_->attribute_affects_layout(name),
+            "remove_attribute:" + ascii_lower(name));
     }
 }
 
@@ -835,7 +911,7 @@ void DomDocument::set_text_content(NodeId id, std::string_view value)
         if (status != LXB_STATUS_OK) {
             throw std::runtime_error("failed to replace character data");
         }
-        impl_->mark_mutated();
+        impl_->mark_mutated(impl_->node_affects_layout(node), "set_text_content");
         return;
     }
 
@@ -848,7 +924,7 @@ void DomDocument::set_text_content(NodeId id, std::string_view value)
         const NodeId text = create_text_node(value);
         append_child(id, text);
     } else if (had_children) {
-        impl_->mark_mutated();
+        impl_->mark_mutated(impl_->node_affects_layout(node), "set_text_content");
     }
 }
 
@@ -890,7 +966,7 @@ void DomDocument::set_inner_html(NodeId id, std::string_view html)
     for (auto* previous : previous_nodes) {
         impl_->forget_node(previous);
     }
-    impl_->mark_mutated();
+    impl_->mark_mutated(impl_->node_affects_layout(node), "set_inner_html");
 }
 
 std::string DomDocument::outer_html(NodeId id) const
@@ -962,12 +1038,14 @@ std::string DomDocument::serialize_html_for_layout(bool omit_js_disabled_content
 
 NodeId DomDocument::append_child(NodeId parent, NodeId child)
 {
+    auto* parent_node = impl_->require_node(parent);
     auto* child_node = impl_->require_node(child);
-    const auto status = lxb_dom_node_append_child(impl_->require_node(parent), child_node);
+    const bool affects_layout = impl_->node_affects_layout(parent_node) && impl_->node_affects_layout(child_node);
+    const auto status = lxb_dom_node_append_child(parent_node, child_node);
     if (status != LXB_DOM_EXCEPTION_OK) {
         throw std::runtime_error("failed to append DOM child");
     }
-    impl_->mark_mutated();
+    impl_->mark_mutated(affects_layout, "append_child");
     return impl_->id_for(child_node);
 }
 
@@ -977,10 +1055,12 @@ NodeId DomDocument::insert_before(NodeId parent, NodeId child, NodeId reference_
         return append_child(parent, child);
     }
 
+    auto* parent_node = impl_->require_node(parent);
     auto* child_node = impl_->require_node(child);
     auto* reference_node = impl_->require_node(reference_child);
+    const bool affects_layout = impl_->node_affects_layout(parent_node) && impl_->node_affects_layout(child_node);
     const auto status = lxb_dom_node_insert_before_spec(
-        impl_->require_node(parent),
+        parent_node,
         child_node,
         reference_node);
 
@@ -988,31 +1068,36 @@ NodeId DomDocument::insert_before(NodeId parent, NodeId child, NodeId reference_
         throw std::runtime_error("failed to insert DOM child");
     }
 
-    impl_->mark_mutated();
+    impl_->mark_mutated(affects_layout, "insert_before");
     return impl_->id_for(child_node);
 }
 
 NodeId DomDocument::remove_child(NodeId parent, NodeId child)
 {
+    auto* parent_node = impl_->require_node(parent);
     auto* child_node = impl_->require_node(child);
-    const auto status = lxb_dom_node_remove_child(impl_->require_node(parent), child_node);
+    const bool affects_layout = impl_->node_affects_layout(parent_node) && impl_->node_affects_layout(child_node);
+    const auto status = lxb_dom_node_remove_child(parent_node, child_node);
     if (status != LXB_DOM_EXCEPTION_OK) {
         throw std::runtime_error("failed to remove DOM child");
     }
-    impl_->mark_mutated();
+    impl_->mark_mutated(affects_layout, "remove_child");
     return impl_->id_for(child_node);
 }
 
 NodeId DomDocument::replace_child(NodeId parent, NodeId child, NodeId replaced_child)
 {
+    auto* parent_node = impl_->require_node(parent);
     auto* child_node = impl_->require_node(child);
     auto* replaced_node = impl_->require_node(replaced_child);
-    const auto status = lxb_dom_node_replace_child(impl_->require_node(parent), child_node, replaced_node);
+    const bool affects_layout = impl_->node_affects_layout(parent_node)
+        && (impl_->node_affects_layout(child_node) || impl_->node_affects_layout(replaced_node));
+    const auto status = lxb_dom_node_replace_child(parent_node, child_node, replaced_node);
     if (status != LXB_DOM_EXCEPTION_OK) {
         throw std::runtime_error("failed to replace DOM child");
     }
 
-    impl_->mark_mutated();
+    impl_->mark_mutated(affects_layout, "replace_child");
     return impl_->id_for(replaced_node);
 }
 

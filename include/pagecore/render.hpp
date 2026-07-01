@@ -215,6 +215,20 @@ public:
         return std::nullopt;
     }
 
+    virtual std::optional<std::string> computed_style_property(std::string_view node_key, std::string_view property)
+    {
+        auto style = computed_style(node_key);
+        if (!style) {
+            return std::nullopt;
+        }
+        for (const auto& [name, value] : style->properties) {
+            if (name == property) {
+                return value;
+            }
+        }
+        return std::nullopt;
+    }
+
     // Looks up a single element by the same engine-defined key and reads
     // back its box-model geometry from the last layout() pass. Returns
     // nullopt if the element doesn't participate in layout (display:none,

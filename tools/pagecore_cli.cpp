@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -203,8 +204,33 @@ void write_perf_event_jsonl(std::ostream& out, const pagecore::PerfEvent& event)
     out << ",\"name\":";
     write_json_string(out, event.name);
     out << ",\"elapsed_us\":" << event.elapsed_us
-        << ",\"count\":" << event.count
-        << "}\n";
+        << ",\"count\":" << event.count;
+    if (event.node_id) {
+        out << ",\"node_id\":" << *event.node_id;
+    }
+    if (event.mutation_version) {
+        out << ",\"mutation_version\":" << *event.mutation_version;
+    }
+    if (event.layout_mutation_version) {
+        out << ",\"layout_mutation_version\":" << *event.layout_mutation_version;
+    }
+    if (event.styled_document_cache_hit) {
+        out << ",\"styled_document_cache_hit\":"
+            << (*event.styled_document_cache_hit ? "true" : "false");
+    }
+    if (!event.styled_document_cache_reason.empty()) {
+        out << ",\"styled_document_cache_reason\":";
+        write_json_string(out, event.styled_document_cache_reason);
+    }
+    if (!event.layout_mutation_reason.empty()) {
+        out << ",\"layout_mutation_reason\":";
+        write_json_string(out, event.layout_mutation_reason);
+    }
+    if (!event.property.empty()) {
+        out << ",\"property\":";
+        write_json_string(out, event.property);
+    }
+    out << "}\n";
 }
 
 } // namespace
@@ -279,8 +305,12 @@ int main(int argc, char** argv)
                 }
                 perf_trace_stream = perf_trace_file.get();
             }
-            pagecore::PerfTraceCallback perf_trace = [perf_trace_stream](const pagecore::PerfEvent& event) {
-                write_perf_event_jsonl(*perf_trace_stream, event);
+            auto perf_trace_mutex = std::make_shared<std::mutex>();
+            pagecore::PerfTraceCallback perf_trace = [perf_trace_stream, perf_trace_mutex](const pagecore::PerfEvent& event) {
+                std::ostringstream line;
+                write_perf_event_jsonl(line, event);
+                std::lock_guard<std::mutex> lock(*perf_trace_mutex);
+                *perf_trace_stream << line.str();
             };
             load_options.perf_trace = perf_trace;
             render_options.perf_trace = std::move(perf_trace);
