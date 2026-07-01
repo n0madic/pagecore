@@ -15,6 +15,8 @@ option(PAGECORE_BUILD_TOOLS "Build PageCore command-line tools" ${PAGECORE_DEFAU
 option(PAGECORE_BUILD_EXAMPLES "Build PageCore examples" OFF)
 set(PAGECORE_DEFAULT_ENABLE_RENDERING ${PAGECORE_BUILD_TOOLS})
 option(PAGECORE_ENABLE_RENDERING "Build the litehtml layout adapter and Cairo/Pango rendering pipeline" ${PAGECORE_DEFAULT_ENABLE_RENDERING})
+option(PAGECORE_ENABLE_WEBP "Build WebP image decoding support" ON)
+option(PAGECORE_ENABLE_SVG "Build SVG image rasterization support" ON)
 set(PAGECORE_IMAGE_DECODER "system" CACHE STRING "Raster image decoder backend: system or stb")
 set_property(CACHE PAGECORE_IMAGE_DECODER PROPERTY STRINGS system stb)
 set(PAGECORE_IMAGE_DECODER_CHOICES system stb)
@@ -238,11 +240,12 @@ if(PAGECORE_ENABLE_RENDERING)
         pangoft2
         fontconfig
         libbrotlidec
-        libwebp
-        libwebpdecoder
     )
     if(PAGECORE_IMAGE_DECODER STREQUAL "system")
         list(APPEND PAGECORE_RENDERING_PKG_MODULES libturbojpeg)
+    endif()
+    if(PAGECORE_ENABLE_WEBP)
+        list(APPEND PAGECORE_RENDERING_PKG_MODULES libwebp libwebpdecoder)
     endif()
 
     pagecore_pkg_config_static_first(
@@ -478,6 +481,18 @@ if(PAGECORE_ENABLE_RENDERING)
     else()
         target_compile_definitions(pagecore PRIVATE PAGECORE_IMAGE_DECODER_SYSTEM=1)
     endif()
+endif()
+
+if(PAGECORE_ENABLE_WEBP)
+    target_compile_definitions(pagecore PUBLIC PAGECORE_ENABLE_WEBP=1)
+else()
+    target_compile_definitions(pagecore PUBLIC PAGECORE_ENABLE_WEBP=0)
+endif()
+
+if(PAGECORE_ENABLE_SVG)
+    target_compile_definitions(pagecore PUBLIC PAGECORE_ENABLE_SVG=1)
+else()
+    target_compile_definitions(pagecore PUBLIC PAGECORE_ENABLE_SVG=0)
 endif()
 
 target_link_libraries(pagecore

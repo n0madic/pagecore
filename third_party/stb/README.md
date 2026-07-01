@@ -8,5 +8,5 @@ Vendored copy of `stb_image.h` from the `nothings/stb` repository.
 - License: public domain or MIT; see `LICENSE` and the license block at the end of `stb_image.h`.
 
 PageCore uses this only when configured with `-DPAGECORE_IMAGE_DECODER=stb`.
-That backend decodes PNG, JPEG, and GIF through stb_image while keeping WebP on
-libwebp and SVG on PageCore's Cairo-based SVG subset.
+That backend decodes PNG, JPEG, and GIF through stb_image. WebP and SVG are
+controlled independently by `PAGECORE_ENABLE_WEBP` and `PAGECORE_ENABLE_SVG`.

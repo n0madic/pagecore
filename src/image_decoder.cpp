@@ -12,7 +12,9 @@
 #include <gif_lib.h>
 #include <turbojpeg.h>
 #endif
+#if PAGECORE_ENABLE_WEBP
 #include <webp/decode.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -1535,6 +1537,7 @@ std::shared_ptr<const DecodedImage> decode_jpeg_rgba(std::string_view bytes)
 
 std::shared_ptr<const DecodedImage> decode_webp_rgba(std::string_view bytes)
 {
+#if PAGECORE_ENABLE_WEBP
     if (bytes.empty()) {
         throw std::runtime_error("decode WebP: empty input");
     }
@@ -1561,6 +1564,10 @@ std::shared_ptr<const DecodedImage> decode_webp_rgba(std::string_view bytes)
     }
 
     return image;
+#else
+    (void) bytes;
+    throw std::runtime_error("decode WebP: WebP support is disabled");
+#endif
 }
 
 std::shared_ptr<const DecodedImage> decode_gif_rgba(std::string_view bytes)
@@ -1645,6 +1652,7 @@ std::shared_ptr<const DecodedImage> decode_gif_rgba(std::string_view bytes)
 
 std::shared_ptr<const DecodedImage> decode_svg_rgba(std::string_view bytes)
 {
+#if PAGECORE_ENABLE_SVG
     if (bytes.empty()) {
         throw std::runtime_error("decode SVG: empty input");
     }
@@ -1739,6 +1747,10 @@ std::shared_ptr<const DecodedImage> decode_svg_rgba(std::string_view bytes)
     }
 
     return surface_to_decoded_image(surface.get(), "decode SVG");
+#else
+    (void) bytes;
+    throw std::runtime_error("decode SVG: SVG support is disabled");
+#endif
 }
 
 } // namespace pagecore

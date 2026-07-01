@@ -25,7 +25,7 @@ Small modular web engine for headless automation, embedding, offscreen rendering
 - Layout geometry flows back to JS through the same litehtml engine and `data-pc-sid` identity used by `getComputedStyle()`, but reads from a real `layout()` pass (`document_->render()`, populating litehtml's `render_item` tree) instead of just the cascade: `Page::element_geometry(NodeId)` forces that layout (shared `Page::Impl::ensure_layout`, also used by `display_list()`, so a render afterwards reuses the same pass) and `LayoutEngine::element_geometry` reads `render_item::get_placement()` (content-box) expanded by `get_paddings()`/`get_borders()` into padding-box and border-box (`litehtml::position::operator+=`, the same expansion `html_tag.cpp` uses for paint). `getBoundingClientRect()`, `offsetWidth/offsetHeight`, `offsetTop/offsetLeft`, `clientWidth/clientHeight`, and `clientTop/clientLeft` (`src/dom_shim/30_dom.js`) are derived from this; a `null` result (element is `display:none`, which never gets a `render_item`, or `layout()` hasn't run) maps to all-zero geometry, same as before this channel existed. Because litehtml has no incremental layout against the Lexbor tree, each geometry read that follows a DOM mutation rebuilds the whole styled document and re-runs layout, so a script that reads geometry in a tight read-modify-write loop (e.g. jQuery init) on a large DOM would otherwise spend seconds per read. To bound this, once `Page::Impl` observes that building/laying-out the page's styled document is expensive (a single rebuild or layout exceeds a small threshold), it stops forcing synchronous layout for geometry reads and returns `nullopt` (geometry → 0, the pre-geometry-channel value) for the rest of the load; detection piggybacks on work `getComputedStyle()`/the render already do, so heavy pages pay nothing extra for geometry while normal pages keep full geometry. `window.innerWidth/innerHeight/outerWidth/outerHeight/devicePixelRatio` and `screen.*` are live getters reading `Page::Impl::last_render_options.viewport` through a separate, layout-free bridge call, so they reflect whatever viewport the page was most recently rendered with instead of a value fixed at JS install time.
 - Known geometry-channel limitations: `scrollWidth`/`scrollHeight` are approximated as `clientWidth`/`clientHeight` (litehtml's real scrolled-content size is a protected field with no public getter), so they're wrong for `overflow:scroll|auto` content with actual overflow; `scrollTop`/`scrollLeft` are no-op stubs (read 0, write does nothing) — there is no write channel from JS scroll state back into litehtml layout; `getClientRects()` returns a single bounding rect rather than one rect per line-box fragment for wrapped inline elements; `Range.getBoundingClientRect`/`getClientRects` and `Document.elementFromPoint` are not implemented; and `IntersectionObserver`/`ResizeObserver` don't actually fire (no observation loop), unlike the one-shot geometry reads above.
 - `Page::render(RenderOptions)` rasterizes that display list through the Cairo/PangoCairo backend and returns RGBA pixels. Cairo owns 2D rasterization; PangoCairo owns real font selection, shaping, and anti-aliased text drawing. Future Skia backends should implement `RasterBackend` over the same `DisplayList` contract.
-- PNG, JPEG, WebP, GIF, and SVG images are loaded through the shared `ResourceLoader`, decoded into backend-neutral RGBA, carried on `ImageCommand`, and drawn by the Cairo raster backend. The default `PAGECORE_IMAGE_DECODER=system` backend uses Cairo's stream decoder for PNG, TurboJPEG for JPEG, libwebp for WebP, giflib first-frame decoding for GIF, and the built-in Cairo-based SVG subset for common primitives and paths. `PAGECORE_IMAGE_DECODER=stb` switches PNG/JPEG/GIF to the vendored `third_party/stb/stb_image.h` decoder while WebP and SVG stay on the same libwebp/Cairo paths. Decode failures remain non-fatal placeholders.
+- PNG, JPEG, WebP, GIF, and SVG images are loaded through the shared `ResourceLoader`, decoded into backend-neutral RGBA, carried on `ImageCommand`, and drawn by the Cairo raster backend. The default `PAGECORE_IMAGE_DECODER=system` backend uses Cairo's stream decoder for PNG, TurboJPEG for JPEG, libwebp for WebP, giflib first-frame decoding for GIF, and the built-in Cairo-based SVG subset for common primitives and paths. `PAGECORE_IMAGE_DECODER=stb` switches PNG/JPEG/GIF to the vendored `third_party/stb/stb_image.h` decoder. WebP and SVG are independently optional through `PAGECORE_ENABLE_WEBP` and `PAGECORE_ENABLE_SVG`; decode failures or disabled formats remain non-fatal placeholders.
 - CSS `background-size`, `background-position`, and `background-repeat` are resolved by the litehtml adapter into backend-neutral image tile metadata, then rasterized by Cairo with clipping and repeat-x/repeat-y/repeat/no-repeat behavior.
 - CSS linear gradients are carried as backend-neutral `LinearGradientCommand`s and rasterized by Cairo.
 - CSS `border-radius` is carried as backend-neutral corner radii on background fill/image/border/clip commands. Cairo uses it for rounded clipping of solid backgrounds, background images, and pushed clip regions.
@@ -65,14 +65,24 @@ Rendering system dependencies:
 - `pangoft2`
 - `fontconfig`
 - `libbrotlidec`
-- `libwebp`
-- `libwebpdecoder`
 
 The default `-DPAGECORE_IMAGE_DECODER=system` backend additionally requires
 `libturbojpeg` and `giflib`. Configure with `-DPAGECORE_IMAGE_DECODER=stb` to
 decode PNG/JPEG/GIF through the vendored stb_image backend instead; this removes
-the direct `libturbojpeg` and `giflib` build dependencies, while WebP still uses
-libwebp and SVG still uses PageCore's Cairo-based SVG subset.
+the direct `libturbojpeg` and `giflib` build dependencies.
+
+WebP decoding is enabled by default and requires `libwebp` and `libwebpdecoder`.
+Disable it with `-DPAGECORE_ENABLE_WEBP=OFF` to remove those dependencies. SVG
+rasterization is enabled by default and uses PageCore's built-in Cairo-based SVG
+subset; disable it with `-DPAGECORE_ENABLE_SVG=OFF` when a smaller image surface
+is preferred over SVG image support. A minimal rendering image-decoder profile is:
+
+```sh
+cmake -S . -B build-minimal-images \
+  -DPAGECORE_IMAGE_DECODER=stb \
+  -DPAGECORE_ENABLE_WEBP=OFF \
+  -DPAGECORE_ENABLE_SVG=OFF
+```
 
 CMake uses pkg-config for these system libraries and links static archives by default when an advertised `-lfoo` can be resolved to `libfoo.a` in the pkg-config library search paths. Libraries without an available `.a` fall back to the normal linker token, so the build remains usable on hosts where a dependency is only available as a shared/system library.
 
