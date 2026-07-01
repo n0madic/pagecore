@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -181,6 +182,10 @@ struct CssUrlRef {
     ResourceKind kind = ResourceKind::Image;
 };
 
+struct GeometryCacheEntry {
+    std::optional<ElementGeometry> geometry;
+};
+
 // Extracts url(...) targets from a CSS source so they can be prefetched. Handles
 // comments, quoted/unquoted targets, and multi-value declarations. `@import`
 // targets are returned as stylesheets; `src:` declarations (web fonts) are
@@ -345,17 +350,21 @@ struct Page::Impl {
     // against our Lexbor tree, so each geometry read that follows a DOM mutation
     // forces a full rebuild (serialize the whole DOM, re-parse, re-cascade) plus
     // a full layout. On a large DOM that's seconds per read; a script that reads
-    // geometry in a tight read-modify-write loop (e.g. jQuery init) then spends
-    // tens of seconds and trips the per-script execution deadline. Once we
-    // observe that building/laying-out this page's styled document is expensive,
-    // we stop doing synchronous layout for geometry reads and return nullopt —
-    // the JS layer maps that to 0, exactly the value the engine returned before
-    // the geometry channel existed, so heavy pages still finish rendering. Small
-    // pages (sub-threshold builds) keep full geometry. The detection piggybacks
-    // on work computed_style()/the render already do, so a heavy page pays
-    // nothing extra for geometry beyond what it already paid for the cascade.
+    // geometry in a tight read-modify-write loop (e.g. jQuery init) can then trip
+    // the per-script execution deadline. Once forced geometry layouts consume a
+    // small budget, later post-mutation geometry reads return the last exact
+    // value seen for that NodeId (or nullopt/0 if none exists) until a render or
+    // another non-geometry caller produces a fresh current layout. Cheap pages
+    // keep exact synchronous geometry.
     bool styled_document_expensive = false;
     static constexpr long long kExpensiveStyledDocumentUs = 250'000; // 0.25s
+    bool geometry_bounded_mode = false;
+    int geometry_forced_layout_count = 0;
+    long long geometry_forced_layout_us = 0;
+    std::uint64_t geometry_cache_forget_version = 0;
+    std::unordered_map<NodeId, GeometryCacheEntry> last_known_geometry;
+    static constexpr int kGeometryForcedLayoutCountThreshold = 2;
+    static constexpr long long kGeometryForcedLayoutBudgetUs = 100'000; // 0.10s
 
     // Sub-resource cache shared by every styled-document rebuild of the current
     // document, so a page that rebuilds many times during script execution
@@ -384,6 +393,11 @@ struct Page::Impl {
         // so drop the cross-rebuild cache when the document/loader identity
         // changes.
         render_resource_cache.reset();
+        geometry_bounded_mode = false;
+        geometry_forced_layout_count = 0;
+        geometry_forced_layout_us = 0;
+        geometry_cache_forget_version = document.forget_version();
+        last_known_geometry.clear();
     }
 
     void ensure_js()
@@ -675,6 +689,68 @@ struct Page::Impl {
         return cache;
     }
 
+    StyledDocumentCacheKey styled_document_cache_key(const RenderOptions& render_options) const
+    {
+        return StyledDocumentCacheKey{
+            document.mutation_version(),
+            render_options.viewport.width,
+            render_options.viewport.height,
+            render_options.viewport.device_scale_factor,
+            render_options.load_external_resources,
+            render_base_url(render_options),
+        };
+    }
+
+    bool has_current_layout(const RenderOptions& render_options) const
+    {
+        return styled_document_valid
+            && styled_document_laid_out
+            && styled_document_key == styled_document_cache_key(render_options);
+    }
+
+    void sync_geometry_cache_for_forget_version()
+    {
+        const std::uint64_t current_forget_version = document.forget_version();
+        if (geometry_cache_forget_version == current_forget_version) {
+            return;
+        }
+        geometry_cache_forget_version = current_forget_version;
+        last_known_geometry.clear();
+    }
+
+    std::optional<ElementGeometry> cached_geometry(NodeId node)
+    {
+        sync_geometry_cache_for_forget_version();
+        if (!document.is_connected(node)) {
+            last_known_geometry.erase(node);
+            return std::nullopt;
+        }
+
+        const auto found = last_known_geometry.find(node);
+        return found == last_known_geometry.end() ? std::nullopt : found->second.geometry;
+    }
+
+    void remember_geometry(NodeId node, std::optional<ElementGeometry> geometry)
+    {
+        sync_geometry_cache_for_forget_version();
+        if (!document.is_connected(node)) {
+            last_known_geometry.erase(node);
+            return;
+        }
+        last_known_geometry[node] = GeometryCacheEntry{std::move(geometry)};
+    }
+
+    void note_geometry_forced_layout(long long elapsed_us)
+    {
+        ++geometry_forced_layout_count;
+        geometry_forced_layout_us += std::max<long long>(0, elapsed_us);
+        if (styled_document_expensive
+            || (geometry_forced_layout_count >= kGeometryForcedLayoutCountThreshold
+                && geometry_forced_layout_us > kGeometryForcedLayoutBudgetUs)) {
+            geometry_bounded_mode = true;
+        }
+    }
+
     std::unique_ptr<LayoutEngine> build_layout(const RenderOptions& render_options)
     {
         if (!layout_factory) {
@@ -699,14 +775,7 @@ struct Page::Impl {
     // cascade (compute_styles_only()).
     LayoutEngine& ensure_styled_document(const RenderOptions& render_options)
     {
-        StyledDocumentCacheKey key{
-            document.mutation_version(),
-            render_options.viewport.width,
-            render_options.viewport.height,
-            render_options.viewport.device_scale_factor,
-            render_options.load_external_resources,
-            render_base_url(render_options),
-        };
+        StyledDocumentCacheKey key = styled_document_cache_key(render_options);
 
         if (styled_document_valid && styled_document_key == key) {
             return *styled_document;
@@ -775,22 +844,44 @@ struct Page::Impl {
 
     std::optional<ElementGeometry> element_geometry(NodeId node)
     {
-        // Heavy page already detected: skip the forced layout entirely and let
-        // the JS layer fall back to zero geometry (the pre-geometry-channel
-        // behavior). This keeps read-modify-write geometry loops from rebuilding
-        // and re-laying-out a large document on every read.
-        if (styled_document_expensive) {
+        sync_geometry_cache_for_forget_version();
+        if (!document.is_connected(node)) {
+            last_known_geometry.erase(node);
             return std::nullopt;
         }
+
+        const std::string node_key = std::to_string(node);
+        if (has_current_layout(last_render_options)) {
+            auto geometry = styled_document->element_geometry(node_key);
+            remember_geometry(node, geometry);
+            return geometry;
+        }
+
+        if (geometry_bounded_mode || styled_document_expensive) {
+            geometry_bounded_mode = true;
+            return cached_geometry(node);
+        }
+
         // The (re)build itself may reveal the page is expensive; re-check before
         // paying for a full layout() so the first geometry read on a heavy page
-        // costs at most the cascade build it would have paid for anyway.
+        // costs at most the cascade build it would have paid for anyway. The
+        // time still counts against the geometry budget.
+        const auto t0 = std::chrono::steady_clock::now();
         ensure_styled_document(last_render_options);
         if (styled_document_expensive) {
-            return std::nullopt;
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            note_geometry_forced_layout(elapsed_us);
+            return cached_geometry(node);
         }
+
         auto& engine = ensure_layout(last_render_options);
-        return engine.element_geometry(std::to_string(node));
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        auto geometry = engine.element_geometry(node_key);
+        remember_geometry(node, geometry);
+        note_geometry_forced_layout(elapsed_us);
+        return geometry;
     }
 };
 

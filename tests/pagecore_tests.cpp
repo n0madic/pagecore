@@ -23,6 +23,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -4349,6 +4350,69 @@ private:
     std::shared_ptr<pagecore::LayoutEngineFactory> inner_;
 };
 
+class SlowGeometryEngine final : public pagecore::LayoutEngine {
+public:
+    explicit SlowGeometryEngine(std::shared_ptr<int> layout_calls)
+        : layout_calls_(std::move(layout_calls))
+    {
+    }
+
+    void set_resource_loader(std::shared_ptr<pagecore::ResourceLoader>) override { }
+    void set_viewport(pagecore::Viewport viewport) override
+    {
+        viewport_ = viewport;
+        display_list_.viewport = viewport_;
+    }
+    void load_html(std::string_view, std::string_view) override
+    {
+        laid_out_ = false;
+        display_list_.clear();
+        display_list_.viewport = viewport_;
+    }
+    void layout() override
+    {
+        ++(*layout_calls_);
+        std::this_thread::sleep_for(std::chrono::milliseconds(65));
+        laid_out_ = true;
+        display_list_.viewport = viewport_;
+        display_list_.content_width = viewport_.width;
+        display_list_.content_height = viewport_.height;
+    }
+    const pagecore::DisplayList& display_list() const override { return display_list_; }
+    std::optional<pagecore::ElementGeometry> element_geometry(std::string_view) override
+    {
+        if (!laid_out_) {
+            return std::nullopt;
+        }
+        const float width = static_cast<float>(*layout_calls_ * 10);
+        return pagecore::ElementGeometry{
+            pagecore::Rect{0.0f, 0.0f, width, 10.0f},
+            pagecore::Rect{0.0f, 0.0f, width, 10.0f},
+        };
+    }
+
+private:
+    std::shared_ptr<int> layout_calls_;
+    pagecore::Viewport viewport_;
+    pagecore::DisplayList display_list_;
+    bool laid_out_ = false;
+};
+
+class SlowGeometryFactory final : public pagecore::LayoutEngineFactory {
+public:
+    SlowGeometryFactory()
+        : layout_calls(std::make_shared<int>(0))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        return std::make_unique<SlowGeometryEngine>(layout_calls);
+    }
+
+    std::shared_ptr<int> layout_calls;
+};
+
 void test_element_geometry_reuses_cached_layout()
 {
     auto counting = std::make_shared<LayoutCallCountingFactory>(pagecore::create_litehtml_layout_engine_factory());
@@ -4383,6 +4447,57 @@ void test_element_geometry_reuses_cached_layout()
     require(
         *counting->layout_calls == 2,
         "a DOM mutation must invalidate the cache and force a fresh layout() on next access");
+}
+
+void test_element_geometry_bounded_mode_returns_cached_geometry()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected to find #x");
+
+    auto first = page.element_geometry(box);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    require(*factory->layout_calls == 1, "first geometry read should force one layout");
+
+    page.document().set_attribute(box, "style", "width:20px");
+    auto second = page.element_geometry(box);
+    require(second && second->border_box.width == 20.0f, "second geometry read should still be exact");
+    require(*factory->layout_calls == 2, "second geometry read should force a second layout");
+
+    page.document().set_attribute(box, "style", "width:30px");
+    auto third = page.element_geometry(box);
+    require(third && third->border_box.width == 20.0f, "bounded mode should return last known geometry");
+    require(*factory->layout_calls == 2, "bounded mode must not force another layout");
+}
+
+void test_element_geometry_bounded_mode_drops_disconnected_stale_geometry()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId box = page.document().query_selector(root, "#x");
+    const pagecore::NodeId parent = page.document().parent_node(box);
+    require(box != pagecore::kInvalidNodeId && parent != pagecore::kInvalidNodeId, "expected connected #x");
+
+    (void) page.element_geometry(box);
+    page.document().set_attribute(box, "style", "width:20px");
+    auto second = page.element_geometry(box);
+    require(second && second->border_box.width == 20.0f, "second geometry read should populate the stale cache");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    page.document().remove_child(parent, box);
+    auto removed = page.element_geometry(box);
+    require(!removed, "bounded mode must not return stale geometry for a disconnected node");
+    require(*factory->layout_calls == 2, "disconnected geometry read must not force another layout");
 }
 #endif
 
@@ -4515,6 +4630,8 @@ int main()
         test_window_viewport_reflects_last_render_options();
         test_geometry_apis_return_zero_for_display_none();
         test_element_geometry_reuses_cached_layout();
+        test_element_geometry_bounded_mode_returns_cached_geometry();
+        test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";
