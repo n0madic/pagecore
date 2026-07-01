@@ -1,5 +1,6 @@
 #include "pagecore/page.hpp"
 
+#include "cookie_jar.hpp"
 #include "js_runtime.hpp"
 #include "pagecore/render.hpp"
 #include "pagecore/resource_loader.hpp"
@@ -504,6 +505,76 @@ private:
     long long elapsed_us_ = 0;
 };
 
+class CookieAwareResourceLoader final : public ResourceLoader {
+public:
+    using ResourceLoader::load;
+
+    CookieAwareResourceLoader(
+        std::shared_ptr<ResourceLoader> inner,
+        CookieJar* cookie_jar,
+        std::string document_url,
+        CookieCredentials credentials)
+        : inner_(std::move(inner))
+        , cookie_jar_(cookie_jar)
+        , document_url_(std::move(document_url))
+        , credentials_(credentials)
+    {
+        if (!inner_) {
+            throw std::runtime_error("cookie-aware resource loader requires an inner loader");
+        }
+    }
+
+    ResourceResponse load(const ResourceRequest& request) override
+    {
+        ResourceRequest cookie_request = with_cookies(request);
+        const std::string request_url = cookie_request.url;
+        ResourceResponse response = inner_->load(cookie_request);
+        store_cookies(request_url, response);
+        return response;
+    }
+
+    std::vector<ResourceResponse> load_all(
+        const std::vector<ResourceRequest>& requests,
+        BatchErrorMode mode = BatchErrorMode::FailFast) override
+    {
+        std::vector<ResourceRequest> cookie_requests;
+        cookie_requests.reserve(requests.size());
+        std::vector<std::string> request_urls;
+        request_urls.reserve(requests.size());
+        for (const auto& request : requests) {
+            cookie_requests.push_back(with_cookies(request));
+            request_urls.push_back(cookie_requests.back().url);
+        }
+
+        std::vector<ResourceResponse> responses = inner_->load_all(cookie_requests, mode);
+        for (std::size_t i = 0; i < responses.size() && i < request_urls.size(); ++i) {
+            store_cookies(request_urls[i], responses[i]);
+        }
+        return responses;
+    }
+
+private:
+    ResourceRequest with_cookies(const ResourceRequest& request) const
+    {
+        if (cookie_jar_ == nullptr) {
+            return request;
+        }
+        return cookie_jar_->with_cookie_header(request, credentials_, document_url_);
+    }
+
+    void store_cookies(std::string_view request_url, const ResourceResponse& response) const
+    {
+        if (cookie_jar_ != nullptr) {
+            cookie_jar_->store_from_response(request_url, response, credentials_, document_url_);
+        }
+    }
+
+    std::shared_ptr<ResourceLoader> inner_;
+    CookieJar* cookie_jar_ = nullptr;
+    std::string document_url_;
+    CookieCredentials credentials_ = CookieCredentials::SameOrigin;
+};
+
 std::string ascii_lower_copy(std::string_view value)
 {
     std::string out;
@@ -772,6 +843,7 @@ struct Page::Impl {
     std::shared_ptr<ResourceLoader> loader;
     std::shared_ptr<LayoutEngineFactory> layout_factory;
     std::unique_ptr<JsRuntime> js;
+    CookieJar cookie_jar;
     std::string current_url;
 
     // The single litehtml document shared by the rendered DisplayList and by
@@ -863,7 +935,7 @@ struct Page::Impl {
     void ensure_js()
     {
         if (!js) {
-            js = std::make_unique<JsRuntime>(document, options, script_resource_loader());
+            js = std::make_unique<JsRuntime>(document, options, script_resource_loader(), &cookie_jar);
             js->set_computed_style_resolver([this](NodeId node) { return computed_style(node); });
             js->set_computed_style_property_resolver(
                 [this](NodeId node, std::string_view property) { return computed_style_property(node, property); });
@@ -930,7 +1002,12 @@ struct Page::Impl {
             PerfScope trace(options.perf_trace, PerfPhase::ResourceLoad, "initial_script_load_all", external_requests.size());
             trace.event().property = "script";
             trace.event().url = current_url.empty() ? options.base_url : current_url;
-            std::vector<ResourceResponse> responses = script_resource_loader()->load_all(external_requests);
+            auto loader = std::make_shared<CookieAwareResourceLoader>(
+                script_resource_loader(),
+                &cookie_jar,
+                current_url.empty() ? options.base_url : current_url,
+                CookieCredentials::SameOrigin);
+            std::vector<ResourceResponse> responses = loader->load_all(external_requests);
             std::uint64_t loaded_bytes = 0;
             for (std::size_t i = 0; i < responses.size() && i < external_slots.size(); ++i) {
                 loaded_bytes += responses[i].body.size();
@@ -1306,12 +1383,16 @@ struct Page::Impl {
             render_resource_cache = std::make_shared<CachingResourceLoader>(loader, 4096);
         }
         const std::shared_ptr<CachingResourceLoader>& cache = render_resource_cache;
-        std::shared_ptr<ResourceLoader> render_loader = cache;
+        std::shared_ptr<ResourceLoader> render_loader = std::make_shared<CookieAwareResourceLoader>(
+            cache,
+            &cookie_jar,
+            render_base_url(render_options),
+            CookieCredentials::SameOrigin);
         if (render_options.max_external_resource_loads
             || render_options.max_external_resource_bytes
             || render_options.max_external_resource_time) {
             render_loader = std::make_shared<BudgetedRenderResourceLoader>(
-                cache,
+                render_loader,
                 render_options,
                 perf_trace_for(render_options));
         }
@@ -1881,7 +1962,11 @@ void Page::load_html(std::string_view html, std::string base_url)
 void Page::load_url(std::string_view url)
 {
     const auto t0 = std::chrono::steady_clock::now();
-    auto response = impl_->loader->load(ResourceRequest{std::string(url), ResourceKind::Document});
+    ResourceRequest request{std::string(url), ResourceKind::Document};
+    request = impl_->cookie_jar.with_cookie_header(std::move(request), CookieCredentials::Include, url);
+    auto response = impl_->loader->load(request);
+    const std::string document_url = response.url.empty() ? std::string(url) : response.url;
+    impl_->cookie_jar.store_from_response(request.url, response, CookieCredentials::Include, document_url);
     const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count();
     PerfEvent event{PerfPhase::ResourceLoad, "document_load", elapsed_us, response.body.size()};

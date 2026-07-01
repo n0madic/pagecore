@@ -301,7 +301,7 @@ FetchContent_Declare(
 pagecore_fetchcontent_make_available_excluded(lexbor)
 pagecore_fetchcontent_make_available_excluded(quickjs_ng)
 
-find_package(CURL REQUIRED COMPONENTS libz)
+find_package(CURL 7.64.0 REQUIRED COMPONENTS libz)
 find_package(ZLIB REQUIRED)
 
 find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
@@ -442,6 +442,7 @@ endif()
 add_library(pagecore
     "${PAGECORE_DOM_SHIM_HEADER}"
     src/base64_codec.cpp
+    src/cookie_jar.cpp
     src/display_list_dump.cpp
     src/dom_document.cpp
     src/image_io.cpp

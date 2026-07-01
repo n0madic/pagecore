@@ -52,7 +52,6 @@
       const traversalCache = new WeakMap();
       let activeElement = null;
       let nextCssRootId = 1;
-      const cookieJar = new Map();
       const absoluteURLCache = new Map();
       const stylesheetTextCache = new Map();
       const stylesheetCache = new Map();
@@ -2267,27 +2266,18 @@
           return entry;
         }
 
+        function currentDocumentURL() {
+          return global.location && global.location.href ? global.location.href : (host.baseURL || '');
+        }
+
         function getCookieString() {
-          return Array.from(cookieJar.entries()).map(([name, value]) => `${name}=${value}`).join('; ');
+          if (!host || typeof host.getCookieString !== 'function') return '';
+          return String(host.getCookieString(currentDocumentURL()) || '');
         }
 
         function setCookieString(cookie) {
-          const parts = String(cookie ?? '').split(';').map((part) => part.trim());
-          const pair = parts.shift() || '';
-          const equals = pair.indexOf('=');
-          if (equals <= 0) return;
-
-          const name = pair.slice(0, equals);
-          const value = pair.slice(equals + 1);
-          const expires = parts.find((part) => part.toLowerCase().startsWith('expires='));
-          if (expires) {
-            const when = Date.parse(expires.slice(8));
-            if (Number.isFinite(when) && when <= Date.now()) {
-              cookieJar.delete(name);
-              return;
-            }
-          }
-          cookieJar.set(name, value);
+          if (!host || typeof host.setCookieString !== 'function') return;
+          host.setCookieString(currentDocumentURL(), String(cookie ?? ''));
         }
 
         function splitSelectorList(selector) {

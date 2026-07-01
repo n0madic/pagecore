@@ -35,6 +35,15 @@ struct CurlBody {
     bool too_large = false;
 };
 
+struct CurlHeaders {
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::vector<std::pair<std::string, std::string>> set_cookie_sources;
+    std::vector<std::pair<std::string, std::string>> set_cookie_headers;
+    std::string current_url;
+    std::string next_url;
+    std::string status_text;
+};
+
 struct CurlHeaderListDeleter {
     void operator()(curl_slist* list) const
     {
@@ -104,9 +113,124 @@ size_t write_body(char* ptr, size_t size, size_t nmemb, void* userdata)
     return len;
 }
 
+std::string trim_ascii(std::string_view value)
+{
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.remove_prefix(1);
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.remove_suffix(1);
+    }
+    return std::string(value);
+}
+
+std::string reason_phrase_from_status_line(std::string_view line)
+{
+    const std::size_t first_space = line.find(' ');
+    if (first_space == std::string_view::npos) {
+        return {};
+    }
+    const std::size_t second_space = line.find(' ', first_space + 1);
+    if (second_space == std::string_view::npos) {
+        return {};
+    }
+    return trim_ascii(line.substr(second_space + 1));
+}
+
+size_t write_header(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+    auto* data = static_cast<CurlHeaders*>(userdata);
+    const size_t len = size * nmemb;
+    std::string_view line(ptr, len);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+        line.remove_suffix(1);
+    }
+
+    if (line.empty()) {
+        return len;
+    }
+
+    if (line.substr(0, 5) == "HTTP/") {
+        if (!data->next_url.empty()) {
+            data->current_url = std::move(data->next_url);
+            data->next_url.clear();
+        }
+        data->headers.clear();
+        data->status_text = reason_phrase_from_status_line(line);
+        return len;
+    }
+
+    const std::size_t colon = line.find(':');
+    if (colon == std::string_view::npos) {
+        return len;
+    }
+
+    std::string name = trim_ascii(line.substr(0, colon));
+    if (!name.empty()) {
+        std::string value = trim_ascii(line.substr(colon + 1));
+        if (name.size() == 10
+            && std::equal(name.begin(), name.end(), "Set-Cookie", [](char left, char right) {
+                   return std::tolower(static_cast<unsigned char>(left)) == std::tolower(static_cast<unsigned char>(right));
+               })) {
+            data->set_cookie_sources.emplace_back(data->current_url, value);
+            data->set_cookie_headers.emplace_back(std::move(name), std::move(value));
+        } else if (name.size() == 8
+            && std::equal(name.begin(), name.end(), "Location", [](char left, char right) {
+                   return std::tolower(static_cast<unsigned char>(left)) == std::tolower(static_cast<unsigned char>(right));
+               })) {
+            data->next_url = resolve_url(data->current_url, value);
+            data->headers.emplace_back(std::move(name), std::move(value));
+        } else {
+            data->headers.emplace_back(std::move(name), std::move(value));
+        }
+    }
+    return len;
+}
+
 bool starts_with(std::string_view value, std::string_view prefix)
 {
     return value.substr(0, prefix.size()) == prefix;
+}
+
+std::string default_status_text(int status)
+{
+    switch (status) {
+    case 100: return "Continue";
+    case 101: return "Switching Protocols";
+    case 200: return "OK";
+    case 201: return "Created";
+    case 202: return "Accepted";
+    case 204: return "No Content";
+    case 206: return "Partial Content";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 303: return "See Other";
+    case 304: return "Not Modified";
+    case 307: return "Temporary Redirect";
+    case 308: return "Permanent Redirect";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
+    case 429: return "Too Many Requests";
+    case 500: return "Internal Server Error";
+    case 502: return "Bad Gateway";
+    case 503: return "Service Unavailable";
+    case 504: return "Gateway Timeout";
+    default: return {};
+    }
+}
+
+std::vector<std::pair<std::string, std::string>> content_type_header(std::string_view mime_type)
+{
+    if (mime_type.empty()) {
+        return {};
+    }
+    return {{"Content-Type", std::string(mime_type)}};
 }
 
 bool has_url_scheme(std::string_view value)
@@ -585,6 +709,7 @@ ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePol
         parameter_start = parameter_end + 1;
     }
 
+    auto headers = content_type_header(mime_type);
     ResourceResponse response{
         request.url,
         base64
@@ -594,6 +719,8 @@ ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePol
         std::move(mime_type),
         request.kind,
         false,
+        "OK",
+        std::move(headers),
     };
     enforce_response_policy(request, response, policy);
     return response;
@@ -925,9 +1052,11 @@ CurlHeaderList configure_network_handle(
     const ResourcePolicy& policy,
     CURLSH* share,
     CurlBody& body,
+    CurlHeaders& response_headers,
     OpenSocketContext& socket_context)
 {
     body.max_bytes = policy.max_response_bytes;
+    response_headers.current_url = request.url;
 
     curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -955,6 +1084,8 @@ CurlHeaderList configure_network_handle(
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, write_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(policy.timeout.count()));
     if (share != nullptr) {
@@ -971,6 +1102,7 @@ ResourceResponse build_network_response(
     const ResourceRequest& request,
     const ResourcePolicy& policy,
     CurlBody& body,
+    CurlHeaders& response_headers,
     OpenSocketContext& socket_context,
     CURLcode code)
 {
@@ -978,12 +1110,21 @@ ResourceResponse build_network_response(
     long status = 0;
     char* content_type = nullptr;
     char* effective_url = nullptr;
+    long redirect_count = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
     curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective_url);
+    curl_easy_getinfo(curl, CURLINFO_REDIRECT_COUNT, &redirect_count);
     const std::string response_url = effective_url == nullptr ? url_string : std::string(effective_url);
     const std::string response_mime_type =
         content_type == nullptr ? infer_mime_type(url_string, request.kind) : std::string(content_type);
+    if (response_headers.headers.empty() && !response_mime_type.empty()) {
+        response_headers.headers = content_type_header(response_mime_type);
+    }
+    response_headers.headers.insert(
+        response_headers.headers.end(),
+        response_headers.set_cookie_headers.begin(),
+        response_headers.set_cookie_headers.end());
 
     if (body.too_large) {
         throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
@@ -1013,6 +1154,12 @@ ResourceResponse build_network_response(
         response_mime_type,
         request.kind,
         false,
+        response_headers.status_text.empty()
+            ? default_status_text(static_cast<int>(status))
+            : response_headers.status_text,
+        std::move(response_headers.headers),
+        static_cast<int>(redirect_count),
+        std::move(response_headers.set_cookie_sources),
     };
     enforce_response_policy(request, response, policy);
     return response;
@@ -1085,13 +1232,16 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     }
 
     if (!is_network_scheme(scheme)) {
+        const std::string mime_type = infer_mime_type(url_string, request.kind);
         ResourceResponse response{
             url_string,
             read_file(url_string, policy_),
             200,
-            infer_mime_type(url_string, request.kind),
+            mime_type,
             request.kind,
             false,
+            "OK",
+            content_type_header(mime_type),
         };
         enforce_response_policy(request, response, policy_);
         return response;
@@ -1108,12 +1258,13 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     CURLSH* share = curl_shared == nullptr ? nullptr : curl_shared->share;
 
     CurlBody body;
+    CurlHeaders response_headers;
     OpenSocketContext socket_context;
     CurlHeaderList headers =
-        configure_network_handle(curl.get(), request, user_agent_, policy_, share, body, socket_context);
+        configure_network_handle(curl.get(), request, user_agent_, policy_, share, body, response_headers, socket_context);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    return build_network_response(curl.get(), request, policy_, body, socket_context, code);
+    return build_network_response(curl.get(), request, policy_, body, response_headers, socket_context, code);
 }
 
 std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<ResourceRequest>& requests, BatchErrorMode mode)
@@ -1143,6 +1294,7 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
     // vectors must not reallocate while transfers are in flight.
     std::vector<CURL*> handles(count, nullptr);
     std::vector<CurlBody> bodies(count);
+    std::vector<CurlHeaders> response_headers(count);
     std::vector<OpenSocketContext> contexts(count);
     std::vector<CurlHeaderList> header_lists(count);
 
@@ -1172,13 +1324,16 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
                 continue;
             }
             if (!is_network_scheme(scheme)) {
+                const std::string mime_type = infer_mime_type(requests[i].url, requests[i].kind);
                 ResourceResponse response{
                     requests[i].url,
                     read_file(requests[i].url, policy_),
                     200,
-                    infer_mime_type(requests[i].url, requests[i].kind),
+                    mime_type,
                     requests[i].kind,
                     false,
+                    "OK",
+                    content_type_header(mime_type),
                 };
                 enforce_response_policy(requests[i], response, policy_);
                 responses[i] = std::move(response);
@@ -1191,7 +1346,15 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
                 throw ResourceError(ResourceErrorCode::Transport, requests[i].url, "failed to initialize libcurl");
             }
             header_lists[i] =
-                configure_network_handle(handle, requests[i], user_agent_, policy_, share, bodies[i], contexts[i]);
+                configure_network_handle(
+                    handle,
+                    requests[i],
+                    user_agent_,
+                    policy_,
+                    share,
+                    bodies[i],
+                    response_headers[i],
+                    contexts[i]);
             handles[i] = handle;
             curl_multi_add_handle(multi, handle);
         } catch (...) {
@@ -1227,7 +1390,8 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
         const auto found = result_codes.find(handles[i]);
         const CURLcode code = found == result_codes.end() ? CURLE_RECV_ERROR : found->second;
         try {
-            responses[i] = build_network_response(handles[i], requests[i], policy_, bodies[i], contexts[i], code);
+            responses[i] =
+                build_network_response(handles[i], requests[i], policy_, bodies[i], response_headers[i], contexts[i], code);
         } catch (...) {
             errors[i] = std::current_exception();
         }
@@ -1275,13 +1439,18 @@ void MemoryResourceLoader::add(std::string url, std::string body)
 void MemoryResourceLoader::add(std::string url, std::string body, std::string mime_type)
 {
     const std::string key = url;
+    if (mime_type.empty()) {
+        mime_type = infer_mime_type(key, ResourceKind::Other);
+    }
     resources_[key] = ResourceResponse{
         std::move(url),
         std::move(body),
         200,
-        mime_type.empty() ? infer_mime_type(key, ResourceKind::Other) : std::move(mime_type),
+        mime_type,
         ResourceKind::Other,
         false,
+        "OK",
+        content_type_header(mime_type),
     };
 }
 

@@ -656,7 +656,7 @@
             this.headers = new Headers(init.headers || (source && source.headers) || undefined);
             this.body = init.body !== undefined ? init.body : source ? source.body : null;
             this.mode = init.mode || (source && source.mode) || 'cors';
-            this.credentials = init.credentials || (source && source.credentials) || 'same-origin';
+            this.credentials = normalizeCredentials(init.credentials || (source && source.credentials) || 'same-origin');
             this.cache = init.cache || (source && source.cache) || 'default';
             this.redirect = init.redirect || (source && source.redirect) || 'follow';
             this.referrer = init.referrer || (source && source.referrer) || 'about:client';
@@ -673,7 +673,7 @@
             this.statusText = init.statusText === undefined ? '' : String(init.statusText);
             this.headers = new Headers(init.headers);
             this.url = init.url || '';
-            this.redirected = false;
+            this.redirected = Boolean(init.redirected);
             this.type = 'default';
             this.ok = this.status >= 200 && this.status < 300;
           }
@@ -695,7 +695,8 @@
               status: this.status,
               statusText: this.statusText,
               headers: this.headers,
-              url: this.url
+              url: this.url,
+              redirected: this.redirected
             });
           }
 
@@ -719,8 +720,21 @@
 
         function responseHeadersFromHost(response) {
           const headers = new Headers();
-          if (response && response.mimeType) headers.set('content-type', response.mimeType);
+          if (response && response.headers && typeof response.headers[Symbol.iterator] === 'function') {
+            for (const pair of response.headers) {
+              const name = String(pair[0] || '');
+              if (name.toLowerCase() === 'set-cookie' || name.toLowerCase() === 'set-cookie2') continue;
+              headers.append(name, pair[1]);
+            }
+          }
+          if (response && response.mimeType && !headers.has('content-type')) headers.set('content-type', response.mimeType);
           return headers;
+        }
+
+        function normalizeCredentials(value) {
+          const credentials = String(value || 'same-origin');
+          if (credentials === 'omit' || credentials === 'same-origin' || credentials === 'include') return credentials;
+          throw new TypeError('Invalid credentials mode');
         }
 
         function bodyText(body) {
@@ -745,7 +759,8 @@
             kind,
             init.method || 'GET',
             init.body == null ? '' : String(init.body),
-            headerPairs(init.headers)
+            headerPairs(init.headers),
+            normalizeCredentials(init.credentials || 'same-origin')
           );
         }
 
@@ -829,10 +844,11 @@
                 loaded = loadHostResource(this._url, 'other', {
                   method: this._method,
                   body: bodyText(body),
-                  headers: this._requestHeaders
+                  headers: this._requestHeaders,
+                  credentials: this.withCredentials ? 'include' : 'same-origin'
                 });
-                this.status = Number(loaded.status || 200);
-                this.statusText = this.status >= 200 && this.status < 300 ? 'OK' : '';
+                this.status = loaded.status === undefined ? 200 : Number(loaded.status);
+                this.statusText = loaded.statusText === undefined ? '' : String(loaded.statusText);
                 this.responseURL = loaded.url || this._url;
                 this._responseHeaders = responseHeadersFromHost(loaded);
                 if (this._overrideMimeType) this._responseHeaders.set('content-type', this._overrideMimeType);

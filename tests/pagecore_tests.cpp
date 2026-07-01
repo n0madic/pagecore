@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <chrono>
@@ -32,6 +33,13 @@
 #include <variant>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 void require(bool condition, const std::string& message)
@@ -45,16 +53,34 @@ class RecordingResourceLoader final : public pagecore::ResourceLoader {
 public:
     using ResourceLoader::load;
 
-    void add(std::string url, std::string body, std::string mime_type = {})
+    void add(
+        std::string url,
+        std::string body,
+        std::string mime_type = {},
+        std::vector<std::pair<std::string, std::string>> headers = {},
+        int status = 200,
+        std::string status_text = {})
     {
         const std::string key = url;
+        if (!mime_type.empty()
+            && std::none_of(headers.begin(), headers.end(), [](const auto& header) {
+                   std::string name = header.first;
+                   std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+                   return name == "content-type";
+               })) {
+            headers.emplace_back("Content-Type", mime_type);
+        }
         resources_[key] = pagecore::ResourceResponse{
             std::move(url),
             std::move(body),
-            200,
+            status,
             std::move(mime_type),
             pagecore::ResourceKind::Other,
             false,
+            status_text.empty() && status == 200 ? "OK" : std::move(status_text),
+            std::move(headers),
         };
     }
 
@@ -105,6 +131,29 @@ bool has_header(const pagecore::ResourceRequest& request, std::string_view name,
 {
     for (const auto& [header_name, header_value] : request.headers) {
         if (header_name == name && header_value == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool header_name_equals(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool header_contains(const pagecore::ResourceRequest& request, std::string_view name, std::string_view value)
+{
+    for (const auto& [header_name, header_value] : request.headers) {
+        if (header_name_equals(header_name, name) && header_value.find(value) != std::string::npos) {
             return true;
         }
     }
@@ -2106,6 +2155,210 @@ void test_xhr_and_fetch_load_through_resource_loader()
             "fetch should pass request headers to ResourceLoader");
 }
 
+void test_shared_cookie_jar_document_scripts_fetch_and_xhr()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/index.html",
+        R"HTML(
+<html><head><script src="/static.js"></script></head><body>
+  <script>
+    document.cookie = 'client=js; path=/';
+    document.cookie = 'secret=public; path=/';
+    document.cookie = 'static=gone; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+
+    fetch('/api', { credentials: 'same-origin' }).then((response) => {
+      document.body.setAttribute('data-fetch-headers',
+        response.status === 202 &&
+        response.statusText === 'Accepted' &&
+        response.headers.get('x-api') === 'yes' &&
+        !response.headers.has('set-cookie')
+          ? 'ok'
+          : 'bad');
+      return response.text();
+    }).then(() => {
+      document.body.setAttribute('data-after-fetch-cookie', document.cookie);
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/xhr');
+      xhr.onload = () => {
+        document.body.setAttribute('data-xhr',
+          xhr.status === 200 &&
+          xhr.statusText === 'OK' &&
+          xhr.responseURL === 'https://example.test/xhr' &&
+          xhr.getResponseHeader('x-xhr') === 'yes' &&
+          xhr.getAllResponseHeaders().toLowerCase().indexOf('set-cookie') === -1
+            ? 'ok'
+            : 'bad');
+        document.body.setAttribute('data-final-cookie', document.cookie);
+      };
+      xhr.send();
+    });
+
+    const dynamic = document.createElement('script');
+    dynamic.src = '/dynamic.js';
+    document.head.appendChild(dynamic);
+  </script>
+</body></html>
+)HTML",
+        "text/html",
+        {
+            {"Set-Cookie", "top=nav; Path=/"},
+            {"Set-Cookie", "secret=hidden; Path=/; HttpOnly"},
+        });
+    loader->add(
+        "https://example.test/static.js",
+        "document.body.setAttribute('data-static-cookie', "
+        "document.cookie.includes('top=nav') && !document.cookie.includes('secret=') ? 'ok' : 'bad');",
+        "text/javascript",
+        {{"Set-Cookie", "static=one; Path=/; HttpOnly"}});
+    loader->add(
+        "https://example.test/dynamic.js",
+        "document.body.setAttribute('data-dynamic', document.cookie.includes('api=ok') ? 'ok' : 'bad');",
+        "text/javascript",
+        {{"Set-Cookie", "dynamic=two; Path=/"}});
+    loader->add(
+        "https://example.test/api",
+        "api-ok",
+        "text/plain",
+        {
+            {"X-Api", "yes"},
+            {"Set-Cookie", "api=ok; Path=/"},
+        },
+        202,
+        "Accepted");
+    loader->add(
+        "https://example.test/xhr",
+        "xhr-ok",
+        "text/plain",
+        {
+            {"X-Xhr", "yes"},
+            {"Set-Cookie", "xhr=ok; Path=/"},
+        });
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_url("https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-static-cookie='ok'][data-fetch-headers='ok'][data-xhr='ok'][data-dynamic='ok']").has_value(),
+        "shared CookieJar should be visible through document.cookie and Fetch/XHR response metadata should hide Set-Cookie");
+
+    const auto body = page.outer_html("body");
+    require(body && body->find("top=nav") != std::string::npos,
+            "document.cookie should expose regular cookies from the shared jar");
+    require(body && body->find("client=js") != std::string::npos,
+            "document.cookie writes should update the shared jar");
+    require(body && body->find("api=ok") != std::string::npos && body->find("xhr=ok") != std::string::npos,
+            "Set-Cookie from fetch/XHR responses should update the shared jar");
+    require(body && body->find("secret=hidden") == std::string::npos && body->find("static=one") == std::string::npos,
+            "HttpOnly cookies should be sent on requests but hidden from document.cookie");
+
+    const auto* static_request = find_request(*loader, "https://example.test/static.js");
+    require(static_request != nullptr && header_contains(*static_request, "cookie", "top=nav")
+                && header_contains(*static_request, "cookie", "secret=hidden"),
+            "static scripts should receive cookies from top-level Set-Cookie");
+
+    const auto* api_request = find_request(*loader, "https://example.test/api");
+    require(api_request != nullptr && header_contains(*api_request, "cookie", "client=js")
+                && header_contains(*api_request, "cookie", "static=one")
+                && header_contains(*api_request, "cookie", "secret=hidden")
+                && !header_contains(*api_request, "cookie", "secret=public"),
+            "fetch should send document.cookie writes but document.cookie must not overwrite or delete HttpOnly cookies");
+
+    const auto* dynamic_request = find_request(*loader, "https://example.test/dynamic.js");
+    require(dynamic_request != nullptr && header_contains(*dynamic_request, "cookie", "client=js")
+                && header_contains(*dynamic_request, "cookie", "api=ok"),
+            "dynamic scripts should receive cookies updated by earlier fetch responses");
+
+    const auto* xhr_request = find_request(*loader, "https://example.test/xhr");
+    require(xhr_request != nullptr && header_contains(*xhr_request, "cookie", "api=ok"),
+            "XMLHttpRequest should send cookies from the shared jar");
+}
+
+void test_fetch_xhr_credentials_control_cookie_injection()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/omit", "omit", "text/plain");
+    loader->add(
+        "https://other.test/set",
+        "set",
+        "text/plain",
+        {{"Set-Cookie", "third=1; Domain=other.test; Path=/"}});
+    loader->add("https://other.test/same", "same", "text/plain");
+    loader->add("https://other.test/include", "include", "text/plain");
+    loader->add("https://other.test/xhr-same", "xhr-same", "text/plain");
+    loader->add("https://other.test/xhr-include", "xhr-include", "text/plain");
+    loader->add("https://example.test:8443/port", "port", "text/plain");
+    loader->add(
+        "https://example.test:8443/set-port",
+        "set-port",
+        "text/plain",
+        {{"Set-Cookie", "crossport=bad; Domain=example.test; Path=/"}});
+    loader->add("https://example.test/after-port", "after-port", "text/plain");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.cookie = 'sid=1; path=/';
+    fetch('/omit', { credentials: 'omit' })
+      .then(() => fetch('https://other.test/set', { credentials: 'include' }))
+      .then(() => fetch('https://other.test/same'))
+      .then(() => fetch('https://other.test/include', { credentials: 'include' }))
+      .then(() => fetch('https://example.test:8443/port'))
+      .then(() => fetch('https://example.test:8443/set-port'))
+      .then(() => fetch('/after-port'))
+      .then(() => new Promise((resolve) => {
+        const xhrSame = new XMLHttpRequest();
+        xhrSame.open('GET', 'https://other.test/xhr-same');
+        xhrSame.onload = resolve;
+        xhrSame.send();
+      }))
+      .then(() => new Promise((resolve) => {
+        const xhrInclude = new XMLHttpRequest();
+        xhrInclude.open('GET', 'https://other.test/xhr-include');
+        xhrInclude.withCredentials = true;
+        xhrInclude.onload = resolve;
+        xhrInclude.send();
+      }))
+      .then(() => document.body.setAttribute('data-credentials', 'ok'));
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-credentials='ok']").has_value(),
+            "credentials test chain should complete");
+
+    const auto* omit_request = find_request(*loader, "https://example.test/omit");
+    require(omit_request != nullptr && !header_contains(*omit_request, "cookie", "sid=1"),
+            "fetch credentials=omit should not send same-origin cookies");
+
+    const auto* same_request = find_request(*loader, "https://other.test/same");
+    require(same_request != nullptr && !header_contains(*same_request, "cookie", "third=1"),
+            "fetch default same-origin credentials should not send cross-origin cookies");
+
+    const auto* include_request = find_request(*loader, "https://other.test/include");
+    require(include_request != nullptr && header_contains(*include_request, "cookie", "third=1"),
+            "fetch credentials=include should send matching cross-origin cookies");
+
+    const auto* port_request = find_request(*loader, "https://example.test:8443/port");
+    require(port_request != nullptr && !header_contains(*port_request, "cookie", "sid=1"),
+            "fetch default same-origin credentials should treat different ports as different origins");
+
+    const auto* after_port_request = find_request(*loader, "https://example.test/after-port");
+    require(after_port_request != nullptr && !header_contains(*after_port_request, "cookie", "crossport=bad"),
+            "fetch default same-origin credentials should not accept Set-Cookie from a different port origin");
+
+    const auto* xhr_same_request = find_request(*loader, "https://other.test/xhr-same");
+    require(xhr_same_request != nullptr && !header_contains(*xhr_same_request, "cookie", "third=1"),
+            "XMLHttpRequest without withCredentials should use same-origin credentials");
+
+    const auto* xhr_include_request = find_request(*loader, "https://other.test/xhr-include");
+    require(xhr_include_request != nullptr && header_contains(*xhr_include_request, "cookie", "third=1"),
+            "XMLHttpRequest withCredentials should include matching cross-origin cookies");
+}
+
 void test_page_readiness_wait_until_load_skips_timers()
 {
     pagecore::LoadOptions options;
@@ -2868,6 +3121,109 @@ void test_resource_blocks_file_from_network_origin()
 
     std::filesystem::remove(file);
 }
+
+#if !defined(_WIN32)
+void test_curl_loader_preserves_set_cookie_headers_across_redirects()
+{
+    const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    require(server_fd >= 0, "redirect cookie test server socket should open");
+
+    int reuse = 1;
+    (void) ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    require(::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+            "redirect cookie test server should bind");
+    require(::listen(server_fd, 2) == 0, "redirect cookie test server should listen");
+
+    socklen_t address_len = sizeof(address);
+    require(::getsockname(server_fd, reinterpret_cast<sockaddr*>(&address), &address_len) == 0,
+            "redirect cookie test server should expose its port");
+    const int port = ntohs(address.sin_port);
+
+    std::atomic<int> accepted{0};
+    std::thread server([server_fd, port, &accepted] {
+        for (int i = 0; i < 2; ++i) {
+            const int client = ::accept(server_fd, nullptr, nullptr);
+            if (client < 0) {
+                continue;
+            }
+            ++accepted;
+            char buffer[2048];
+            (void) ::recv(client, buffer, sizeof(buffer), 0);
+            std::string response;
+            if (i == 0) {
+                response =
+                    "HTTP/1.1 302 Found\r\n"
+                    "Location: http://127.0.0.1:" + std::to_string(port) + "/final\r\n"
+                    "Set-Cookie: hop=redirect; Path=/\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+            } else {
+                response =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Set-Cookie: final=ok; Path=/\r\n"
+                    "Content-Length: 2\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "ok";
+            }
+            (void) ::send(client, response.data(), response.size(), 0);
+            ::close(client);
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        pagecore::CurlResourceLoader loader("pagecore-test", policy);
+        const auto response = loader.load(pagecore::ResourceRequest{
+            "http://127.0.0.1:" + std::to_string(port) + "/start",
+            pagecore::ResourceKind::Document,
+        });
+
+        require(response.status == 200 && response.body == "ok", "redirect cookie fixture should return final response");
+        require(response.redirect_count == 1, "redirect count should report followed redirects");
+        require(response.url == "http://127.0.0.1:" + std::to_string(port) + "/final",
+                "final response URL should be exposed after redirect");
+
+        bool saw_redirect_cookie = false;
+        bool saw_final_cookie = false;
+        for (const auto& [name, value] : response.headers) {
+            if (header_name_equals(name, "set-cookie") && value.find("hop=redirect") != std::string::npos) {
+                saw_redirect_cookie = true;
+            }
+            if (header_name_equals(name, "set-cookie") && value.find("final=ok") != std::string::npos) {
+                saw_final_cookie = true;
+            }
+        }
+        require(saw_redirect_cookie && saw_final_cookie,
+                "ResourceResponse headers should preserve Set-Cookie from redirect and final responses");
+        require(response.set_cookie_headers.size() == 2,
+                "ResourceResponse should preserve hop-aware Set-Cookie metadata across redirects");
+        require(response.set_cookie_headers[0].first == "http://127.0.0.1:" + std::to_string(port) + "/start",
+                "redirect Set-Cookie should be associated with the redirect response URL");
+        require(response.set_cookie_headers[1].first == "http://127.0.0.1:" + std::to_string(port) + "/final",
+                "final Set-Cookie should be associated with the final response URL");
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        throw;
+    }
+
+    if (server.joinable()) {
+        server.join();
+    }
+    require(accepted == 2, "redirect cookie fixture should serve redirect and final requests");
+}
+#endif
 
 void test_caching_loader_bounds_and_skips_errors()
 {
@@ -4363,6 +4719,48 @@ void test_page_display_list_resolves_protocol_relative_and_host_like_css_urls()
     require(
         has_request_kind(*loader, "https://cdn.example.test/host.png", pagecore::ResourceKind::Image),
         "host-like CSS image should be requested as an absolute Image resource");
+}
+
+void test_shared_cookie_jar_render_resources()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/image.png", "not-a-real-png", "image/png");
+    loader->add("https://example.test/inline-bg.png", "not-a-real-png", "image/png");
+    loader->add(
+        "https://example.test/style.css",
+        "body { background-image: url('/css-bg.png'); }"
+        "@font-face { font-family: CookieFont; src: url('/font.woff2'); }",
+        "text/css");
+    loader->add("https://example.test/css-bg.png", "not-a-real-png", "image/png");
+    loader->add("https://example.test/font.woff2", "not-a-real-font", "font/woff2");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head>
+  <link rel="stylesheet" href="/style.css">
+</head><body>
+  <script>document.cookie = 'render=sid; path=/';</script>
+  <img src="/image.png">
+  <div style="font-family:CookieFont;background-image:url('/inline-bg.png')">x</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 90, 1.0f};
+    (void) page.display_list(options);
+
+    const auto* stylesheet_request = find_request(*loader, "https://example.test/style.css");
+    require(stylesheet_request != nullptr && header_contains(*stylesheet_request, "cookie", "render=sid"),
+            "stylesheet loads should receive cookies from the shared jar");
+
+    const auto* image_request = find_request(*loader, "https://example.test/image.png");
+    require(image_request != nullptr && header_contains(*image_request, "cookie", "render=sid"),
+            "image loads should receive cookies from the shared jar");
+
+    const auto* font_request = find_request(*loader, "https://example.test/font.woff2");
+    require(font_request != nullptr && header_contains(*font_request, "cookie", "render=sid"),
+            "font loads should receive cookies from the shared jar");
 }
 
 // Records load_all() batches separately from single load() calls so a test can
@@ -6004,6 +6402,8 @@ int main()
         test_target_pseudo_class_selector_fallback();
         test_request_response_fetch_object_shims();
         test_xhr_and_fetch_load_through_resource_loader();
+        test_shared_cookie_jar_document_scripts_fetch_and_xhr();
+        test_fetch_xhr_credentials_control_cookie_injection();
         test_page_readiness_wait_until_load_skips_timers();
         test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable();
         test_page_readiness_image_and_stylesheet_load_events();
@@ -6022,6 +6422,9 @@ int main()
         test_resource_file_sandbox();
         test_resource_relative_file_url();
         test_resource_blocks_file_from_network_origin();
+#if !defined(_WIN32)
+        test_curl_loader_preserves_set_cookie_headers_across_redirects();
+#endif
         test_caching_loader_bounds_and_skips_errors();
         test_resource_load_all_returns_in_order();
         test_resource_load_all_lenient_tolerates_failures();
@@ -6082,6 +6485,7 @@ int main()
         test_page_display_list_resolves_litehtml_relative_base_urls();
         test_page_display_list_resolves_relative_base_element_against_document_url();
         test_page_display_list_resolves_protocol_relative_and_host_like_css_urls();
+        test_shared_cookie_jar_render_resources();
         test_render_prefetches_subresources_into_cache();
         test_perf_trace_records_render_prefetch_waves();
         test_render_resource_budget_blocks_prefetch_and_layout_misses();

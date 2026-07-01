@@ -63,6 +63,10 @@ struct ResourceResponse {
     std::string mime_type;
     ResourceKind kind = ResourceKind::Other;
     bool from_cache = false;
+    std::string status_text;
+    std::vector<std::pair<std::string, std::string>> headers;
+    int redirect_count = 0;
+    std::vector<std::pair<std::string, std::string>> set_cookie_headers;
 };
 
 struct ResourcePolicy {

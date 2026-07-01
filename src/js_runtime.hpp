@@ -24,6 +24,7 @@ namespace pagecore {
 
 class ResourceLoader;
 struct ResourceResponse;
+class CookieJar;
 
 class JsRuntime {
 public:
@@ -32,7 +33,11 @@ public:
     using ElementGeometryResolver = std::function<std::optional<ElementGeometry>(NodeId)>;
     using ViewportResolver = std::function<Viewport()>;
 
-    JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr<ResourceLoader> loader);
+    JsRuntime(
+        DomDocument& document,
+        LoadOptions options,
+        std::shared_ptr<ResourceLoader> loader,
+        CookieJar* cookie_jar = nullptr);
     ~JsRuntime();
 
     JsRuntime(const JsRuntime&) = delete;
@@ -52,7 +57,10 @@ public:
         std::string_view kind,
         std::string method = "GET",
         std::string body = {},
-        std::vector<std::pair<std::string, std::string>> headers = {});
+        std::vector<std::pair<std::string, std::string>> headers = {},
+        std::string credentials = "same-origin");
+    std::string document_cookie(std::string_view url) const;
+    void set_document_cookie(std::string_view url, std::string_view cookie);
     void log_console(std::string_view severity, std::string_view message);
     bool is_timed_out() const;
 
@@ -94,6 +102,7 @@ private:
     DomDocument* document_ = nullptr;
     LoadOptions options_;
     std::shared_ptr<ResourceLoader> loader_;
+    CookieJar* cookie_jar_ = nullptr;
     ComputedStyleResolver computed_style_resolver_;
     ComputedStylePropertyResolver computed_style_property_resolver_;
     ElementGeometryResolver element_geometry_resolver_;

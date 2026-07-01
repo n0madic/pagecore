@@ -1,6 +1,7 @@
 #include "js_runtime.hpp"
 
 #include "base64_codec.hpp"
+#include "cookie_jar.hpp"
 #include "dom_shim.hpp"
 #include "pagecore/resource_loader.hpp"
 
@@ -93,9 +94,32 @@ std::vector<std::pair<std::string, std::string>> headers_from_js_pairs(JSContext
     return out;
 }
 
+CookieCredentials credentials_from_string(std::string_view value)
+{
+    if (value == "omit") {
+        return CookieCredentials::Omit;
+    }
+    if (value == "include") {
+        return CookieCredentials::Include;
+    }
+    return CookieCredentials::SameOrigin;
+}
+
 JSValue js_string(JSContext* ctx, const std::string& value)
 {
     return JS_NewStringLen(ctx, value.data(), value.size());
+}
+
+JSValue js_header_pairs(JSContext* ctx, const std::vector<std::pair<std::string, std::string>>& headers)
+{
+    JSValue array = JS_NewArray(ctx);
+    for (uint32_t i = 0; i < headers.size(); ++i) {
+        JSValue pair = JS_NewArray(ctx);
+        JS_SetPropertyUint32(ctx, pair, 0, js_string(ctx, headers[i].first));
+        JS_SetPropertyUint32(ctx, pair, 1, js_string(ctx, headers[i].second));
+        JS_SetPropertyUint32(ctx, array, i, pair);
+    }
+    return array;
 }
 
 std::string latin1_bytes_from_js_string(JSContext* ctx, JSValueConst value)
@@ -1021,7 +1045,12 @@ JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
         if (argc > 4) {
             headers = headers_from_js_pairs(ctx, argv[4]);
         }
-        const auto response = js.load_resource(url, kind, std::move(method), std::move(body), std::move(headers));
+        std::string credentials = "same-origin";
+        if (argc > 5 && !JS_IsNull(argv[5]) && !JS_IsUndefined(argv[5])) {
+            credentials = to_string(ctx, argv[5]);
+        }
+        const auto response =
+            js.load_resource(url, kind, std::move(method), std::move(body), std::move(headers), std::move(credentials));
 
         JSValue out = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, out, "url", js_string(ctx, response.url));
@@ -1030,7 +1059,29 @@ JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
         JS_SetPropertyStr(ctx, out, "kind", js_string(ctx, resource_kind_name(response.kind)));
         JS_SetPropertyStr(ctx, out, "fromCache", JS_NewBool(ctx, response.from_cache));
         JS_SetPropertyStr(ctx, out, "status", JS_NewInt32(ctx, response.status));
+        JS_SetPropertyStr(ctx, out, "statusText", js_string(ctx, response.status_text));
+        JS_SetPropertyStr(ctx, out, "headers", js_header_pairs(ctx, response.headers));
+        JS_SetPropertyStr(ctx, out, "redirectCount", JS_NewInt32(ctx, response.redirect_count));
         return out;
+    });
+}
+
+JSValue host_get_cookie_string(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        const std::string url = argc > 0 ? to_string(ctx, argv[0]) : std::string{};
+        return js_string(ctx, js.document_cookie(url));
+    });
+}
+
+JSValue host_set_cookie_string(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 2) throw std::runtime_error("setCookieString requires url and cookie");
+        const std::string url = to_string(ctx, argv[0]);
+        const std::string cookie = to_string(ctx, argv[1]);
+        js.set_document_cookie(url, cookie);
+        return JS_UNDEFINED;
     });
 }
 
@@ -1176,10 +1227,11 @@ JSModuleDef* JsRuntime::load_module(JSContext* ctx, const char* module_name, voi
     }
 }
 
-JsRuntime::JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr<ResourceLoader> loader)
+JsRuntime::JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr<ResourceLoader> loader, CookieJar* cookie_jar)
     : document_(&document)
     , options_(std::move(options))
     , loader_(std::move(loader))
+    , cookie_jar_(cookie_jar)
 {
     runtime_ = JS_NewRuntime();
     if (runtime_ == nullptr) {
@@ -1266,6 +1318,8 @@ void JsRuntime::install()
     set_function(context_, dom, "getElementById", bridge_get_element_by_id, 1);
     set_function(context_, host, "log", host_log, 1);
     set_function(context_, host, "loadResource", host_load_resource, 2);
+    set_function(context_, host, "getCookieString", host_get_cookie_string, 1);
+    set_function(context_, host, "setCookieString", host_set_cookie_string, 2);
     set_function(context_, host, "activityBegin", host_activity_begin, 1);
     set_function(context_, host, "activityEnd", host_activity_end, 1);
     set_function(context_, host, "activityMarkMutation", host_activity_mark_mutation, 1);
@@ -1770,7 +1824,8 @@ ResourceResponse JsRuntime::load_resource(
     std::string_view kind,
     std::string method,
     std::string body,
-    std::vector<std::pair<std::string, std::string>> headers)
+    std::vector<std::pair<std::string, std::string>> headers,
+    std::string credentials)
 {
     if (!loader_) {
         throw std::runtime_error("resource loader is not available");
@@ -1785,6 +1840,7 @@ ResourceResponse JsRuntime::load_resource(
         std::move(body),
         std::move(headers),
     };
+    const CookieCredentials cookie_credentials = credentials_from_string(credentials);
 
     if (js_resource_load_blocked(options_.js_resource_load_policy, base, request.url)) {
         emit_perf_trace(
@@ -1805,7 +1861,14 @@ ResourceResponse JsRuntime::load_resource(
 
     const auto perf_start = std::chrono::steady_clock::now();
     try {
+        const std::string request_url = request.url;
+        if (cookie_jar_ != nullptr) {
+            request = cookie_jar_->with_cookie_header(std::move(request), cookie_credentials, base);
+        }
         auto response = loader_->load(request);
+        if (cookie_jar_ != nullptr) {
+            cookie_jar_->store_from_response(request_url, response, cookie_credentials, base);
+        }
         const long long elapsed_us = elapsed_us_since(perf_start);
         record_js_resource_load(elapsed_us, response.body.size());
         PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, response.body.size()};
@@ -1821,6 +1884,18 @@ ResourceResponse JsRuntime::load_resource(
         event.url = request.url;
         emit_perf_trace(options_.perf_trace, std::move(event));
         throw;
+    }
+}
+
+std::string JsRuntime::document_cookie(std::string_view url) const
+{
+    return cookie_jar_ == nullptr ? std::string{} : cookie_jar_->document_cookie(url);
+}
+
+void JsRuntime::set_document_cookie(std::string_view url, std::string_view cookie)
+{
+    if (cookie_jar_ != nullptr) {
+        cookie_jar_->set_document_cookie(url, cookie);
     }
 }
 

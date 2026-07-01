@@ -488,17 +488,27 @@
         global.Option = Option;
         global.fetch = (input, init = {}) => {
           const request = new Request(input, init);
+          const signal = request.signal;
+          if (signal && signal.aborted) {
+            return Promise.reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+          }
           activityBegin('xhr-fetch');
           return Promise.resolve().then(() => {
+            if (signal && signal.aborted) {
+              throw signal.reason || new DOMException('The operation was aborted.', 'AbortError');
+            }
             const loaded = loadHostResource(request.url, 'other', {
               method: request.method,
               body: bodyText(request.body),
-              headers: request.headers
+              headers: request.headers,
+              credentials: request.credentials
             });
             return new Response(loaded.body || '', {
-              status: Number(loaded.status || 200),
+              status: loaded.status === undefined ? 200 : Number(loaded.status),
+              statusText: loaded.statusText === undefined ? '' : String(loaded.statusText),
               headers: responseHeadersFromHost(loaded),
-              url: loaded.url || request.url
+              url: loaded.url || request.url,
+              redirected: Number(loaded.redirectCount || 0) > 0
             });
           }).then((response) => {
             activityEnd('xhr-fetch');
