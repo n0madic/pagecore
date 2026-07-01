@@ -156,6 +156,7 @@
         Request,
         Response,
         responseHeadersFromHost,
+        bodyText,
         loadHostResource,
         XMLHttpRequest,
         Storage,
@@ -484,9 +485,6 @@
           getEntriesByName: () => [],
           getEntriesByType: () => []
         };
-        global.addEventListener = (...args) => EventTarget.prototype.addEventListener.apply(global, args);
-        global.removeEventListener = (...args) => EventTarget.prototype.removeEventListener.apply(global, args);
-        global.dispatchEvent = (...args) => EventTarget.prototype.dispatchEvent.apply(global, args);
         global.Image = function(width = undefined, height = undefined) {
           const image = document.createElement('img');
           if (width !== undefined) image.width = Number(width);
@@ -499,7 +497,11 @@
         global.Option = Option;
         global.fetch = (input, init = {}) => Promise.resolve().then(() => {
           const request = new Request(input, init);
-          const loaded = loadHostResource(request.url, 'other');
+          const loaded = loadHostResource(request.url, 'other', {
+            method: request.method,
+            body: bodyText(request.body),
+            headers: request.headers
+          });
           return new Response(loaded.body || '', {
             status: Number(loaded.status || 200),
             headers: responseHeadersFromHost(loaded),

@@ -723,11 +723,30 @@
           return headers;
         }
 
-        function loadHostResource(url, kind = 'other') {
+        function bodyText(body) {
+          if (body == null) return '';
+          if (body instanceof Blob) return decodeUtf8(body._bytes);
+          if (body instanceof Uint8Array) return decodeUtf8(body);
+          if (body instanceof ArrayBuffer) return decodeUtf8(new Uint8Array(body));
+          if (ArrayBuffer.isView(body)) return decodeUtf8(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+          return String(body);
+        }
+
+        function headerPairs(headers) {
+          return headers ? Array.from(headers.entries()) : [];
+        }
+
+        function loadHostResource(url, kind = 'other', init = {}) {
           if (!host || typeof host.loadResource !== 'function') {
             throw new Error('resource loading is not available');
           }
-          return host.loadResource(absoluteURL(url), kind);
+          return host.loadResource(
+            absoluteURL(url),
+            kind,
+            init.method || 'GET',
+            init.body == null ? '' : String(init.body),
+            headerPairs(init.headers)
+          );
         }
 
         class XMLHttpRequest extends EventTarget {
@@ -801,7 +820,11 @@
               if (this._aborted) return;
               let loaded = null;
               try {
-                loaded = loadHostResource(this._url, 'other');
+                loaded = loadHostResource(this._url, 'other', {
+                  method: this._method,
+                  body: bodyText(body),
+                  headers: this._requestHeaders
+                });
                 this.status = Number(loaded.status || 200);
                 this.statusText = this.status >= 200 && this.status < 300 ? 'OK' : '';
                 this.responseURL = loaded.url || this._url;
@@ -904,11 +927,26 @@
           return value;
         }
 
+        function reportTimerError(error) {
+          try {
+            if (global.console && typeof global.console.error === 'function') {
+              global.console.error(error);
+            } else if (host && typeof host.log === 'function') {
+              host.log('error', error && error.stack ? error.stack : String(error));
+            }
+          } catch (_reportError) {
+          }
+        }
+
         function callTimerCallback(timer) {
           if (typeof timer.callback === 'function') {
             // Timer callbacks run with the global object as `this`, per spec,
             // so non-strict callbacks relying on `this === window` work.
-            timer.callback.call(global, ...timer.args);
+            try {
+              timer.callback.call(global, ...timer.args);
+            } catch (error) {
+              reportTimerError(error);
+            }
           }
         }
 
@@ -1143,6 +1181,7 @@
         Request,
         Response,
         responseHeadersFromHost,
+        bodyText,
         loadHostResource,
         XMLHttpRequest,
         Storage,

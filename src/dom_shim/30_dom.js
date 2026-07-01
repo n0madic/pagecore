@@ -59,6 +59,7 @@
       let adoptedStyleSheets = [];
       let cssomVersion = 0;
       let stylesheetListMutationVersion = -1;
+      let nextDynamicScriptId = 0;
 
       function locationFromURL(href) {
         let url = null;
@@ -85,6 +86,108 @@
           reload() {},
           toString() { return this.href; }
         };
+      }
+
+      function normalizedScriptType(value) {
+        const text = String(value || '').trim().toLowerCase();
+        const semicolon = text.indexOf(';');
+        return semicolon >= 0 ? text.slice(0, semicolon).trim() : text;
+      }
+
+      function isClassicScriptType(script) {
+        const type = normalizedScriptType(script.getAttribute('type') || '');
+        return type === ''
+          || type === 'text/javascript'
+          || type === 'application/javascript'
+          || type === 'application/ecmascript'
+          || type === 'text/ecmascript'
+          || type === 'application/x-javascript'
+          || type === 'text/jscript';
+      }
+
+      function scriptErrorMessage(error) {
+        if (error && typeof error.stack === 'string' && error.stack) return error.stack;
+        if (error && typeof error.message === 'string' && error.message) return error.message;
+        try {
+          return String(error);
+        } catch (_stringifyError) {
+          return 'JS exception in dynamic script';
+        }
+      }
+
+      function reportDynamicScriptError(error) {
+        try {
+          if (host && typeof host.log === 'function') host.log('error', scriptErrorMessage(error));
+        } catch (_reportError) {
+        }
+      }
+
+      function sourceURLComment(filename) {
+        const safe = String(filename || '<dynamic-script>').replace(/[\r\n]/g, '');
+        return `\n//# sourceURL=${safe}`;
+      }
+
+      function executeDynamicScriptSource(script, code, filename) {
+        const previous = document.currentScript;
+        try {
+          document.__setCurrentScript(script && script.__id ? script.__id : null);
+          (0, global.eval)(String(code || '') + sourceURLComment(filename));
+          script.dispatchEvent(new Event('load'));
+        } catch (error) {
+          reportDynamicScriptError(error);
+          script.dispatchEvent(new Event('error'));
+        } finally {
+          document.__setCurrentScript(previous && previous.__id ? previous.__id : null);
+        }
+      }
+
+      function markScriptStarted(script) {
+        if (script && script.localName === 'script') {
+          defineValue(script, '__pagecoreScriptStarted', true);
+        }
+      }
+
+      function markScriptsStartedInSubtree(node) {
+        if (!node) return;
+        markScriptStarted(node);
+        if (node.querySelectorAll) {
+          for (const script of node.querySelectorAll('script')) markScriptStarted(script);
+        }
+      }
+
+      function executeDynamicScript(script) {
+        if (!script || script.localName !== 'script' || script.__pagecoreScriptStarted) return;
+        if (!script.isConnected || script.hasAttribute('nomodule') || !isClassicScriptType(script)) return;
+        markScriptStarted(script);
+
+        const src = script.getAttribute('src');
+        if (src) {
+          const url = absoluteURL(src);
+          const run = () => {
+            try {
+              const loaded = loadHostResource(url, 'script');
+              executeDynamicScriptSource(script, loaded && loaded.body ? loaded.body : '', (loaded && loaded.url) || url);
+            } catch (error) {
+              reportDynamicScriptError(error);
+              script.dispatchEvent(new Event('error'));
+            }
+          };
+          if (typeof global.setTimeout === 'function') global.setTimeout(run, 0);
+          else run();
+          return;
+        }
+
+        const base = global.location && global.location.href ? global.location.href : (host.baseURL || '');
+        const filename = `${base || '<dynamic-script>'}#dynamic-script-${nextDynamicScriptId++}`;
+        executeDynamicScriptSource(script, script.textContent || '', filename);
+      }
+
+      function executeDynamicScriptsInSubtree(node) {
+        if (!node || !node.isConnected) return;
+        if (node.localName === 'script') executeDynamicScript(node);
+        if (node.querySelectorAll) {
+          for (const script of node.querySelectorAll('script')) executeDynamicScript(script);
+        }
       }
 
 
@@ -198,7 +301,7 @@
             const id = bridge.appendChild(this._liveId(), liveId(child));
             const appended = wrapNode(id) || child;
             connectCustomElementTree(appended);
-            return afterMutation(appended, {
+            const result = afterMutation(appended, {
               type: 'childList',
               target: this,
               addedNodes: [child],
@@ -207,6 +310,8 @@
               nextSibling: null,
               attributeName: null
             });
+            executeDynamicScriptsInSubtree(result);
+            return result;
           }
 
           insertBefore(child, referenceChild) {
@@ -235,7 +340,7 @@
             const id = bridge.insertBefore(this._liveId(), liveId(child), referenceId);
             const inserted = wrapNode(id) || child;
             connectCustomElementTree(inserted);
-            return afterMutation(inserted, {
+            const result = afterMutation(inserted, {
               type: 'childList',
               target: this,
               addedNodes: [child],
@@ -244,6 +349,8 @@
               nextSibling: referenceChild || null,
               attributeName: null
             });
+            executeDynamicScriptsInSubtree(result);
+            return result;
           }
 
           removeChild(child) {
@@ -271,7 +378,7 @@
               return replacedChild;
             }
             const id = bridge.replaceChild(this._liveId(), liveId(child), liveId(replacedChild));
-            return afterMutation(wrapNode(id) || replacedChild, {
+            const result = afterMutation(wrapNode(id) || replacedChild, {
               type: 'childList',
               target: this,
               addedNodes: [child],
@@ -280,6 +387,8 @@
               nextSibling: null,
               attributeName: null
             });
+            executeDynamicScriptsInSubtree(child);
+            return result;
           }
 
           cloneNode(deep = false) {
@@ -952,7 +1061,9 @@
         function parseHTMLFragment(html) {
           const container = document.createElement('div');
           container.innerHTML = String(html ?? '');
-          return [...container.childNodes];
+          const nodes = [...container.childNodes];
+          for (const node of nodes) markScriptsStartedInSubtree(node);
+          return nodes;
         }
 
         function fragmentFromHTML(html) {
@@ -2251,6 +2362,7 @@
               nextSibling: null,
               attributeName: null
             });
+            markScriptsStartedInSubtree(this);
           }
           get outerHTML() { return bridge.outerHTML(this._liveId()); }
           get style() { return memo(this, '__style', () => styleDeclaration(this)); }
@@ -2708,7 +2820,10 @@
         class HTMLPreElement extends HTMLElement {}
         class HTMLProgressElement extends HTMLElement {}
         class HTMLQuoteElement extends HTMLElement {}
-        class HTMLScriptElement extends HTMLElement {}
+        class HTMLScriptElement extends HTMLElement {
+          get text() { return this.textContent || ''; }
+          set text(value) { this.textContent = String(value ?? ''); }
+        }
         class HTMLSelectElement extends HTMLFormControlElement {
           get options() { return this.querySelectorAll('option'); }
           get value() {
@@ -3089,6 +3204,9 @@
           __setCurrentScript(id) {
             this.currentScript = id == null ? null : wrapNode(id);
             setDocumentWriteState(this, null);
+          }
+          __markScriptStarted(id) {
+            markScriptStarted(id == null ? null : wrapNode(id));
           }
         }
 

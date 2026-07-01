@@ -16,6 +16,7 @@ extern "C" {
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pagecore {
@@ -52,6 +53,41 @@ std::string to_string(JSContext* ctx, JSValueConst value)
     }
     std::string out(data, len);
     JS_FreeCString(ctx, data);
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> headers_from_js_pairs(JSContext* ctx, JSValueConst value)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    if (JS_IsNull(value) || JS_IsUndefined(value)) {
+        return out;
+    }
+
+    JSValue length_value = JS_GetPropertyStr(ctx, value, "length");
+    uint32_t length = 0;
+    if (JS_ToUint32(ctx, &length, length_value) < 0) {
+        JS_FreeValue(ctx, length_value);
+        throw std::runtime_error("expected headers array");
+    }
+    JS_FreeValue(ctx, length_value);
+
+    out.reserve(length);
+    for (uint32_t i = 0; i < length; ++i) {
+        JSValue pair = JS_GetPropertyUint32(ctx, value, i);
+        JSValue name = JS_GetPropertyUint32(ctx, pair, 0);
+        JSValue header_value = JS_GetPropertyUint32(ctx, pair, 1);
+        try {
+            out.emplace_back(to_string(ctx, name), to_string(ctx, header_value));
+        } catch (...) {
+            JS_FreeValue(ctx, header_value);
+            JS_FreeValue(ctx, name);
+            JS_FreeValue(ctx, pair);
+            throw;
+        }
+        JS_FreeValue(ctx, header_value);
+        JS_FreeValue(ctx, name);
+        JS_FreeValue(ctx, pair);
+    }
     return out;
 }
 
@@ -834,7 +870,19 @@ JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
         if (argc < 1) throw std::runtime_error("loadResource requires url");
         const std::string url = to_string(ctx, argv[0]);
         const std::string kind = argc > 1 ? to_string(ctx, argv[1]) : "other";
-        const auto response = js.load_resource(url, kind);
+        std::string method = "GET";
+        if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
+            method = to_string(ctx, argv[2]);
+        }
+        std::string body;
+        if (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
+            body = to_string(ctx, argv[3]);
+        }
+        std::vector<std::pair<std::string, std::string>> headers;
+        if (argc > 4) {
+            headers = headers_from_js_pairs(ctx, argv[4]);
+        }
+        const auto response = js.load_resource(url, kind, std::move(method), std::move(body), std::move(headers));
 
         JSValue out = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, out, "url", js_string(ctx, response.url));
@@ -1136,7 +1184,12 @@ void JsRuntime::run_until_idle()
     bool timer_budget_available = true;
 
     for (int i = 0; i < 100; ++i) {
-        drain_jobs();
+        try {
+            drain_jobs();
+        } catch (const std::exception& error) {
+            log_console("error", error.what());
+            break;
+        }
 
         JSValue global = JS_GetGlobalObject(context_);
         JSValue run_timers = JS_GetPropertyStr(context_, global, "__pagecore_run_timers");
@@ -1155,12 +1208,23 @@ void JsRuntime::run_until_idle()
         JSValue result = JS_Call(context_, run_timers, JS_UNDEFINED, 1, args);
         JS_FreeValue(context_, args[0]);
         JS_FreeValue(context_, run_timers);
-        check_exception(result, "<timer-callback>");
+        try {
+            check_exception(result, "<timer-callback>");
+        } catch (const std::exception& error) {
+            log_console("error", error.what());
+            JS_FreeValue(context_, result);
+            break;
+        }
 
         int32_t ran = 0;
         JS_ToInt32(context_, &ran, result);
         JS_FreeValue(context_, result);
-        drain_jobs();
+        try {
+            drain_jobs();
+        } catch (const std::exception& error) {
+            log_console("error", error.what());
+            break;
+        }
 
         if (ran == 0) {
             break;
@@ -1214,7 +1278,12 @@ Viewport JsRuntime::viewport()
     return viewport_resolver_();
 }
 
-ResourceResponse JsRuntime::load_resource(std::string_view url, std::string_view kind)
+ResourceResponse JsRuntime::load_resource(
+    std::string_view url,
+    std::string_view kind,
+    std::string method,
+    std::string body,
+    std::vector<std::pair<std::string, std::string>> headers)
 {
     if (!loader_) {
         throw std::runtime_error("resource loader is not available");
@@ -1225,6 +1294,9 @@ ResourceResponse JsRuntime::load_resource(std::string_view url, std::string_view
         resource_kind_from_string(kind),
         base,
         base,
+        std::move(method),
+        std::move(body),
+        std::move(headers),
     });
 }
 

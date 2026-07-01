@@ -50,29 +50,32 @@ std::string normalized_script_type(std::string_view value)
     return out;
 }
 
+bool is_standard_javascript_type(std::string_view type)
+{
+    return type == "module"
+        || type == "text/javascript"
+        || type == "application/javascript"
+        || type == "application/ecmascript"
+        || type == "text/ecmascript"
+        || type == "application/x-javascript"
+        || type == "text/jscript";
+}
+
 bool is_javascript_script_type(const std::optional<std::string>& type)
 {
     if (!type || type->empty()) {
         return true;
     }
-
     const std::string normalized = normalized_script_type(*type);
-    if (normalized.empty()) {
-        return true;
-    }
-
-    return normalized == "module"
-        || normalized == "text/javascript"
-        || normalized == "application/javascript"
-        || normalized == "application/ecmascript"
-        || normalized == "text/ecmascript"
-        || normalized == "application/x-javascript"
-        || normalized == "text/jscript";
+    return normalized.empty() || is_standard_javascript_type(normalized);
 }
 
 bool is_module_script_type(const std::optional<std::string>& type)
 {
-    return type && normalized_script_type(*type) == "module";
+    if (!type) {
+        return false;
+    }
+    return normalized_script_type(*type) == "module";
 }
 
 // Identifies the inputs that fully determine a built styled document (the
@@ -347,13 +350,13 @@ struct Page::Impl {
             if (document.has_attribute(script, "nomodule")) {
                 continue;
             }
+            const auto src = document.get_attribute(script, "src");
             const auto type = document.get_attribute(script, "type");
             if (!is_javascript_script_type(type)) {
                 continue;
             }
             const bool module = is_module_script_type(type);
 
-            const auto src = document.get_attribute(script, "src");
             if (src && !src->empty()) {
                 const std::string base = current_url.empty() ? options.base_url : current_url;
                 const std::string url = resolve_url(base, *src);
@@ -395,23 +398,31 @@ struct Page::Impl {
     {
         ensure_js();
         for (const auto& script : collect_scripts()) {
+            js->execute("document.__markScriptStarted(" + std::to_string(script.node) + ");", "<pagecore-script-state>");
             if (script.module) {
                 js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
-                js->execute_module(script.code, script.filename);
+                try {
+                    js->execute_module(script.code, script.filename);
+                } catch (const std::exception& error) {
+                    js->log_console("error", error.what());
+                } catch (...) {
+                    js->log_console("error", "JS exception in module script");
+                }
                 continue;
             }
 
             js->execute("document.__setCurrentScript(" + std::to_string(script.node) + ");", "<pagecore-current-script>");
             try {
                 js->execute(script.code, script.filename);
+            } catch (const std::exception& error) {
+                js->log_console("error", error.what());
             } catch (...) {
-                try {
-                    js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
-                } catch (...) {
-                }
-                throw;
+                js->log_console("error", "JS exception in script");
             }
-            js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
+            try {
+                js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
+            } catch (...) {
+            }
         }
         js->execute(
             "if (typeof __pagecore_fireDOMContentLoaded === 'function') __pagecore_fireDOMContentLoaded();\n"

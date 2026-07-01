@@ -35,6 +35,17 @@ struct CurlBody {
     bool too_large = false;
 };
 
+struct CurlHeaderListDeleter {
+    void operator()(curl_slist* list) const
+    {
+        if (list != nullptr) {
+            curl_slist_free_all(list);
+        }
+    }
+};
+
+using CurlHeaderList = std::unique_ptr<curl_slist, CurlHeaderListDeleter>;
+
 // libcurl share handle for connection / DNS-cache / TLS-session reuse across
 // requests, with one lock mutex per shared data type so the share is safe to use
 // from multiple threads. Owned (type-erased) by each CurlResourceLoader.
@@ -860,12 +871,56 @@ bool looks_like_host_reference(std::string_view candidate)
     return true;
 }
 
+CurlHeaderList apply_request_metadata(CURL* curl, const ResourceRequest& request)
+{
+    if (request.method == "HEAD") {
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    } else if (request.method == "GET" || request.method.empty()) {
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    } else {
+        if (request.method == "POST") {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        } else {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, request.method.c_str());
+        }
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request.body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(request.body.size()));
+    }
+
+    curl_slist* raw_headers = nullptr;
+    for (const auto& [name, value] : request.headers) {
+        if (name.empty()) {
+            continue;
+        }
+        const std::string header = name + ": " + value;
+        raw_headers = curl_slist_append(raw_headers, header.c_str());
+    }
+    CurlHeaderList headers(raw_headers);
+    if (headers) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers.get());
+    }
+    return headers;
+}
+
+std::string cache_key_for(const ResourceRequest& request)
+{
+    std::string key = resource_kind_name(request.kind) + "\n" + request.url + "\n" + request.referrer
+        + "\n" + request.method + "\n" + request.body;
+    for (const auto& [name, value] : request.headers) {
+        key += "\n";
+        key += name;
+        key += ": ";
+        key += value;
+    }
+    return key;
+}
+
 // Applies every libcurl option for a single network transfer. Shared verbatim by
 // the serial load() and the concurrent load_all() so both paths enforce the same
 // protocol pinning, SSRF socket guard, size cap, timeout, and connection reuse.
-void configure_network_handle(
+CurlHeaderList configure_network_handle(
     CURL* curl,
-    const std::string& url,
+    const ResourceRequest& request,
     const std::string& user_agent,
     const ResourcePolicy& policy,
     CURLSH* share,
@@ -874,7 +929,7 @@ void configure_network_handle(
 {
     body.max_bytes = policy.max_response_bytes;
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
     // Pin the protocol set for the initial transfer too (not just redirects);
@@ -905,6 +960,7 @@ void configure_network_handle(
     if (share != nullptr) {
         curl_easy_setopt(curl, CURLOPT_SHARE, share);
     }
+    return apply_request_metadata(curl, request);
 }
 
 // Reads back the transfer result, enforces the post-transfer policy (size cap,
@@ -1053,7 +1109,8 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
 
     CurlBody body;
     OpenSocketContext socket_context;
-    configure_network_handle(curl.get(), url_string, user_agent_, policy_, share, body, socket_context);
+    CurlHeaderList headers =
+        configure_network_handle(curl.get(), request, user_agent_, policy_, share, body, socket_context);
 
     const CURLcode code = curl_easy_perform(curl.get());
     return build_network_response(curl.get(), request, policy_, body, socket_context, code);
@@ -1087,6 +1144,7 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
     std::vector<CURL*> handles(count, nullptr);
     std::vector<CurlBody> bodies(count);
     std::vector<OpenSocketContext> contexts(count);
+    std::vector<CurlHeaderList> header_lists(count);
 
     auto* curl_shared = static_cast<CurlShared*>(shared_.get());
     CURLSH* share = curl_shared == nullptr ? nullptr : curl_shared->share;
@@ -1132,7 +1190,8 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
             if (handle == nullptr) {
                 throw ResourceError(ResourceErrorCode::Transport, requests[i].url, "failed to initialize libcurl");
             }
-            configure_network_handle(handle, requests[i].url, user_agent_, policy_, share, bodies[i], contexts[i]);
+            header_lists[i] =
+                configure_network_handle(handle, requests[i], user_agent_, policy_, share, bodies[i], contexts[i]);
             handles[i] = handle;
             curl_multi_add_handle(multi, handle);
         } catch (...) {
@@ -1271,7 +1330,7 @@ CachingResourceLoader::CachingResourceLoader(std::shared_ptr<ResourceLoader> inn
 
 ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
 {
-    const std::string key = resource_kind_name(request.kind) + "\n" + request.url + "\n" + request.referrer;
+    const std::string key = cache_key_for(request);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto cached = cache_.find(key);
@@ -1313,7 +1372,7 @@ std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t i = 0; i < count; ++i) {
-            keys[i] = resource_kind_name(requests[i].kind) + "\n" + requests[i].url + "\n" + requests[i].referrer;
+            keys[i] = cache_key_for(requests[i]);
             auto cached = cache_.find(keys[i]);
             if (cached != cache_.end()) {
                 responses[i] = cached->second;

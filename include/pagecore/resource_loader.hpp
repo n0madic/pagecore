@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace pagecore {
@@ -50,6 +51,9 @@ struct ResourceRequest {
     ResourceKind kind = ResourceKind::Other;
     std::string referrer;
     std::string base_url;
+    std::string method = "GET";
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> headers;
 };
 
 struct ResourceResponse {

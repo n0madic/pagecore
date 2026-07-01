@@ -392,6 +392,23 @@
           }
         }
 
+        const windowAddEventListener = EventTarget.prototype.addEventListener;
+        const windowRemoveEventListener = EventTarget.prototype.removeEventListener;
+        const windowDispatchEvent = EventTarget.prototype.dispatchEvent;
+
+        function windowEventTarget(receiver) {
+          return receiver == null ? global : receiver;
+        }
+
+        defineValue(Window.prototype, 'addEventListener', function(...args) {
+          return windowAddEventListener.apply(windowEventTarget(this), args);
+        });
+        defineValue(Window.prototype, 'removeEventListener', function(...args) {
+          return windowRemoveEventListener.apply(windowEventTarget(this), args);
+        });
+        defineValue(Window.prototype, 'dispatchEvent', function(...args) {
+          return windowDispatchEvent.apply(windowEventTarget(this), args);
+        });
         defineValue(Window.prototype, Symbol.toStringTag, 'Window');
 
         function installWindowIdentity(target) {

@@ -7,7 +7,7 @@
 #include "pagecore/render.hpp"
 #include "pagecore/resource_loader.hpp"
 
-#if defined(PAGECORE_ENABLE_RENDERING)
+#if defined(PAGECORE_ENABLE_RENDERING) && defined(PAGECORE_ENABLE_WEBP) && PAGECORE_ENABLE_WEBP
 #include <webp/encode.h>
 #endif
 
@@ -85,6 +85,26 @@ bool has_request_kind(
 {
     for (const auto& request : loader.requests) {
         if (request.url == url && request.kind == kind) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const pagecore::ResourceRequest* find_request(const RecordingResourceLoader& loader, std::string_view url)
+{
+    for (const auto& request : loader.requests) {
+        if (request.url == url) {
+            return &request;
+        }
+    }
+    return nullptr;
+}
+
+bool has_header(const pagecore::ResourceRequest& request, std::string_view name, std::string_view value)
+{
+    for (const auto& [header_name, header_value] : request.headers) {
+        if (header_name == name && header_value == value) {
             return true;
         }
     }
@@ -321,6 +341,9 @@ std::string jpeg_header_with_dimensions(std::uint16_t width, std::uint16_t heigh
     return std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes));
 }
 
+#endif
+
+#if defined(PAGECORE_ENABLE_RENDERING) && defined(PAGECORE_ENABLE_WEBP) && PAGECORE_ENABLE_WEBP
 std::string webp_body(pagecore::Color color, int width = 4, int height = 4)
 {
     std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4);
@@ -461,17 +484,23 @@ void test_timers_and_events()
     b.addEventListener('done', (event) => b.setAttribute('data-hit', event.detail));
     b.ondone = () => { throw new Error('handler boom'); };
     setTimeout(() => b.dispatchEvent(new CustomEvent('done', { detail: 'ok' })), 10);
+    setTimeout(() => { throw new Error('timer boom'); }, 11);
+    setTimeout(() => b.setAttribute('data-after-timer-error', 'ok'), 12);
   </script>
 </body></html>
 )HTML");
 
     auto button = page.outer_html("#b[data-hit='ok']");
     require(button.has_value(), "setTimeout and CustomEvent should mutate DOM even when another listener throws");
-    require(console_logs.size() == 2, "throwing event handlers should be reported through the console log callback");
+    require(page.outer_html("#b[data-after-timer-error='ok']").has_value(),
+            "throwing timer callbacks should not abort later timers");
+    require(console_logs.size() == 3, "throwing event handlers and timer callbacks should be reported through the console log callback");
     require(console_logs[0].first == "error", "listener exception should be reported as console error");
     require(!console_logs[0].second.empty(), "listener exception log should include stack details");
     require(console_logs[1].first == "error", "event handler exception should be reported as console error");
     require(!console_logs[1].second.empty(), "event handler exception log should include stack details");
+    require(console_logs[2].first == "error", "timer callback exception should be reported as console error");
+    require(!console_logs[2].second.empty(), "timer callback exception log should include stack details");
 }
 
 void test_js_console_log_callback()
@@ -708,9 +737,25 @@ void test_browser_like_web_api_shims()
         checks.push(window instanceof Window);
         checks.push(Window.prototype instanceof EventTarget);
         checks.push(Object.prototype.toString.call(window) === '[object Window]');
+        checks.push(!Object.prototype.hasOwnProperty.call(window, 'addEventListener'));
       } else {
-        checks.push(false, false, false);
+        checks.push(false, false, false, false);
       }
+      const capturedWindowAddEventListener = window.addEventListener;
+      const originalEventTargetAddEventListener = EventTarget.prototype.addEventListener;
+      let patchedAddEventListenerCalled = false;
+      EventTarget.prototype.addEventListener = function(...args) {
+        patchedAddEventListenerCalled = true;
+        return originalEventTargetAddEventListener.apply(this, args);
+      };
+      capturedWindowAddEventListener.call(window, 'pagecore-native-listener-check', () => {
+        document.body.setAttribute('data-captured-window-listener', 'ok');
+      });
+      window.dispatchEvent(new Event('pagecore-native-listener-check'));
+      EventTarget.prototype.addEventListener = originalEventTargetAddEventListener;
+      checks.push(
+        !patchedAddEventListenerCalled &&
+        document.body.getAttribute('data-captured-window-listener') === 'ok');
       checks.push(navigator.javaEnabled() === false);
       checks.push(screen.width === window.innerWidth);
       checks.push(screen.height === window.innerHeight);
@@ -1964,7 +2009,7 @@ void test_request_response_fetch_object_shims()
 
 void test_xhr_and_fetch_load_through_resource_loader()
 {
-    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    auto loader = std::make_shared<RecordingResourceLoader>();
     loader->add(
         "https://api.test/data.json",
         R"JSON({"name":"xhr-ok"})JSON",
@@ -1980,7 +2025,8 @@ void test_xhr_and_fetch_load_through_resource_loader()
 <html><body>
   <script>
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', 'https://api.test/data.json');
+    xhr.open('POST', 'https://api.test/data.json');
+    xhr.setRequestHeader('Content-Type', 'application/json; charset=utf-8');
     xhr.onload = () => {
       const data = JSON.parse(xhr.responseText);
       document.body.setAttribute('data-xhr',
@@ -1991,9 +2037,13 @@ void test_xhr_and_fetch_load_through_resource_loader()
           ? 'ok'
           : 'bad');
     };
-    xhr.send();
+    xhr.send(JSON.stringify({ source: 'xhr' }));
 
-    fetch('/fetch.json').then((response) => response.json()).then((data) => {
+    fetch('/fetch.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: 'fetch-body'
+    }).then((response) => response.json()).then((data) => {
       document.body.setAttribute('data-fetch-loader', data.name);
     });
   </script>
@@ -2003,6 +2053,20 @@ void test_xhr_and_fetch_load_through_resource_loader()
     require(
         page.outer_html("body[data-xhr='ok'][data-fetch-loader='fetch-ok']").has_value(),
         "XMLHttpRequest and fetch should load resources through ResourceLoader");
+    const auto* xhr_request = find_request(*loader, "https://api.test/data.json");
+    require(xhr_request != nullptr, "XMLHttpRequest request should be recorded");
+    require(xhr_request->method == "POST", "XMLHttpRequest should pass the request method to ResourceLoader");
+    require(xhr_request->body == R"JSON({"source":"xhr"})JSON",
+            "XMLHttpRequest should pass the request body to ResourceLoader");
+    require(has_header(*xhr_request, "content-type", "application/json; charset=utf-8"),
+            "XMLHttpRequest should pass request headers to ResourceLoader");
+
+    const auto* fetch_request = find_request(*loader, "https://example.test/fetch.json");
+    require(fetch_request != nullptr, "fetch request should be recorded");
+    require(fetch_request->method == "POST", "fetch should pass the request method to ResourceLoader");
+    require(fetch_request->body == "fetch-body", "fetch should pass the request body to ResourceLoader");
+    require(has_header(*fetch_request, "content-type", "text/plain"),
+            "fetch should pass request headers to ResourceLoader");
 }
 
 void test_xhr_event_handler_exceptions_are_reported()
@@ -2065,6 +2129,85 @@ void test_non_javascript_script_types_are_not_executed()
 
     require(page.outer_html("body[data-js='ok']").has_value(),
             "non-JavaScript script types should be skipped instead of parsed by QuickJS");
+}
+
+void test_dynamic_script_insertion_executes_classic_scripts()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/masked.js",
+        R"JS(
+document.body.setAttribute('data-masked-static', 'bad');
+)JS",
+        "text/javascript");
+    loader->add(
+        "https://example.test/dynamic.js",
+        R"JS(
+document.body.setAttribute('data-dynamic-external', document.currentScript.src);
+)JS",
+        "text/javascript");
+    loader->add(
+        "https://example.test/late-handler.js",
+        R"JS(
+document.body.setAttribute('data-late-handler-script', 'ok');
+)JS",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script src="/masked.js" type="loader-token-text/javascript"></script>
+  <script type="loader-token-application/javascript">
+    document.body.setAttribute('data-masked-inline', 'bad');
+  </script>
+  <script>
+    const external = document.createElement('script');
+    external.src = '/dynamic.js';
+    external.onload = () => document.body.setAttribute('data-dynamic-load', 'ok');
+    document.head.appendChild(external);
+
+    const lateHandler = document.createElement('script');
+    lateHandler.src = '/late-handler.js';
+    document.head.appendChild(lateHandler);
+    lateHandler.onload = () => document.body.setAttribute('data-late-handler-load', 'ok');
+
+    const inline = document.createElement('script');
+    inline.text = "document.body.setAttribute('data-dynamic-inline', document.currentScript && document.currentScript.localName);";
+    document.body.appendChild(inline);
+
+    const holder = document.createElement('div');
+    holder.innerHTML = '<script>document.body.setAttribute("data-innerhtml-script", "bad");</' + 'script>';
+    document.body.appendChild(holder);
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-dynamic-external='https://example.test/dynamic.js'][data-dynamic-load='ok'][data-dynamic-inline='script'][data-late-handler-script='ok'][data-late-handler-load='ok']")
+            .has_value(),
+        "classic scripts inserted through DOM APIs should execute with currentScript and load events");
+    require(
+        !page.outer_html("body[data-masked-static='bad']").has_value(),
+        "non-standard static script types should not be fetched or executed by PageCore itself");
+    require(
+        !page.outer_html("body[data-masked-inline='bad']").has_value(),
+        "non-standard inline script types should not execute during static script collection");
+    require(
+        !has_request_kind(
+            *loader,
+            "https://example.test/masked.js",
+            pagecore::ResourceKind::Script),
+        "non-standard static external script types should not be requested before a loader opts in");
+    require(
+        has_request_kind(*loader, "https://example.test/dynamic.js", pagecore::ResourceKind::Script),
+        "dynamic external scripts should load as script resources");
+    require(
+        has_request_kind(*loader, "https://example.test/late-handler.js", pagecore::ResourceKind::Script),
+        "external dynamic scripts should start asynchronously enough for post-insertion onload handlers");
+    require(
+        !page.outer_html("body[data-innerhtml-script='bad']").has_value(),
+        "scripts created by innerHTML should remain inert when their container is inserted");
 }
 
 void test_resource_request_kind_and_cache()
@@ -2482,6 +2625,30 @@ void test_caching_loader_load_all_serves_hits_and_caches()
 
     const auto again = cache.load_all(requests);
     require(again[0].from_cache && again[1].from_cache, "a repeated batch is served entirely from cache");
+
+    auto dynamic = std::make_shared<RecordingResourceLoader>();
+    dynamic->add("https://example.test/api", "OK");
+    pagecore::CachingResourceLoader request_cache(dynamic, 8);
+    (void) request_cache.load(pagecore::ResourceRequest{
+        "https://example.test/api",
+        pagecore::ResourceKind::Other,
+        "https://example.test/page.html",
+        "https://example.test/page.html",
+        "POST",
+        "first",
+        {{"content-type", "text/plain"}},
+    });
+    (void) request_cache.load(pagecore::ResourceRequest{
+        "https://example.test/api",
+        pagecore::ResourceKind::Other,
+        "https://example.test/page.html",
+        "https://example.test/page.html",
+        "POST",
+        "second",
+        {{"content-type", "text/plain"}},
+    });
+    require(dynamic->requests.size() == 2,
+            "cache key should include request method, body and headers, not just URL");
 }
 
 void test_external_scripts_load_in_document_order()
@@ -2765,6 +2932,7 @@ void test_jpeg_decoder_rgba()
             "JPEG decoder should preserve approximate pixel color");
 }
 
+#if PAGECORE_ENABLE_WEBP
 void test_webp_decoder_rgba()
 {
     const auto body = webp_body(pagecore::Color{12, 200, 90, 255}, 4, 3);
@@ -2776,6 +2944,7 @@ void test_webp_decoder_rgba()
     require(color_close(decoded->rgba, pagecore::Color{12, 200, 90, 255}, 0),
             "WebP decoder should preserve lossless pixel color");
 }
+#endif
 
 void test_jpeg_decoder_rejects_huge_dimensions()
 {
@@ -2789,6 +2958,7 @@ void test_jpeg_decoder_rejects_huge_dimensions()
         "JPEG decoder should reject huge decoded dimensions before allocation");
 }
 
+#if PAGECORE_ENABLE_WEBP
 void test_webp_decoder_rejects_huge_dimensions()
 {
     std::string body = webp_body(pagecore::Color{12, 200, 90, 255}, 4, 3);
@@ -2816,6 +2986,7 @@ void test_webp_decoder_rejects_huge_dimensions()
         "too large",
         "WebP decoder should reject huge decoded dimensions before allocation");
 }
+#endif
 
 void test_gif_decoder_rgba()
 {
@@ -2828,6 +2999,7 @@ void test_gif_decoder_rgba()
             "GIF decoder should preserve first-frame palette color");
 }
 
+#if PAGECORE_ENABLE_SVG
 void test_svg_decoder_rgba()
 {
     const auto decoded = pagecore::decode_image_rgba(svg_body(pagecore::Color{240, 20, 30, 255}));
@@ -2875,6 +3047,7 @@ void test_svg_decoder_rejects_huge_dimensions()
         "too large",
         "SVG decoder should enforce the decode byte budget before allocating the cairo surface");
 }
+#endif
 
 void test_cairo_raster_handles_nonfinite_coordinates()
 {
@@ -2953,8 +3126,10 @@ void test_image_decoder_rejects_malformed_input()
     expect_throws(std::string_view(jpeg).substr(0, jpeg.size() / 3), "truncated JPEG");
     const auto gif = gif_body();
     expect_throws(std::string_view(gif).substr(0, gif.size() / 3), "truncated GIF");
+#if PAGECORE_ENABLE_WEBP
     const auto webp = webp_body(pagecore::Color{10, 20, 30, 255});
     expect_throws(std::string_view(webp).substr(0, webp.size() / 3), "truncated WebP");
+#endif
 }
 
 void test_cairo_raster_and_io_error_paths()
@@ -3291,15 +3466,22 @@ void test_js_runtime_robust_exception_paths()
     const auto ok = page.eval("1 + 1");
     require(ok == "2", "a prior stringification failure must not corrupt later evaluation");
 
-    // Throwing a non-object must surface cleanly (no crash from reading .stack).
-    pagecore::Page page2;
-    bool threw = false;
-    try {
-        page2.load_html("<html><body><script>throw null;</script></body></html>");
-    } catch (const std::exception&) {
-        threw = true;
-    }
-    require(threw, "throwing a non-object should surface as an error, not crash");
+    // Throwing a non-object from a page script must be logged without corrupting
+    // later JS execution.
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+    pagecore::Page page2(options);
+    page2.load_html("<html><body><script>throw null;</script><script>document.body.setAttribute('data-after-null-throw', 'ok')</script></body></html>");
+    require(page2.outer_html("body[data-after-null-throw='ok']").has_value(),
+            "a throwing page script should not abort later scripts");
+    require(console_logs.size() == 1 && console_logs[0].first == "error",
+            "throwing a non-object from a page script should be logged as an error");
+    require(
+        console_logs[0].second.find("JS exception (<inline-script-0>): null") != std::string::npos,
+        "logged non-object exception should include the script source and thrown value");
 }
 
 void test_web_shim_crypto_url_input()
@@ -3382,22 +3564,27 @@ void test_streams_writable_controller_and_tee()
 
 void test_js_exception_message_includes_source_name()
 {
-    pagecore::Page page;
-    try {
-        page.load_html(R"HTML(
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
 <html><body>
   <script>throw new Error('boom')</script>
+  <script>document.body.setAttribute('data-after-throw', 'ok')</script>
 </body></html>
 )HTML", "https://example.test/page.html");
-    } catch (const std::exception& error) {
-        const std::string message = error.what();
-        require(
-            message.find("JS exception (https://example.test/page.html#inline-script-0): Error: boom") != std::string::npos,
-            "JS exception message should include the script source before the exception text");
-        return;
-    }
 
-    require(false, "throwing script should fail page load");
+    require(page.outer_html("body[data-after-throw='ok']").has_value(),
+            "a throwing page script should not abort later scripts");
+    require(console_logs.size() == 1 && console_logs[0].first == "error",
+            "throwing page script should be logged as a console error");
+    require(
+        console_logs[0].second.find("JS exception (https://example.test/page.html#inline-script-0): Error: boom") != std::string::npos,
+        "JS exception log should include the script source before the exception text");
 }
 
 #if defined(PAGECORE_ENABLE_RENDERING)
@@ -4101,6 +4288,7 @@ void test_page_render_decodes_and_draws_jpeg_images()
             "Page::render should draw decoded JPEG pixels");
 }
 
+#if PAGECORE_ENABLE_WEBP
 void test_page_render_decodes_and_draws_webp_images()
 {
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -4132,6 +4320,7 @@ void test_page_render_decodes_and_draws_webp_images()
     const auto rendered = page.render(options);
     require(image_has_pixel(rendered, pagecore::Color{12, 200, 90, 255}), "Page::render should draw decoded WebP pixels");
 }
+#endif
 
 void test_page_render_decodes_and_draws_gif_images()
 {
@@ -4166,6 +4355,7 @@ void test_page_render_decodes_and_draws_gif_images()
             "Page::render should draw decoded GIF pixels");
 }
 
+#if PAGECORE_ENABLE_SVG
 void test_page_render_decodes_and_draws_svg_images()
 {
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -4197,6 +4387,7 @@ void test_page_render_decodes_and_draws_svg_images()
     const auto rendered = page.render(options);
     require(image_has_pixel(rendered, pagecore::Color{240, 20, 30, 255}), "Page::render should draw decoded SVG pixels");
 }
+#endif
 
 void test_page_render_background_image_size_position_and_repeat()
 {
@@ -4438,11 +4629,15 @@ void test_visual_fixture_regression()
 
     require(region_has_saturated_pixel(image, 56, 596, 112, 76), "visual fixture should draw PNG img content");
     require(region_has_saturated_pixel(image, 220, 596, 118, 76), "visual fixture should draw JPEG img content");
+#if PAGECORE_ENABLE_WEBP
     require(region_has_saturated_pixel(image, 56, 728, 112, 76), "visual fixture should draw WebP img content");
+#endif
 
     require(region_has_saturated_pixel(image, 408, 580, 352, 58), "visual fixture should draw JPEG background image");
     require(region_has_saturated_pixel(image, 408, 646, 352, 58), "visual fixture should draw PNG repeated background image");
+#if PAGECORE_ENABLE_WEBP
     require(region_has_saturated_pixel(image, 408, 712, 352, 58), "visual fixture should draw WebP repeated background image");
+#endif
 
     require(
         region_has_close_pixel(image, 12, 930, 760, 54, pagecore::Color{23, 32, 42, 255}, 4),
@@ -4889,6 +5084,7 @@ int main()
         test_xhr_and_fetch_load_through_resource_loader();
         test_xhr_event_handler_exceptions_are_reported();
         test_non_javascript_script_types_are_not_executed();
+        test_dynamic_script_insertion_executes_classic_scripts();
         test_resource_request_kind_and_cache();
         test_resource_url_resolution_normalizes_dot_segments();
         test_resource_loader_decodes_data_urls();
@@ -4916,13 +5112,19 @@ int main()
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_png_decoder_rgba();
         test_jpeg_decoder_rgba();
+#if PAGECORE_ENABLE_WEBP
         test_webp_decoder_rgba();
+#endif
         test_jpeg_decoder_rejects_huge_dimensions();
+#if PAGECORE_ENABLE_WEBP
         test_webp_decoder_rejects_huge_dimensions();
+#endif
         test_gif_decoder_rgba();
+#if PAGECORE_ENABLE_SVG
         test_svg_decoder_rgba();
         test_svg_path_parser_terminates_on_malformed_input();
         test_svg_decoder_rejects_huge_dimensions();
+#endif
         test_cairo_raster_handles_nonfinite_coordinates();
         test_background_tiling_is_bounded();
         test_image_decoder_rejects_malformed_input();
@@ -4958,9 +5160,13 @@ int main()
         test_page_render_decodes_and_draws_data_url_images();
         test_page_render_decodes_css_data_url_background_images();
         test_page_render_decodes_and_draws_jpeg_images();
+#if PAGECORE_ENABLE_WEBP
         test_page_render_decodes_and_draws_webp_images();
+#endif
         test_page_render_decodes_and_draws_gif_images();
+#if PAGECORE_ENABLE_SVG
         test_page_render_decodes_and_draws_svg_images();
+#endif
         test_page_render_background_image_size_position_and_repeat();
         test_page_render_linear_gradient_background();
         test_page_render_clips_background_to_border_radius();

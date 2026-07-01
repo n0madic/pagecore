@@ -10,6 +10,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 extern "C" {
 #include <quickjs.h>
@@ -39,7 +41,12 @@ public:
     void run_until_idle();
 
     DomDocument& document();
-    ResourceResponse load_resource(std::string_view url, std::string_view kind);
+    ResourceResponse load_resource(
+        std::string_view url,
+        std::string_view kind,
+        std::string method = "GET",
+        std::string body = {},
+        std::vector<std::pair<std::string, std::string>> headers = {});
     void log_console(std::string_view severity, std::string_view message);
     bool is_timed_out() const;
 
