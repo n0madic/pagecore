@@ -173,8 +173,9 @@
         }
       }
 
-      function scheduleTask(callback) {
-        if (typeof global.setTimeout === 'function') global.setTimeout(callback, 0);
+      function scheduleTask(callback, kind = 'other') {
+        if (typeof global.__pagecore_queue_task === 'function') global.__pagecore_queue_task(callback, kind);
+        else if (typeof global.setTimeout === 'function') global.setTimeout(callback, 0);
         else callback();
       }
 
@@ -191,7 +192,7 @@
             activityEnd('dynamic-script');
             drainOrderedDynamicScripts();
           }
-        });
+        }, 'dynamic-script');
       }
 
       function markScriptStarted(script) {
@@ -228,7 +229,7 @@
             } finally {
               activityEnd('dynamic-script');
             }
-          });
+          }, 'dynamic-script');
           return;
         }
 
@@ -301,8 +302,7 @@
             activityEnd('dom-resource');
           }
         };
-        if (typeof global.setTimeout === 'function') global.setTimeout(run, 0);
-        else run();
+        scheduleTask(run, 'dom-resource');
       }
 
       function scheduleResourceLoadsInSubtree(node) {

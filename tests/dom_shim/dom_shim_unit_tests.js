@@ -464,14 +464,30 @@ test('web timers run timeout and interval callbacks deterministically', () => {
   const intervalId = web.setIntervalShim(() => {
     calls.push('interval');
     if (calls.filter((value) => value === 'interval').length === 2) {
-      web.clearTimer(intervalId);
+      web.clearTask(intervalId);
     }
   }, 5);
 
-  assert.strictEqual(web.runTimers(4), 0);
+  assert.strictEqual(web.runEventLoopStep(4), 0);
   assert.deepStrictEqual(calls, []);
-  assert.strictEqual(web.runTimers(6), 3);
+  assert.strictEqual(web.runEventLoopStep(6), 1);
+  assert.deepStrictEqual(calls, ['interval']);
+  assert.strictEqual(web.runEventLoopStep(5), 1);
+  assert.strictEqual(web.runEventLoopStep(0), 1);
   assert.deepStrictEqual(calls, ['interval', 'timeout:a', 'interval']);
+});
+
+test('web event loop step runs one due task in insertion order', () => {
+  const { web } = installWeb();
+  const calls = [];
+
+  web.queuePageTask(() => calls.push('first'), 'test');
+  web.queuePageTask(() => calls.push('second'), 'test');
+
+  assert.strictEqual(web.runEventLoopStep(0), 1);
+  assert.deepStrictEqual(calls, ['first']);
+  assert.strictEqual(web.runEventLoopStep(0), 1);
+  assert.deepStrictEqual(calls, ['first', 'second']);
 });
 
 test('events exposes standard DOMException legacy constants', () => {
@@ -506,6 +522,23 @@ test('dom HTMLScriptElement tracks dynamic async state', () => {
   assert.strictEqual(script.hasAttribute('defer'), true);
   assert.strictEqual('async' in div, false);
   assert.strictEqual('defer' in div, false);
+});
+
+test('dom MutationObserver uses explicit delivery hook', () => {
+  const { dom, events } = installDomEnvironment();
+  const { document } = dom;
+  const recordsSeen = [];
+  const observer = new events.MutationObserver((records) => {
+    recordsSeen.push(records.map((record) => record.type).join(','));
+  });
+
+  observer.observe(document.body, { childList: true });
+  document.body.appendChild(document.createElement('span'));
+
+  assert.deepStrictEqual(recordsSeen, []);
+  assert.strictEqual(events.deliverMutationObservers(), 1);
+  assert.deepStrictEqual(recordsSeen, ['childList']);
+  assert.strictEqual(events.deliverMutationObservers(), 0);
 });
 
 test('dom TreeWalker and NodeIterator traverse with filters', () => {

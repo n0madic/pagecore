@@ -792,6 +792,106 @@ void test_zero_wait_does_not_run_timer_callbacks()
             "wait_time=0 run_until_idle must keep timer callbacks pending");
 }
 
+void test_run_until_idle_logs_throwing_event_loop_snapshot()
+{
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Load;
+    options.wait_time = std::chrono::milliseconds(10);
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
+    page.load_html("<html><body></body></html>");
+    page.eval(R"JS(
+      window.__pagecore_event_loop_snapshot = () => { throw new Error('snapshot boom'); };
+      setTimeout(() => document.body.setAttribute('data-timer', 'ran'), 0);
+    )JS");
+
+    bool threw = false;
+    try {
+        page.run_until_idle();
+    } catch (...) {
+        threw = true;
+    }
+
+    require(!threw, "run_until_idle should log throwing event-loop snapshot hooks instead of propagating");
+    require(
+        std::any_of(console_logs.begin(), console_logs.end(), [](const auto& entry) {
+            return entry.first == "error" && entry.second.find("snapshot boom") != std::string::npos;
+        }),
+        "run_until_idle should report event-loop snapshot exceptions through console_log");
+}
+
+void test_event_loop_ordering_contract()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/fetch.json", R"JSON({"value":"fetch"})JSON", "application/json");
+    loader->add("https://example.test/xhr.json", R"JSON({"value":"xhr"})JSON", "application/json");
+
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Ready;
+    options.wait_time = std::chrono::milliseconds(50);
+    options.stable_window = std::chrono::milliseconds(5);
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    window.__eventLoopOrder = [];
+    const push = (value) => window.__eventLoopOrder.push(value);
+
+    setTimeout(() => push('timer-before-sync-mutation'), 0);
+    Promise.resolve().then(() => push('promise-before-first-task'));
+
+    const observer = new MutationObserver(() => {
+      push('observer');
+      Promise.resolve().then(() => push('observer-promise'));
+      throw new Error('observer boom');
+    });
+    observer.observe(document.body, { attributes: true });
+    document.body.setAttribute('data-sync-mutation', '1');
+    setTimeout(() => push('timer-after-sync-mutation'), 0);
+
+    fetch('/fetch.json')
+      .then((response) => response.json())
+      .then((data) => push(data.value));
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/xhr.json');
+    xhr.onload = () => push(JSON.parse(xhr.responseText).value);
+    xhr.send();
+
+    setTimeout(() => { throw new Error('timer boom'); }, 0);
+    setTimeout(() => {
+      push('timer-after-error');
+      observer.disconnect();
+      document.body.setAttribute('data-event-loop-order', window.__eventLoopOrder.join(','));
+    }, 0);
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.eval("window.__eventLoopOrder.join(',')")
+            == "promise-before-first-task,observer,observer-promise,timer-before-sync-mutation,timer-after-sync-mutation,fetch,xhr,timer-after-error",
+        "event loop should run checkpoint before tasks, deliver MutationObserver before next task, and treat fetch/XHR as tasks");
+    require(
+        page.outer_html("body[data-event-loop-order]").has_value(),
+        "later timer task should run after throwing observer/timer callbacks");
+    require(console_logs.size() >= 2, "throwing observer and timer callbacks should be logged");
+    require(
+        has_request_kind(*loader, "https://example.test/fetch.json", pagecore::ResourceKind::Other)
+            && has_request_kind(*loader, "https://example.test/xhr.json", pagecore::ResourceKind::Other),
+        "fetch and XHR event-loop tasks should load through ResourceLoader");
+}
+
 void test_browser_like_web_api_shims()
 {
     pagecore::LoadOptions options;
@@ -1310,16 +1410,6 @@ void test_text_content_mutation_observer_records_nodes()
     const records = [];
     new MutationObserver((batch) => {
       for (const record of batch) records.push(record);
-    }).observe(root, { childList: true, characterData: true, subtree: true });
-
-    root.textContent = 'fresh';
-    const fresh = root.firstChild;
-    fresh.textContent = 'fresh2';
-    const comment = document.createComment('before');
-    root.appendChild(comment);
-    comment.textContent = 'after';
-
-    Promise.resolve().then(() => {
       const childRecord = records.find((record) =>
         record.type === 'childList' &&
         record.target === root &&
@@ -1334,7 +1424,14 @@ void test_text_content_mutation_observer_records_nodes()
         record.type === 'characterData' && record.target === comment);
       root.setAttribute('data-textcontent-records',
         childRecord && textRecord && commentRecord ? 'ok' : 'bad');
-    });
+    }).observe(root, { childList: true, characterData: true, subtree: true });
+
+    root.textContent = 'fresh';
+    const fresh = root.firstChild;
+    fresh.textContent = 'fresh2';
+    const comment = document.createComment('before');
+    root.appendChild(comment);
+    comment.textContent = 'after';
   </script>
 </body></html>
 )HTML");
@@ -2511,7 +2608,37 @@ void test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable()
         "wait-until=ready should wait for timer-scheduled fetch and the resulting DOM mutation");
     require(
         has_request_kind(*loader, "https://example.test/data.json", pagecore::ResourceKind::Other),
-        "timer-scheduled fetch should load through ResourceLoader before readiness completes");
+            "timer-scheduled fetch should load through ResourceLoader before readiness completes");
+}
+
+void test_page_readiness_dom_stable_runs_pending_page_tasks()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/data.json", R"JSON({"value":"ok"})JSON", "application/json");
+
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Load;
+    options.wait_time = std::chrono::milliseconds(0);
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html("<html><body></body></html>", "https://example.test/index.html");
+    page.eval(R"JS(
+      fetch('/data.json')
+        .then((response) => response.json())
+        .then((data) => document.body.setAttribute('data-dom-stable-fetch', data.value));
+    )JS");
+
+    const bool ready = page.run_until_ready(pagecore::PageReadinessOptions{
+        pagecore::WaitUntil::DomStable,
+        std::chrono::milliseconds(50),
+        std::chrono::milliseconds(0),
+    });
+
+    require(ready, "wait-until=dom-stable should complete after pending page tasks run");
+    require(
+        page.outer_html("body[data-dom-stable-fetch='ok']").has_value(),
+        "wait-until=dom-stable should not finish before a queued fetch task mutates the DOM");
 }
 
 void test_page_readiness_image_and_stylesheet_load_events()
@@ -2878,6 +3005,8 @@ document.body.setAttribute('data-masked-static', 'bad');
     loader->add(
         "https://example.test/dynamic.js",
         R"JS(
+window.__dynamicScriptOrder = (window.__dynamicScriptOrder || []);
+window.__dynamicScriptOrder.push('body');
 document.body.setAttribute('data-dynamic-external', document.currentScript.src);
 )JS",
         "text/javascript");
@@ -2907,7 +3036,11 @@ document.body.setAttribute('data-late-handler-script', 'ok');
   <script>
     const external = document.createElement('script');
     external.src = '/dynamic.js';
-    external.onload = () => document.body.setAttribute('data-dynamic-load', 'ok');
+    external.onload = () => {
+      window.__dynamicScriptOrder.push('load');
+      document.body.setAttribute('data-dynamic-load', 'ok');
+      document.body.setAttribute('data-dynamic-script-order', window.__dynamicScriptOrder.join(','));
+    };
     document.head.appendChild(external);
 
     const lateHandler = document.createElement('script');
@@ -2942,6 +3075,9 @@ document.body.setAttribute('data-late-handler-script', 'ok');
         page.outer_html("body[data-dynamic-external='https://example.test/dynamic.js'][data-dynamic-load='ok'][data-dynamic-inline='script'][data-late-handler-script='ok'][data-late-handler-load='ok']")
             .has_value(),
         "classic scripts inserted through DOM APIs should execute with currentScript and load events");
+    require(
+        page.outer_html("body[data-dynamic-script-order='body,load']").has_value(),
+        "dynamic script load event should fire after the script body runs");
     require(
         !page.outer_html("body[data-masked-static='bad']").has_value(),
         "non-standard static script types should not be fetched or executed by PageCore itself");
@@ -6759,6 +6895,8 @@ int main()
         test_wrapper_cache_prunes_only_on_forget();
         test_timer_wait_budget();
         test_zero_wait_does_not_run_timer_callbacks();
+        test_run_until_idle_logs_throwing_event_loop_snapshot();
+        test_event_loop_ordering_contract();
         test_browser_like_web_api_shims();
         test_event_constructor_ignores_prototype_accessors();
         test_document_lifecycle_ignores_ready_state_overrides();
@@ -6799,6 +6937,7 @@ int main()
         test_cookie_attributes_path_domain_expires_secure_samesite();
         test_page_readiness_wait_until_load_skips_timers();
         test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable();
+        test_page_readiness_dom_stable_runs_pending_page_tasks();
         test_page_readiness_image_and_stylesheet_load_events();
         test_js_resource_policy_block_all_keeps_parser_scripts();
         test_js_resource_policy_same_origin_blocks_cross_origin_loads();

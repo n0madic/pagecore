@@ -92,10 +92,10 @@ private:
         std::uint64_t calls = 0;
     };
 
-    struct TimerSnapshot {
+    struct EventLoopSnapshot {
         std::chrono::milliseconds now{0};
         std::size_t relevant_count = 0;
-        std::optional<std::chrono::milliseconds> next_relevant_delay;
+        std::optional<std::chrono::milliseconds> next_task_delay;
     };
 
     JSRuntime* runtime_ = nullptr;
@@ -121,10 +121,12 @@ private:
 
     void start_deadline();
     void clear_deadline();
-    void drain_jobs();
-    int drain_jobs_logged();
-    int run_timers(std::chrono::milliseconds advance);
-    TimerSnapshot timer_snapshot(std::chrono::milliseconds horizon);
+    int drain_jobs();
+    int deliver_mutation_observers();
+    void run_microtask_checkpoint();
+    int run_microtask_checkpoint_logged();
+    int run_event_loop_step(std::chrono::milliseconds advance);
+    EventLoopSnapshot event_loop_snapshot(std::chrono::milliseconds horizon);
     void sync_activity_state(std::chrono::milliseconds timer_horizon);
     bool readiness_satisfied(WaitUntil wait_until, std::chrono::milliseconds stable_window) const;
     void check_exception(JSValue value, std::string_view source_name = {});

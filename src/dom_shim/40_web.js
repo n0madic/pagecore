@@ -903,7 +903,7 @@
             };
 
             void body;
-            if (this._async) global.setTimeout(run, 0);
+            if (this._async) queuePageTask(run, 'xhr-fetch');
             else run();
           }
 
@@ -971,8 +971,8 @@
           }
         }
 
-        const timers = new Map();
-        let nextTimerId = 1;
+        const tasks = new Map();
+        let nextTaskId = 1;
         let timerNow = 0;
 
         function normalizeDelay(delay) {
@@ -981,7 +981,7 @@
           return value;
         }
 
-        function reportTimerError(error) {
+        function reportTaskError(error) {
           try {
             if (global.console && typeof global.console.error === 'function') {
               global.console.error(error);
@@ -992,14 +992,12 @@
           }
         }
 
-        function callTimerCallback(timer) {
-          if (typeof timer.callback === 'function') {
-            // Timer callbacks run with the global object as `this`, per spec,
-            // so non-strict callbacks relying on `this === window` work.
+        function callTaskCallback(task) {
+          if (typeof task.callback === 'function') {
             try {
-              timer.callback.call(global, ...timer.args);
+              task.callback.call(global, ...task.args);
             } catch (error) {
-              reportTimerError(error);
+              reportTaskError(error);
             }
           }
         }
@@ -1147,22 +1145,34 @@
           });
         }
 
-      function setTimeoutShim(callback, delay = 0, ...args) {
-        const id = nextTimerId++;
+      function queueTask(callback, delay = 0, args = [], kind = 'other', interval = false) {
+        const id = nextTaskId++;
         const timeout = normalizeDelay(delay);
-        timers.set(id, { callback, delay: timeout, due: timerNow + timeout, args, interval: false });
+        tasks.set(id, {
+          callback,
+          delay: timeout,
+          due: timerNow + timeout,
+          args: Array.isArray(args) ? args : [],
+          interval: Boolean(interval),
+          kind: String(kind || 'other')
+        });
         return id;
       }
 
-      function clearTimer(id) {
-        return timers.delete(id);
+      function queuePageTask(callback, kind = 'other', delay = 0) {
+        return queueTask(callback, delay, [], kind, false);
+      }
+
+      function setTimeoutShim(callback, delay = 0, ...args) {
+        return queueTask(callback, delay, args, 'timer', false);
+      }
+
+      function clearTask(id) {
+        return tasks.delete(id);
       }
 
       function setIntervalShim(callback, delay = 0, ...args) {
-        const id = nextTimerId++;
-        const timeout = normalizeDelay(delay);
-        timers.set(id, { callback, delay: timeout, due: timerNow + timeout, args, interval: true });
-        return id;
+        return queueTask(callback, delay, args, 'timer', true);
       }
 
       function requestAnimationFrameShim(callback) {
@@ -1178,53 +1188,54 @@
       }
       ctx.pagecoreNow = performanceNow;
 
-      function runTimers(advanceMs = 0) {
-        const deadline = timerNow + normalizeDelay(advanceMs);
-        let ran = 0;
-        const maxCallbacks = 250;
-
-        for (;;) {
-          let nextDue = Infinity;
-          for (const timer of timers.values()) {
-            if (timer.due < nextDue) nextDue = timer.due;
-          }
-
-          if (nextDue === Infinity || nextDue > deadline) {
-            timerNow = deadline;
-            return ran;
-          }
-
-          timerNow = nextDue;
-          const due = [...timers.entries()]
-            .filter((entry) => entry[1].due <= timerNow)
-            .sort((left, right) => left[1].due - right[1].due || left[0] - right[0]);
-
-          for (const [id, timer] of due) {
-            if (!timers.has(id)) continue;
-            if (timer.interval) {
-              timer.due = timerNow + Math.max(1, timer.delay);
-            } else {
-              timers.delete(id);
-            }
-            callTimerCallback(timer);
-            ran++;
-            if (ran >= maxCallbacks) return 0;
-          }
+	      function runEventLoopStep(advanceMs = 0) {
+	        const deadline = timerNow + normalizeDelay(advanceMs);
+	        let nextDue = Infinity;
+	        for (const task of tasks.values()) {
+	          if (task.due < nextDue) nextDue = task.due;
         }
-      }
 
-      function timerSnapshot(horizonMs = 0) {
-        const horizon = timerNow + normalizeDelay(horizonMs);
-        let relevant = 0;
-        let nextDue = Infinity;
-        for (const timer of timers.values()) {
-          if (timer.interval || timer.due > horizon) continue;
-          relevant++;
-          if (timer.due < nextDue) nextDue = timer.due;
+        if (nextDue === Infinity || nextDue > deadline) {
+          timerNow = deadline;
+          return 0;
         }
-        return {
-          now: timerNow,
-          relevant,
+
+        timerNow = nextDue;
+        const due = [...tasks.entries()]
+          .filter((entry) => entry[1].due <= timerNow)
+          .sort((left, right) => left[1].due - right[1].due || left[0] - right[0]);
+        if (due.length === 0) return 0;
+
+        const [id, task] = due[0];
+        if (!tasks.has(id)) return 0;
+        if (task.interval) {
+          task.due = timerNow + Math.max(1, task.delay);
+        } else {
+          tasks.delete(id);
+        }
+	        callTaskCallback(task);
+	        return 1;
+	      }
+
+	      function isReadinessRelevantTask(task) {
+	        if (task.interval) return false;
+	        return task.kind === 'timer'
+	          || task.kind === 'xhr-fetch'
+	          || task.kind === 'dynamic-script'
+	          || task.kind === 'dom-resource';
+	      }
+
+	      function eventLoopSnapshot(horizonMs = 0) {
+	        const horizon = timerNow + normalizeDelay(horizonMs);
+	        let relevant = 0;
+	        let nextDue = Infinity;
+	        for (const task of tasks.values()) {
+	          if (task.due < nextDue) nextDue = task.due;
+	          if (isReadinessRelevantTask(task) && task.due <= horizon) relevant++;
+	        }
+	        return {
+	          now: timerNow,
+	          relevant,
           nextDelay: nextDue === Infinity ? -1 : Math.max(0, nextDue - timerNow)
         };
       }
@@ -1257,13 +1268,14 @@
         randomUUID,
         installWptHook,
         setTimeoutShim,
-        clearTimer,
+        clearTask,
         setIntervalShim,
         requestAnimationFrameShim,
         requestIdleCallbackShim,
         performanceNow,
-        runTimers,
-        timerSnapshot
+        queuePageTask,
+        runEventLoopStep,
+        eventLoopSnapshot
       };
     }
   };

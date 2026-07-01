@@ -1361,7 +1361,7 @@ void JsRuntime::execute(std::string_view script, std::string_view filename)
             JS_EVAL_TYPE_GLOBAL);
         check_exception(value, filename_string);
         JS_FreeValue(context_, value);
-        drain_jobs();
+        run_microtask_checkpoint();
         clear_deadline();
         flush_dom_bridge_perf();
         emit_script_perf("execute", perf_start, script.size());
@@ -1395,7 +1395,7 @@ void JsRuntime::execute_module(std::string_view script, std::string_view filenam
         JSValue value = JS_EvalFunction(context_, module_value);
         check_exception(value, filename_string);
         JS_FreeValue(context_, value);
-        drain_jobs();
+        run_microtask_checkpoint();
         clear_deadline();
         flush_dom_bridge_perf();
         emit_script_perf("execute_module", perf_start, script.size());
@@ -1423,7 +1423,7 @@ std::string JsRuntime::evaluate(std::string_view script, std::string_view filena
     // value holds a live reference; if draining a pending job throws, free it
     // (and clear the deadline) before propagating so it does not leak.
     try {
-        drain_jobs();
+        run_microtask_checkpoint();
     } catch (...) {
         JS_FreeValue(context_, value);
         clear_deadline();
@@ -1452,71 +1452,62 @@ void JsRuntime::run_until_idle()
 {
     const auto perf_start = std::chrono::steady_clock::now();
     start_deadline();
-    bool timer_budget_available = true;
     int iterations = 0;
 
-    for (int i = 0; i < 100; ++i) {
-        ++iterations;
+    auto finish = [&]() {
+        clear_deadline();
+        flush_dom_bridge_perf();
+        emit_script_perf("run_until_idle", perf_start, static_cast<std::uint64_t>(iterations));
+    };
+
+    if (run_microtask_checkpoint_logged() < 0) {
+        finish();
+        return;
+    }
+
+    const auto wait_time = options_.wait_time;
+    if (wait_time.count() > 0) {
+        EventLoopSnapshot initial;
         try {
-            drain_jobs();
+            initial = event_loop_snapshot(wait_time);
         } catch (const std::exception& error) {
             log_console("error", error.what());
-            break;
+            finish();
+            return;
         }
+        const auto virtual_deadline = initial.now + wait_time;
+        constexpr int kMaxIdleIterations = 1000;
 
-        const auto wait_time = options_.wait_time.count();
-        if (wait_time <= 0) {
-            break;
-        }
-
-        JSValue global = JS_GetGlobalObject(context_);
-        JSValue run_timers = JS_GetPropertyStr(context_, global, "__pagecore_run_timers");
-        JS_FreeValue(context_, global);
-
-        if (!JS_IsFunction(context_, run_timers)) {
-            JS_FreeValue(context_, run_timers);
-            break;
-        }
-
-        const auto timer_budget = timer_budget_available && wait_time > 0 ? wait_time : 0;
-        timer_budget_available = false;
-
-        JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(timer_budget))};
-        JSValue result = JS_Call(context_, run_timers, JS_UNDEFINED, 1, args);
-        JS_FreeValue(context_, args[0]);
-        JS_FreeValue(context_, run_timers);
-        try {
-            check_exception(result, "<timer-callback>");
-        } catch (const std::exception& error) {
-            log_console("error", error.what());
-            JS_FreeValue(context_, result);
-            break;
-        }
-
-        int32_t ran = 0;
-        JS_ToInt32(context_, &ran, result);
-        JS_FreeValue(context_, result);
-        try {
-            drain_jobs();
-        } catch (const std::exception& error) {
-            log_console("error", error.what());
-            break;
-        }
-
-        if (ran == 0) {
-            break;
+        for (int i = 0; i < kMaxIdleIterations; ++i) {
+            EventLoopSnapshot snapshot;
+            try {
+                snapshot = event_loop_snapshot(wait_time);
+            } catch (const std::exception& error) {
+                log_console("error", error.what());
+                break;
+            }
+            if (!snapshot.next_task_delay) {
+                break;
+            }
+            auto remaining = virtual_deadline - snapshot.now;
+            if (remaining.count() < 0) {
+                break;
+            }
+            const int ran = run_event_loop_step(remaining);
+            ++iterations;
+            if (ran < 0 || ran == 0) {
+                break;
+            }
         }
     }
 
-    clear_deadline();
-    flush_dom_bridge_perf();
-    emit_script_perf("run_until_idle", perf_start, static_cast<std::uint64_t>(iterations));
+    finish();
 }
 
-int JsRuntime::drain_jobs_logged()
+int JsRuntime::run_microtask_checkpoint_logged()
 {
     try {
-        drain_jobs();
+        run_microtask_checkpoint();
         return 0;
     } catch (const std::exception& error) {
         log_console("error", error.what());
@@ -1524,14 +1515,48 @@ int JsRuntime::drain_jobs_logged()
     }
 }
 
-int JsRuntime::run_timers(std::chrono::milliseconds advance)
+int JsRuntime::deliver_mutation_observers()
 {
     JSValue global = JS_GetGlobalObject(context_);
-    JSValue run_timers = JS_GetPropertyStr(context_, global, "__pagecore_run_timers");
+    JSValue deliver = JS_GetPropertyStr(context_, global, "__pagecore_deliver_mutation_observers");
     JS_FreeValue(context_, global);
 
-    if (!JS_IsFunction(context_, run_timers)) {
-        JS_FreeValue(context_, run_timers);
+    if (!JS_IsFunction(context_, deliver)) {
+        JS_FreeValue(context_, deliver);
+        return 0;
+    }
+
+    JSValue result = JS_Call(context_, deliver, JS_UNDEFINED, 0, nullptr);
+    JS_FreeValue(context_, deliver);
+    check_exception(result, "<mutation-observer>");
+
+    int32_t delivered = 0;
+    JS_ToInt32(context_, &delivered, result);
+    JS_FreeValue(context_, result);
+    return delivered;
+}
+
+void JsRuntime::run_microtask_checkpoint()
+{
+    constexpr int kMaxCheckpointIterations = 100;
+    for (int i = 0; i < kMaxCheckpointIterations; ++i) {
+        drain_jobs();
+        const int delivered = deliver_mutation_observers();
+        drain_jobs();
+        if (delivered == 0) {
+            break;
+        }
+    }
+}
+
+int JsRuntime::run_event_loop_step(std::chrono::milliseconds advance)
+{
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue run_step = JS_GetPropertyStr(context_, global, "__pagecore_run_event_loop_step");
+    JS_FreeValue(context_, global);
+
+    if (!JS_IsFunction(context_, run_step)) {
+        JS_FreeValue(context_, run_step);
         return 0;
     }
 
@@ -1539,11 +1564,11 @@ int JsRuntime::run_timers(std::chrono::milliseconds advance)
         advance = std::chrono::milliseconds{0};
     }
     JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(advance.count()))};
-    JSValue result = JS_Call(context_, run_timers, JS_UNDEFINED, 1, args);
+    JSValue result = JS_Call(context_, run_step, JS_UNDEFINED, 1, args);
     JS_FreeValue(context_, args[0]);
-    JS_FreeValue(context_, run_timers);
+    JS_FreeValue(context_, run_step);
     try {
-        check_exception(result, "<timer-callback>");
+        check_exception(result, "<event-loop-task>");
     } catch (const std::exception& error) {
         log_console("error", error.what());
         JS_FreeValue(context_, result);
@@ -1553,19 +1578,22 @@ int JsRuntime::run_timers(std::chrono::milliseconds advance)
     int32_t ran = 0;
     JS_ToInt32(context_, &ran, result);
     JS_FreeValue(context_, result);
+    if (ran > 0 && run_microtask_checkpoint_logged() < 0) {
+        return -1;
+    }
     return ran;
 }
 
-JsRuntime::TimerSnapshot JsRuntime::timer_snapshot(std::chrono::milliseconds horizon)
+JsRuntime::EventLoopSnapshot JsRuntime::event_loop_snapshot(std::chrono::milliseconds horizon)
 {
-    TimerSnapshot snapshot;
+    EventLoopSnapshot snapshot;
 
     JSValue global = JS_GetGlobalObject(context_);
-    JSValue timer_snapshot_fn = JS_GetPropertyStr(context_, global, "__pagecore_timer_snapshot");
+    JSValue event_loop_snapshot_fn = JS_GetPropertyStr(context_, global, "__pagecore_event_loop_snapshot");
     JS_FreeValue(context_, global);
 
-    if (!JS_IsFunction(context_, timer_snapshot_fn)) {
-        JS_FreeValue(context_, timer_snapshot_fn);
+    if (!JS_IsFunction(context_, event_loop_snapshot_fn)) {
+        JS_FreeValue(context_, event_loop_snapshot_fn);
         return snapshot;
     }
 
@@ -1573,10 +1601,10 @@ JsRuntime::TimerSnapshot JsRuntime::timer_snapshot(std::chrono::milliseconds hor
         horizon = std::chrono::milliseconds{0};
     }
     JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(horizon.count()))};
-    JSValue result = JS_Call(context_, timer_snapshot_fn, JS_UNDEFINED, 1, args);
+    JSValue result = JS_Call(context_, event_loop_snapshot_fn, JS_UNDEFINED, 1, args);
     JS_FreeValue(context_, args[0]);
-    JS_FreeValue(context_, timer_snapshot_fn);
-    check_exception(result, "<timer-snapshot>");
+    JS_FreeValue(context_, event_loop_snapshot_fn);
+    check_exception(result, "<event-loop-snapshot>");
 
     auto int_property = [this, result](const char* name) -> int64_t {
         JSValue value = JS_GetPropertyStr(context_, result, name);
@@ -1592,7 +1620,7 @@ JsRuntime::TimerSnapshot JsRuntime::timer_snapshot(std::chrono::milliseconds hor
     snapshot.now = std::chrono::milliseconds{std::max<int64_t>(0, now)};
     snapshot.relevant_count = static_cast<std::size_t>(std::max<int64_t>(0, relevant));
     if (next_delay >= 0) {
-        snapshot.next_relevant_delay = std::chrono::milliseconds{next_delay};
+        snapshot.next_task_delay = std::chrono::milliseconds{next_delay};
     }
     JS_FreeValue(context_, result);
     return snapshot;
@@ -1600,9 +1628,9 @@ JsRuntime::TimerSnapshot JsRuntime::timer_snapshot(std::chrono::milliseconds hor
 
 void JsRuntime::sync_activity_state(std::chrono::milliseconds timer_horizon)
 {
-    const TimerSnapshot timers = timer_snapshot(timer_horizon);
-    activity_tracker_.set_clock(timers.now);
-    activity_tracker_.set_relevant_timers(timers.relevant_count);
+    const EventLoopSnapshot event_loop = event_loop_snapshot(timer_horizon);
+    activity_tracker_.set_clock(event_loop.now);
+    activity_tracker_.set_relevant_timers(event_loop.relevant_count);
     activity_tracker_.sync_mutation_version(document_->mutation_version());
 }
 
@@ -1646,15 +1674,15 @@ bool JsRuntime::run_until_ready(PageReadinessOptions options)
 
     for (;;) {
         ++iterations;
-        if (drain_jobs_logged() < 0) {
+        if (run_microtask_checkpoint_logged() < 0) {
             break;
         }
 
-        TimerSnapshot timers;
+        EventLoopSnapshot event_loop;
         try {
-            timers = timer_snapshot(options.stable_window);
-            activity_tracker_.set_clock(timers.now);
-            activity_tracker_.set_relevant_timers(timers.relevant_count);
+            event_loop = event_loop_snapshot(options.stable_window);
+            activity_tracker_.set_clock(event_loop.now);
+            activity_tracker_.set_relevant_timers(event_loop.relevant_count);
             activity_tracker_.sync_mutation_version(document_->mutation_version());
         } catch (const std::exception& error) {
             log_console("error", error.what());
@@ -1677,8 +1705,8 @@ bool JsRuntime::run_until_ready(PageReadinessOptions options)
         const bool wants_dom_stability = options.wait_until == WaitUntil::DomStable
             || options.wait_until == WaitUntil::Ready;
         std::optional<std::chrono::milliseconds> advance;
-        if (timers.next_relevant_delay) {
-            advance = *timers.next_relevant_delay;
+        if (event_loop.next_task_delay) {
+            advance = *event_loop.next_task_delay;
         }
         if (wants_dom_stability && !activity_tracker_.dom_stable(options.stable_window)) {
             const auto snapshot = activity_tracker_.snapshot();
@@ -1695,7 +1723,7 @@ bool JsRuntime::run_until_ready(PageReadinessOptions options)
             break;
         }
 
-        const int ran = run_timers(*advance);
+        const int ran = run_event_loop_step(*advance);
         if (ran < 0) {
             break;
         }
@@ -1947,9 +1975,10 @@ bool JsRuntime::is_timed_out() const
     return deadline_active_ && std::chrono::steady_clock::now() > deadline_;
 }
 
-void JsRuntime::drain_jobs()
+int JsRuntime::drain_jobs()
 {
     JSContext* job_context = nullptr;
+    int count = 0;
     for (;;) {
         const int status = JS_ExecutePendingJob(runtime_, &job_context);
         if (status <= 0) {
@@ -1958,7 +1987,9 @@ void JsRuntime::drain_jobs()
             }
             break;
         }
+        ++count;
     }
+    return count;
 }
 
 void JsRuntime::check_exception(JSValue value, std::string_view source_name)

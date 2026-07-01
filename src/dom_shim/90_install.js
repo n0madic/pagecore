@@ -33,6 +33,7 @@
         AbortSignal,
         AbortController,
         MutationObserver,
+        deliverMutationObservers,
         installWindowIdentity
       } = api.events;
       const {
@@ -168,13 +169,14 @@
         randomUUID,
         installWptHook,
         setTimeoutShim,
-        clearTimer,
+        clearTask,
         setIntervalShim,
         requestAnimationFrameShim,
         requestIdleCallbackShim,
         performanceNow,
-        runTimers,
-        timerSnapshot
+        queuePageTask,
+        runEventLoopStep,
+        eventLoopSnapshot
       } = api.web;
       const {
         FormData
@@ -458,14 +460,14 @@
         };
 
         global.setTimeout = setTimeoutShim;
-        global.clearTimeout = clearTimer;
+        global.clearTimeout = clearTask;
         global.setInterval = setIntervalShim;
-        global.clearInterval = clearTimer;
+        global.clearInterval = clearTask;
         global.requestAnimationFrame = requestAnimationFrameShim;
-        global.cancelAnimationFrame = clearTimer;
+        global.cancelAnimationFrame = clearTask;
         global.queueMicrotask = (callback) => Promise.resolve().then(callback);
         global.requestIdleCallback = requestIdleCallbackShim;
-        global.cancelIdleCallback = clearTimer;
+        global.cancelIdleCallback = clearTask;
         global.getComputedStyle = (element) => computedStyleFor(element);
         global.matchMedia = makeMediaQueryList;
         global.performance = {
@@ -493,30 +495,32 @@
             return Promise.reject(signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
           }
           activityBegin('xhr-fetch');
-          return Promise.resolve().then(() => {
-            if (signal && signal.aborted) {
-              throw signal.reason || new DOMException('The operation was aborted.', 'AbortError');
-            }
-            const loaded = loadHostResource(request.url, 'other', {
-              method: request.method,
-              body: bodyText(request.body),
-              headers: request.headers,
-              credentials: request.credentials,
-              referrer: request.referrer
-            });
-            return new Response(loaded.body || '', {
-              status: loaded.status === undefined ? 200 : Number(loaded.status),
-              statusText: loaded.statusText === undefined ? '' : String(loaded.statusText),
-              headers: responseHeadersFromHost(loaded),
-              url: loaded.url || request.url,
-              redirected: Number(loaded.redirectCount || 0) > 0
-            });
-          }).then((response) => {
-            activityEnd('xhr-fetch');
-            return response;
-          }, (error) => {
-            activityEnd('xhr-fetch');
-            throw error;
+          return new Promise((resolve, reject) => {
+            queuePageTask(() => {
+              try {
+                if (signal && signal.aborted) {
+                  throw signal.reason || new DOMException('The operation was aborted.', 'AbortError');
+                }
+                const loaded = loadHostResource(request.url, 'other', {
+                  method: request.method,
+                  body: bodyText(request.body),
+                  headers: request.headers,
+                  credentials: request.credentials,
+                  referrer: request.referrer
+                });
+                resolve(new Response(loaded.body || '', {
+                  status: loaded.status === undefined ? 200 : Number(loaded.status),
+                  statusText: loaded.statusText === undefined ? '' : String(loaded.statusText),
+                  headers: responseHeadersFromHost(loaded),
+                  url: loaded.url || request.url,
+                  redirected: Number(loaded.redirectCount || 0) > 0
+                }));
+              } catch (error) {
+                reject(error);
+              } finally {
+                activityEnd('xhr-fetch');
+              }
+            }, 'xhr-fetch');
           });
         };
         global.__pagecore_install_wpt_hook = installWptHook;
@@ -551,8 +555,10 @@
           defineValue(Node.prototype, name, value, true);
         }
 
-        global.__pagecore_run_timers = runTimers;
-        global.__pagecore_timer_snapshot = timerSnapshot;
+        global.__pagecore_queue_task = queuePageTask;
+        global.__pagecore_run_event_loop_step = runEventLoopStep;
+        global.__pagecore_event_loop_snapshot = eventLoopSnapshot;
+        global.__pagecore_deliver_mutation_observers = deliverMutationObservers;
 
       return {};
     }

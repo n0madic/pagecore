@@ -233,12 +233,19 @@ Page readiness is controlled by `LoadOptions::wait_until`,
 as `--wait-until load|network-idle|dom-stable|ready`, `--wait-ms`, and
 `--stable-window-ms`. The default is `ready`: after scripts and lifecycle
 events, PageCore waits for JS-initiated `fetch`/XHR, dynamic classic scripts,
-image/stylesheet load events, relevant one-shot timers, drained microtasks and
-MutationObserver delivery, and a quiet DOM mutation window. `--wait-ms` is the
+image/stylesheet load events, relevant one-shot timer/network/script/resource
+tasks, drained microtasks and MutationObserver delivery, and a quiet DOM
+mutation window. `--wait-ms` is the
 overall hard budget. A zero wait budget still runs synchronous scripts and
 microtasks, but leaves timer callbacks pending. Embedders can call
 `Page::run_until_ready(PageReadinessOptions)` explicitly; `run_until_idle()`
-remains a lower-level deterministic timer drain helper.
+remains a lower-level deterministic task drain helper. PageCore's explicit
+event-loop checkpoint is: execute one macrotask, drain QuickJS Promise jobs,
+deliver MutationObserver records, then drain Promise jobs created by observer
+callbacks before advancing to the next due timer/network/script/resource task.
+`dom-stable` uses the stable window to drain due readiness-relevant tasks before
+declaring the DOM quiet; `ready` additionally requires the page activity tracker
+to be idle.
 `LoadOptions::js_resource_load_policy` controls only JS-initiated resource
 loads during script execution and readiness/event-loop processing. The CLI
 exposes it as `--js-resource-policy allow|same-origin|none`: `allow` preserves

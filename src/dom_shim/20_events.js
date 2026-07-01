@@ -529,17 +529,27 @@
           if (mutationFlushQueued) return;
           mutationFlushQueued = true;
           activityBegin('mutation-observer');
-          Promise.resolve().then(() => {
-            try {
-              mutationFlushQueued = false;
-              for (const observer of [...mutationObservers]) {
-                const records = observer.takeRecords();
-                if (records.length > 0) observer._callback(records, observer);
+        }
+
+        function deliverMutationObservers() {
+          if (!mutationFlushQueued) return 0;
+          mutationFlushQueued = false;
+          let delivered = 0;
+          try {
+            for (const observer of [...mutationObservers]) {
+              const records = observer.takeRecords();
+              if (records.length === 0) continue;
+              delivered++;
+              try {
+                observer._callback(records, observer);
+              } catch (error) {
+                reportEventListenerError(error);
               }
-            } finally {
-              activityEnd('mutation-observer');
             }
-          });
+          } finally {
+            activityEnd('mutation-observer');
+          }
+          return delivered;
         }
 
         class MutationObserver {
@@ -617,6 +627,7 @@
         }
 
       ctx.queueMutation = queueMutation;
+      ctx.deliverMutationObservers = deliverMutationObservers;
 
       return {
         DOMException,
@@ -636,6 +647,7 @@
         AbortController,
         MutationObserver,
         queueMutation,
+        deliverMutationObservers,
         connectCustomElementTree,
         notifyCustomElementAttributeChanged,
         invokeCustomElementConnected,
