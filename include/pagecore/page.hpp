@@ -15,8 +15,8 @@ namespace pagecore {
 
 struct LoadOptions {
     bool enable_js = true;
-    std::chrono::milliseconds wait_time{5000};
-    std::chrono::milliseconds js_timeout{5000};
+    std::chrono::milliseconds wait_time{15000};
+    std::chrono::milliseconds js_timeout{30000};
     std::size_t js_memory_limit_bytes = 256 * 1024 * 1024;
     std::string user_agent = "PageCore/0.1";
     std::string base_url;

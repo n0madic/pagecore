@@ -296,6 +296,20 @@
           contains(candidate) {
             if (candidate == null || !isNodeWrapper(candidate)) return false;
             if (this === candidate) return true;
+            // Fast path: when neither node has a JS-only fragment/shadow
+            // parent link, candidate's entire ancestor chain is exactly its
+            // real bridge parent chain (Node.appendChild/insertBefore always
+            // clear __fragmentParent on real attachment — see below), so
+            // bridge.contains() — an O(depth) raw lexbor-pointer walk with no
+            // wrapper allocation — gives the same answer as the JS loop
+            // beneath it, just without re-wrapping every ancestor into a
+            // full Element on each step. That wrapping is what makes
+            // contains() pathological in a tight loop over a deep tree (e.g.
+            // jQuery's .show()/.hide() over many real-world page elements).
+            if (!this.__fragmentParent && !candidate.__fragmentParent
+              && bridge.hasNode(this.__id) && bridge.hasNode(candidate.__id)) {
+              return bridge.contains(this.__id, candidate.__id);
+            }
             for (let node = candidate.parentNode; node; node = node.parentNode) {
               if (node === this) return true;
             }
@@ -1100,6 +1114,16 @@
             .join(' ');
         }
 
+        function indexDeclarations(declarations) {
+          const values = Object.create(null);
+          const priorities = Object.create(null);
+          for (const declaration of declarations) {
+            values[declaration.name] = declaration.value;
+            priorities[declaration.name] = declaration.priority;
+          }
+          return { values, priorities };
+        }
+
         function makeCSSStyleDeclaration(readCssText, writeCssText = null, readOnly = false) {
           const declaration = new CSSStyleDeclaration(readCssText, writeCssText, readOnly);
           return new Proxy(declaration, {
@@ -1162,12 +1186,7 @@
             const text = String(this._readCssText() || '');
             if (text !== this._cachedCssText) {
               const declarations = parseDeclarations(text);
-              const values = Object.create(null);
-              const priorities = Object.create(null);
-              for (const declaration of declarations) {
-                values[declaration.name] = declaration.value;
-                priorities[declaration.name] = declaration.priority;
-              }
+              const { values, priorities } = indexDeclarations(declarations);
               this._cachedCssText = text;
               this._cachedDeclarations = declarations;
               this._cachedValues = values;
@@ -1201,8 +1220,29 @@
 
           _write(declarations) {
             if (this._readOnly || typeof this._writeCssText !== 'function') return;
-            this._writeCssText(serializeDeclarations(declarations));
-            this._invalidate();
+            const text = serializeDeclarations(declarations);
+            this._writeCssText(text);
+            // setProperty()/removeProperty() already know exactly what they
+            // just wrote, so seed the snapshot cache directly instead of
+            // invalidating it — this turns a sequence of N setProperty()
+            // calls on the same element from N parseDeclarations() reparses
+            // (each call's pre-write _declarations() previously had to
+            // reparse, since the prior call's _invalidate() had cleared the
+            // cache) into effectively one, which matters in a tight
+            // read-modify-write loop like jQuery's .css(). Verify the write
+            // landed as expected first — a synchronous
+            // attributeChangedCallback/MutationObserver could have mutated
+            // the same attribute again — and fall back to invalidating so
+            // the next _snapshot() reparses from the real current value.
+            if (String(this._readCssText() || '') === text) {
+              const { values, priorities } = indexDeclarations(declarations);
+              this._cachedCssText = text;
+              this._cachedDeclarations = declarations;
+              this._cachedValues = values;
+              this._cachedPriorities = priorities;
+            } else {
+              this._invalidate();
+            }
             cssomVersion++;
           }
 
@@ -1846,21 +1886,29 @@
           return matchFrom(tokens.length - 1, element);
         }
 
+        // Per-element cache of litehtml's cascade result, keyed (per entry) by
+        // the bridge mutation version — same invalidation pattern as
+        // elementGeometryCache/traversalCache below. Without this, every
+        // getComputedStyle(el) call started a fresh cache (scoped to that
+        // single call's closure), so reading multiple properties off one
+        // element — or calling getComputedStyle(el) repeatedly in a
+        // read-modify-write loop, as jQuery's .css() does — re-crossed the
+        // bridge and rebuilt the full ~30-property cascade every time, even
+        // when nothing had changed since the last read.
+        const computedStyleValuesCache = new WeakMap();
+        function computedStyleValuesFor(element) {
+          if (!(element instanceof Element)) return Object.create(null);
+          const version = bridge.mutationVersion();
+          let entry = computedStyleValuesCache.get(element);
+          if (entry === undefined || entry.version !== version) {
+            entry = { version, values: bridge.computedStyle(element.__id) };
+            computedStyleValuesCache.set(element, entry);
+          }
+          return entry.values;
+        }
+
         function computedStyleFor(element) {
-          // litehtml's cascade is keyed on the bridge's mutation version (see
-          // Page::Impl::ensure_styled_document), so a value computed for the
-          // current version stays valid until the DOM changes again.
-          let cachedValues = null;
-          let cachedVersion = -1;
-          const styleValues = () => {
-            if (!(element instanceof Element)) return Object.create(null);
-            const version = bridge.mutationVersion();
-            if (cachedValues === null || cachedVersion !== version) {
-              cachedValues = bridge.computedStyle(element.__id);
-              cachedVersion = version;
-            }
-            return cachedValues;
-          };
+          const styleValues = () => computedStyleValuesFor(element);
           const propertyNames = () => Object.keys(styleValues());
           const propertyValue = (name) => {
             const property = cssPropertyName(name);

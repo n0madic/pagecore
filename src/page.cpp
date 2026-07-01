@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -339,6 +340,29 @@ struct Page::Impl {
     // hasn't been rendered yet).
     RenderOptions last_render_options;
 
+    // Synchronous geometry read-back (getBoundingClientRect / offsetWidth / ...)
+    // needs a real litehtml layout() pass. litehtml has no incremental layout
+    // against our Lexbor tree, so each geometry read that follows a DOM mutation
+    // forces a full rebuild (serialize the whole DOM, re-parse, re-cascade) plus
+    // a full layout. On a large DOM that's seconds per read; a script that reads
+    // geometry in a tight read-modify-write loop (e.g. jQuery init) then spends
+    // tens of seconds and trips the per-script execution deadline. Once we
+    // observe that building/laying-out this page's styled document is expensive,
+    // we stop doing synchronous layout for geometry reads and return nullopt —
+    // the JS layer maps that to 0, exactly the value the engine returned before
+    // the geometry channel existed, so heavy pages still finish rendering. Small
+    // pages (sub-threshold builds) keep full geometry. The detection piggybacks
+    // on work computed_style()/the render already do, so a heavy page pays
+    // nothing extra for geometry beyond what it already paid for the cascade.
+    bool styled_document_expensive = false;
+    static constexpr long long kExpensiveStyledDocumentUs = 250'000; // 0.25s
+
+    // Sub-resource cache shared by every styled-document rebuild of the current
+    // document, so a page that rebuilds many times during script execution
+    // fetches each image/stylesheet once instead of on every rebuild. Reset when
+    // the document or loader identity changes (invalidate_display_list_cache).
+    std::shared_ptr<CachingResourceLoader> render_resource_cache;
+
     explicit Impl(LoadOptions init_options)
         : options(std::move(init_options))
         , loader(std::make_shared<CurlResourceLoader>(options.user_agent))
@@ -353,6 +377,13 @@ struct Page::Impl {
         styled_document_valid = false;
         styled_document_laid_out = false;
         styled_document.reset();
+        // Expensiveness is a property of the page's content; a fresh document
+        // may be cheap, so re-measure it from scratch.
+        styled_document_expensive = false;
+        // Sub-resource URLs and the loader itself may differ for a new document,
+        // so drop the cross-rebuild cache when the document/loader identity
+        // changes.
+        render_resource_cache.reset();
     }
 
     void ensure_js()
@@ -575,12 +606,26 @@ struct Page::Impl {
 
     // Returns the loader litehtml should use for a render. When external loading
     // is enabled, the page's sub-resources are prefetched concurrently into a
-    // per-render cache so the layout's synchronous requests hit warm entries.
+    // cache so the layout's synchronous requests hit warm entries.
+    //
+    // The cache persists across styled-document rebuilds for the lifetime of the
+    // current document: a script-heavy page invalidates the styled-document
+    // cache on every DOM mutation, so it rebuilds (and re-lays-out) its litehtml
+    // document many times during a single load, and each layout re-requests the
+    // page's images and stylesheets. A per-rebuild cache would re-fetch all of
+    // them from the network every time; a persistent one fetches each resource
+    // once. It is reset whenever the loader or document identity changes (see
+    // invalidate_display_list_cache).
     std::shared_ptr<ResourceLoader> prepare_render_loader(const RenderOptions& render_options)
     {
         if (!render_options.load_external_resources || !loader) {
             return nullptr;
         }
+
+        if (!render_resource_cache) {
+            render_resource_cache = std::make_shared<CachingResourceLoader>(loader, 4096);
+        }
+        const std::shared_ptr<CachingResourceLoader>& cache = render_resource_cache;
 
         const std::string effective_base = effective_base_url(render_options);
 
@@ -588,10 +633,8 @@ struct Page::Impl {
         std::unordered_set<std::string> seen;
         collect_dom_subresources(effective_base, wave1, seen);
         if (wave1.empty()) {
-            return loader;
+            return cache;
         }
-
-        auto cache = std::make_shared<CachingResourceLoader>(loader, wave1.size() + 64);
 
         std::vector<ResourceResponse> fetched;
         try {
@@ -680,7 +723,15 @@ struct Page::Impl {
 
         engine->set_viewport(render_options.viewport);
         engine->set_resource_loader(prepare_render_loader(render_options));
-        engine->load_html(serialized_html_for_render(), render_base_url(render_options));
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            engine->load_html(serialized_html_for_render(), render_base_url(render_options));
+            const auto rebuild_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (rebuild_us > kExpensiveStyledDocumentUs) {
+                styled_document_expensive = true;
+            }
+        }
 
         styled_document = std::move(engine);
         styled_document_key = std::move(key);
@@ -697,7 +748,13 @@ struct Page::Impl {
     {
         auto& engine = ensure_styled_document(render_options);
         if (!styled_document_laid_out) {
+            const auto t0 = std::chrono::steady_clock::now();
             engine.layout();
+            const auto layout_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (layout_us > kExpensiveStyledDocumentUs) {
+                styled_document_expensive = true;
+            }
             styled_document_laid_out = true;
         }
         return engine;
@@ -718,6 +775,20 @@ struct Page::Impl {
 
     std::optional<ElementGeometry> element_geometry(NodeId node)
     {
+        // Heavy page already detected: skip the forced layout entirely and let
+        // the JS layer fall back to zero geometry (the pre-geometry-channel
+        // behavior). This keeps read-modify-write geometry loops from rebuilding
+        // and re-laying-out a large document on every read.
+        if (styled_document_expensive) {
+            return std::nullopt;
+        }
+        // The (re)build itself may reveal the page is expensive; re-check before
+        // paying for a full layout() so the first geometry read on a heavy page
+        // costs at most the cascade build it would have paid for anyway.
+        ensure_styled_document(last_render_options);
+        if (styled_document_expensive) {
+            return std::nullopt;
+        }
         auto& engine = ensure_layout(last_render_options);
         return engine.element_geometry(std::to_string(node));
     }

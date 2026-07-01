@@ -52,8 +52,8 @@ void usage(const char* argv0)
         << "  --viewport WIDTHxHEIGHT  render viewport, default 1280x720\n"
         << "  --full-page              expand the viewport height to the full page content height before rendering\n"
         << "  --scale NUMBER           render scale factor, default 1\n"
-        << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 5000\n"
-        << "  --js-timeout-ms NUMBER   per-script execution deadline, default 5000\n"
+        << "  --wait-ms NUMBER         async timer/XHR/fetch wait budget, default 15000\n"
+        << "  --js-timeout-ms NUMBER   per-script execution deadline, default 30000\n"
         << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n";
 }
 

@@ -3630,6 +3630,47 @@ void test_render_prefetches_subresources_into_cache()
             "layout-time sub-resource requests are served from the prefetch cache, not re-fetched");
 }
 
+// Regression: a script-heavy page invalidates its styled document on every DOM
+// mutation, so getComputedStyle()/geometry/render rebuild the litehtml document
+// many times during one load. The sub-resource cache must persist across those
+// rebuilds so each image/stylesheet is fetched once, not re-downloaded on every
+// rebuild (which made large real-world pages spend tens of seconds re-fetching).
+void test_render_resource_cache_persists_across_rebuilds()
+{
+    auto loader = std::make_shared<BatchRecordingLoader>();
+    loader->add("https://example.test/style.css", "#b { color: rgb(1, 2, 3); }", "text/css");
+    loader->add("https://example.test/pixel.png", "fake-image-bytes", "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head><link rel="stylesheet" href="/style.css"></head>
+<body><div id="b"></div><img src="/pixel.png"></body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{200, 100, 1.0f};
+    (void) page.display_list(options);
+
+    const auto fetch_count = [&](const std::string& url) {
+        return std::count(loader->all_requested.begin(), loader->all_requested.end(), url);
+    };
+    require(fetch_count("https://example.test/style.css") == 1, "stylesheet fetched once on the first render");
+    require(fetch_count("https://example.test/pixel.png") == 1, "image fetched once on the first render");
+
+    // A DOM mutation bumps mutation_version, invalidating the styled-document
+    // cache so the next render rebuilds the litehtml document from scratch.
+    page.eval("document.getElementById('b').setAttribute('data-x', '1')");
+    (void) page.display_list(options);
+
+    // The persistent sub-resource cache survives the rebuild: the stylesheet and
+    // image are served from cache, not re-fetched from the network.
+    require(fetch_count("https://example.test/style.css") == 1,
+            "stylesheet is served from the persistent cache on rebuild, not re-fetched");
+    require(fetch_count("https://example.test/pixel.png") == 1,
+            "image is served from the persistent cache on rebuild, not re-fetched");
+}
+
 void test_render_prefetches_css_background_images()
 {
     auto loader = std::make_shared<BatchRecordingLoader>();
@@ -4454,6 +4495,7 @@ int main()
         test_page_display_list_resolves_relative_base_element_against_document_url();
         test_page_display_list_resolves_protocol_relative_and_host_like_css_urls();
         test_render_prefetches_subresources_into_cache();
+        test_render_resource_cache_persists_across_rebuilds();
         test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();
         test_page_render_decodes_and_draws_png_images();

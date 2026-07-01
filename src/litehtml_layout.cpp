@@ -743,6 +743,10 @@ public:
         styles_computed_ = true;
         display_list_.clear();
         display_list_.viewport = viewport_;
+        // Drop the old document's element::ptrs immediately rather than
+        // waiting for the next find_tagged_element() call to overwrite them.
+        tagged_elements_.clear();
+        tagged_elements_indexed_ = false;
     }
 
     void layout() override
@@ -819,17 +823,40 @@ public:
     }
 
 private:
+    // O(1) data-pc-sid -> element lookup, built once per document (lazily,
+    // on first lookup) and reused across every computed_style()/
+    // element_geometry() call. Without this, find_tagged_element() used
+    // litehtml::select_one("[data-pc-sid=\"N\"]"), which re-parses the
+    // selector and does a full document tree walk on EVERY call; with
+    // getComputedStyle()/getBoundingClientRect() etc. called per element on
+    // real pages, that's O(n) work per call, i.e. O(n^2) for the page.
+    void index_tagged_elements(const litehtml::element::ptr& element)
+    {
+        if (!element) {
+            return;
+        }
+        const char* sid = element->get_attr("data-pc-sid");
+        if (sid != nullptr && *sid != '\0') {
+            tagged_elements_.emplace(sid, element);
+        }
+        for (const auto& child : element->children()) {
+            index_tagged_elements(child);
+        }
+    }
+
     litehtml::element::ptr find_tagged_element(std::string_view node_key)
     {
         if (!document_) {
             return nullptr;
         }
 
-        std::string selector = "[data-pc-sid=\"";
-        selector += node_key;
-        selector += "\"]";
+        if (!tagged_elements_indexed_) {
+            index_tagged_elements(document_->root());
+            tagged_elements_indexed_ = true;
+        }
 
-        return document_->root()->select_one(selector);
+        auto found = tagged_elements_.find(std::string(node_key));
+        return found != tagged_elements_.end() ? found->second : nullptr;
     }
 
     void ensure_styles_computed()
@@ -926,6 +953,8 @@ private:
     litehtml::document::ptr document_;
     DisplayList display_list_;
     bool styles_computed_ = false;
+    std::unordered_map<std::string, litehtml::element::ptr> tagged_elements_;
+    bool tagged_elements_indexed_ = false;
 };
 
 } // namespace
