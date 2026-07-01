@@ -376,6 +376,134 @@ private:
     std::chrono::steady_clock::time_point start_;
 };
 
+long long elapsed_us_since(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+class BudgetedRenderResourceLoader final : public ResourceLoader {
+public:
+    using ResourceLoader::load;
+
+    BudgetedRenderResourceLoader(
+        std::shared_ptr<ResourceLoader> inner,
+        RenderOptions options,
+        PerfTraceCallback perf_trace)
+        : inner_(std::move(inner))
+        , max_loads_(options.max_external_resource_loads)
+        , max_bytes_(options.max_external_resource_bytes)
+        , max_time_(options.max_external_resource_time)
+        , perf_trace_(std::move(perf_trace))
+    {
+        if (!inner_) {
+            throw std::runtime_error("render resource budget loader requires an inner loader");
+        }
+    }
+
+    ResourceResponse load(const ResourceRequest& request) override
+    {
+        if (auto reason = block_reason()) {
+            return blocked_response(request, *reason);
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        try {
+            auto response = inner_->load(request);
+            record_load(elapsed_us_since(start), response.body.size(), 1);
+            return response;
+        } catch (...) {
+            record_load(elapsed_us_since(start), 0, 1);
+            throw;
+        }
+    }
+
+    std::vector<ResourceResponse> load_all(
+        const std::vector<ResourceRequest>& requests,
+        BatchErrorMode mode = BatchErrorMode::FailFast) override
+    {
+        std::vector<ResourceResponse> responses(requests.size());
+        std::vector<ResourceRequest> allowed_requests;
+        std::vector<std::size_t> allowed_indices;
+        allowed_requests.reserve(requests.size());
+        allowed_indices.reserve(requests.size());
+
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            if (auto reason = block_reason(allowed_requests.size())) {
+                responses[i] = blocked_response(requests[i], *reason);
+                continue;
+            }
+            allowed_indices.push_back(i);
+            allowed_requests.push_back(requests[i]);
+        }
+
+        if (allowed_requests.empty()) {
+            return responses;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        std::vector<ResourceResponse> fetched;
+        try {
+            fetched = inner_->load_all(allowed_requests, mode);
+        } catch (...) {
+            record_load(elapsed_us_since(start), 0, allowed_requests.size());
+            throw;
+        }
+
+        std::uint64_t bytes = 0;
+        for (std::size_t i = 0; i < fetched.size() && i < allowed_indices.size(); ++i) {
+            bytes += fetched[i].body.size();
+            responses[allowed_indices[i]] = std::move(fetched[i]);
+        }
+        record_load(elapsed_us_since(start), bytes, fetched.size());
+        return responses;
+    }
+
+private:
+    std::optional<std::string> block_reason(std::size_t pending_loads = 0) const
+    {
+        if (max_loads_ && load_count_ + pending_loads >= *max_loads_) {
+            return "budget:max_render_resource_loads";
+        }
+        if (max_bytes_ && loaded_bytes_ >= *max_bytes_) {
+            return "budget:max_render_resource_bytes";
+        }
+        if (max_time_) {
+            const auto max_us = std::chrono::duration_cast<std::chrono::microseconds>(*max_time_).count();
+            if (elapsed_us_ >= max_us) {
+                return "budget:max_render_resource_time_ms";
+            }
+        }
+        return std::nullopt;
+    }
+
+    ResourceResponse blocked_response(const ResourceRequest& request, const std::string& reason) const
+    {
+        PerfEvent event{PerfPhase::ResourceLoad, "render_resource_blocked", 0, 0};
+        event.property = resource_kind_name(request.kind);
+        event.url = request.url;
+        event.reason = reason;
+        emit_perf_trace(perf_trace_, std::move(event));
+        return ResourceResponse{request.url, {}, 0, {}, request.kind, false};
+    }
+
+    void record_load(long long elapsed_us, std::uint64_t bytes, std::size_t loads)
+    {
+        load_count_ += loads;
+        loaded_bytes_ += bytes;
+        elapsed_us_ += std::max<long long>(0, elapsed_us);
+    }
+
+    std::shared_ptr<ResourceLoader> inner_;
+    std::optional<std::size_t> max_loads_;
+    std::optional<std::size_t> max_bytes_;
+    std::optional<std::chrono::milliseconds> max_time_;
+    PerfTraceCallback perf_trace_;
+    std::size_t load_count_ = 0;
+    std::uint64_t loaded_bytes_ = 0;
+    long long elapsed_us_ = 0;
+};
+
 std::string ascii_lower_copy(std::string_view value)
 {
     std::string out;
@@ -1114,6 +1242,38 @@ struct Page::Impl {
     }
 #endif
 
+    std::uint64_t render_prefetch_loaded_bytes(const std::vector<ResourceResponse>& responses) const
+    {
+        std::uint64_t bytes = 0;
+        for (const auto& response : responses) {
+            bytes += response.body.size();
+        }
+        return bytes;
+    }
+
+    void emit_render_prefetch_responses(
+        const PerfTraceCallback& perf_trace,
+        std::string_view wave,
+        const std::vector<ResourceRequest>& requests,
+        const std::vector<ResourceResponse>& responses) const
+    {
+        const std::size_t count = std::min(requests.size(), responses.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            PerfEvent event{
+                PerfPhase::ResourceLoad,
+                "render_prefetch_response",
+                0,
+                responses[i].body.size(),
+            };
+            event.property = resource_kind_name(requests[i].kind);
+            event.url = responses[i].url.empty() ? requests[i].url : responses[i].url;
+            event.reason = responses[i].from_cache
+                ? std::string(wave) + ":cache"
+                : std::string(wave);
+            emit_perf_trace(perf_trace, std::move(event));
+        }
+    }
+
     // Returns the loader litehtml should use for a render. When external loading
     // is enabled, the page's sub-resources are prefetched concurrently into a
     // cache so the layout's synchronous requests hit warm entries.
@@ -1140,6 +1300,15 @@ struct Page::Impl {
             render_resource_cache = std::make_shared<CachingResourceLoader>(loader, 4096);
         }
         const std::shared_ptr<CachingResourceLoader>& cache = render_resource_cache;
+        std::shared_ptr<ResourceLoader> render_loader = cache;
+        if (render_options.max_external_resource_loads
+            || render_options.max_external_resource_bytes
+            || render_options.max_external_resource_time) {
+            render_loader = std::make_shared<BudgetedRenderResourceLoader>(
+                cache,
+                render_options,
+                perf_trace_for(render_options));
+        }
 
         const std::string effective_base = effective_base_url(render_options);
 
@@ -1151,18 +1320,23 @@ struct Page::Impl {
             trace.set_count(wave1.size());
         }
         if (wave1.empty()) {
-            return cache;
+            return render_loader;
         }
 
         std::vector<ResourceResponse> fetched;
         try {
             // Lenient: a failed sub-resource must not abort the render; litehtml
             // will fall back to its placeholder for it.
-            fetched = cache->load_all(wave1, BatchErrorMode::Lenient);
+            PerfScope trace(perf_trace_for(render_options), PerfPhase::ResourceLoad, "render_prefetch_wave1", wave1.size());
+            trace.event().property = "render";
+            trace.event().reason = "wave1";
+            fetched = render_loader->load_all(wave1, BatchErrorMode::Lenient);
+            trace.set_count(render_prefetch_loaded_bytes(fetched));
+            emit_render_prefetch_responses(perf_trace_for(render_options), "wave1", wave1, fetched);
         } catch (...) {
             // Prefetch is purely an optimization; on any failure fall back to the
             // cache delegating each request to the inner loader on demand.
-            return cache;
+            return render_loader;
         }
 
         // Second wave: background images referenced by url() inside the external
@@ -1187,12 +1361,17 @@ struct Page::Impl {
 
         if (!wave2.empty()) {
             try {
-                cache->load_all(wave2, BatchErrorMode::Lenient);
+                PerfScope trace(perf_trace_for(render_options), PerfPhase::ResourceLoad, "render_prefetch_wave2", wave2.size());
+                trace.event().property = "render";
+                trace.event().reason = "wave2";
+                const auto wave2_responses = render_loader->load_all(wave2, BatchErrorMode::Lenient);
+                trace.set_count(render_prefetch_loaded_bytes(wave2_responses));
+                emit_render_prefetch_responses(perf_trace_for(render_options), "wave2", wave2, wave2_responses);
             } catch (...) {
             }
         }
 
-        return cache;
+        return render_loader;
     }
 
     StyledDocumentCacheKey styled_document_cache_key(const RenderOptions& render_options) const

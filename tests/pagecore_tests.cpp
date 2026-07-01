@@ -4346,6 +4346,92 @@ void test_render_prefetches_subresources_into_cache()
             "layout-time sub-resource requests are served from the prefetch cache, not re-fetched");
 }
 
+void test_perf_trace_records_render_prefetch_waves()
+{
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    auto loader = std::make_shared<BatchRecordingLoader>();
+    loader->add("https://example.test/style.css",
+                "#b { width: 40px; height: 20px; background-image: url('/bg.png'); }", "text/css");
+    loader->add("https://example.test/pixel.png", "fake-image-bytes", "image/png");
+    loader->add("https://example.test/bg.png", "fake-background-bytes", "image/png");
+
+    pagecore::Page page(load_options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head><link rel="stylesheet" href="/style.css"></head>
+<body><div id="b"></div><img src="/pixel.png"></body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{200, 100, 1.0f};
+    (void) page.display_list(options);
+
+    const auto has_event = [&](std::string_view name, std::string_view reason, std::string_view url = {}) {
+        return std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+            return event.phase == pagecore::PerfPhase::ResourceLoad
+                && event.name == name
+                && event.reason == reason
+                && (url.empty() || event.url == url);
+        });
+    };
+
+    require(has_event("render_prefetch_wave1", "wave1"), "perf trace should record render prefetch wave1");
+    require(has_event("render_prefetch_wave2", "wave2"), "perf trace should record render prefetch wave2");
+    require(
+        has_event("render_prefetch_response", "wave1", "https://example.test/style.css"),
+        "perf trace should list wave1 stylesheet responses");
+    require(
+        has_event("render_prefetch_response", "wave1", "https://example.test/pixel.png"),
+        "perf trace should list wave1 image responses");
+    require(
+        has_event("render_prefetch_response", "wave2", "https://example.test/bg.png"),
+        "perf trace should list wave2 CSS image responses");
+}
+
+void test_render_resource_budget_blocks_prefetch_and_layout_misses()
+{
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    auto loader = std::make_shared<BatchRecordingLoader>();
+    loader->add("https://example.test/a.png", "image-a", "image/png");
+    loader->add("https://example.test/b.png", "image-b", "image/png");
+
+    pagecore::Page page(load_options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body><img src="/a.png"><img src="/b.png"></body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{200, 100, 1.0f};
+    options.max_external_resource_loads = 1;
+    (void) page.display_list(options);
+
+    const auto fetch_count = [&](const std::string& url) {
+        return std::count(loader->all_requested.begin(), loader->all_requested.end(), url);
+    };
+    require(fetch_count("https://example.test/a.png") == 1, "first render resource should be loaded");
+    require(fetch_count("https://example.test/b.png") == 0,
+            "render resources blocked by budget should not reach the underlying loader");
+
+    const bool saw_blocked = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ResourceLoad
+            && event.name == "render_resource_blocked"
+            && event.reason == "budget:max_render_resource_loads"
+            && event.url == "https://example.test/b.png";
+    });
+    require(saw_blocked, "perf trace should record render resources blocked by budget");
+}
+
 // Regression: a script-heavy page invalidates its styled document on every DOM
 // mutation, so getComputedStyle()/geometry/render rebuild the litehtml document
 // many times during one load. The sub-resource cache must persist across those
@@ -5884,6 +5970,8 @@ int main()
         test_page_display_list_resolves_relative_base_element_against_document_url();
         test_page_display_list_resolves_protocol_relative_and_host_like_css_urls();
         test_render_prefetches_subresources_into_cache();
+        test_perf_trace_records_render_prefetch_waves();
+        test_render_resource_budget_blocks_prefetch_and_layout_misses();
         test_render_resource_cache_persists_across_rebuilds();
         test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();

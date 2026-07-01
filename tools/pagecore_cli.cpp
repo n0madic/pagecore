@@ -59,6 +59,9 @@ void usage(const char* argv0)
         << "  --max-js-resource-loads NUMBER stop JS-initiated resource loads after this many actual loads\n"
         << "  --max-js-resource-bytes NUMBER stop JS-initiated resource loads after this many response bytes\n"
         << "  --max-js-resource-time-ms NUMBER stop JS-initiated resource loads after this much cumulative load time\n"
+        << "  --max-render-resource-loads NUMBER stop render resource loads after this many actual loads\n"
+        << "  --max-render-resource-bytes NUMBER stop render resource loads after this many response bytes\n"
+        << "  --max-render-resource-time-ms NUMBER stop render resource loads after this much cumulative load time\n"
         << "  --js-timeout-ms NUMBER   per-script execution deadline, default 30000\n"
         << "  --js-memory-mb NUMBER    QuickJS heap limit, default 256\n"
         << "  --perf-trace PATH|-      write perf trace JSONL; '-' writes to stderr\n";
@@ -314,6 +317,18 @@ int main(int argc, char** argv)
             else if (arg == "--max-js-resource-time-ms") {
                 load_options.max_js_resource_time =
                     std::chrono::milliseconds(parse_nonnegative_int(next(), "max-js-resource-time-ms"));
+            }
+            else if (arg == "--max-render-resource-loads") {
+                render_options.max_external_resource_loads =
+                    static_cast<std::size_t>(parse_nonnegative_int(next(), "max-render-resource-loads"));
+            }
+            else if (arg == "--max-render-resource-bytes") {
+                render_options.max_external_resource_bytes =
+                    static_cast<std::size_t>(parse_nonnegative_int(next(), "max-render-resource-bytes"));
+            }
+            else if (arg == "--max-render-resource-time-ms") {
+                render_options.max_external_resource_time =
+                    std::chrono::milliseconds(parse_nonnegative_int(next(), "max-render-resource-time-ms"));
             }
             else if (arg == "--js-timeout-ms") load_options.js_timeout = std::chrono::milliseconds(parse_positive_int(next(), "js-timeout-ms"));
             else if (arg == "--js-memory-mb") {

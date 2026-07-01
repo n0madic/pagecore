@@ -2,6 +2,8 @@
 
 #include "pagecore/perf.hpp"
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -25,6 +27,9 @@ struct Viewport {
 struct RenderOptions {
     Viewport viewport;
     bool load_external_resources = true;
+    std::optional<std::size_t> max_external_resource_loads;
+    std::optional<std::size_t> max_external_resource_bytes;
+    std::optional<std::chrono::milliseconds> max_external_resource_time;
     std::string base_url;
     PerfTraceCallback perf_trace;
 };

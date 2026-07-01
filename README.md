@@ -216,7 +216,9 @@ document loads are emitted as `document_load`, initial parser-discovered
 external scripts as `initial_script_load_all` plus one
 `initial_script_response` per response, JS-initiated `fetch`/XHR/dynamic script
 loads as `js_load_resource`, and policy- or budget-rejected JS loads as
-`js_load_resource_blocked`.
+`js_load_resource_blocked`. Render prefetching emits `render_prefetch_wave1`,
+`render_prefetch_wave2`, and `render_prefetch_response`; render resources
+rejected by budget emit `render_resource_blocked`.
 Use `tools/perf_trace_summary.js /tmp/pagecore-trace.jsonl` to print phase
 totals, resource-load groups, and the slowest resource events.
 
@@ -237,6 +239,14 @@ The same JS-initiated loads can also be capped with
 checked before each JS-initiated load; counts and elapsed time are accumulated
 for actual loader calls, and bytes are accumulated from successful response
 bodies.
+Render-time external sub-resources can be capped independently with
+`RenderOptions::max_external_resource_loads`,
+`RenderOptions::max_external_resource_bytes`, and
+`RenderOptions::max_external_resource_time` (`--max-render-resource-loads`,
+`--max-render-resource-bytes`, `--max-render-resource-time-ms`). These budgets
+wrap the render loader passed to litehtml, so over-budget resources are blocked
+both during PageCore's prefetch waves and during later litehtml synchronous
+cache misses.
 
 ## Embedding
 
