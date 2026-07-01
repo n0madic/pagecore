@@ -8,7 +8,6 @@
 #include "pagecore/resource_loader.hpp"
 
 #if defined(PAGECORE_ENABLE_RENDERING)
-#include <turbojpeg.h>
 #include <webp/encode.h>
 #endif
 
@@ -288,42 +287,38 @@ std::string pagecore_icon_font_body(std::string_view format)
 }
 
 #if defined(PAGECORE_ENABLE_RENDERING)
-std::string jpeg_body(pagecore::Color color, int width = 4, int height = 4)
+std::string jpeg_body()
 {
-    std::vector<unsigned char> rgb(static_cast<std::size_t>(width) * height * 3);
-    for (std::size_t offset = 0; offset + 2 < rgb.size(); offset += 3) {
-        rgb[offset] = color.r;
-        rgb[offset + 1] = color.g;
-        rgb[offset + 2] = color.b;
-    }
+    return pagecore::base64_decode(
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB"
+        "AQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB"
+        "AQEBAQEBAQEBAQEBAQH/wAARCAAEAAQDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA"
+        "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6"
+        "Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG"
+        "x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA"
+        "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5"
+        "OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPE"
+        "xcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD8t6KKK/ic/rg//9k=");
+}
 
-    tjhandle handle = tjInitCompress();
-    require(handle != nullptr, "TurboJPEG compressor should initialize");
-
-    unsigned char* encoded = nullptr;
-    unsigned long encoded_size = 0;
-    const int result = tjCompress2(
-        handle,
-        rgb.data(),
-        width,
-        0,
-        height,
-        TJPF_RGB,
-        &encoded,
-        &encoded_size,
-        TJSAMP_444,
-        100,
-        TJFLAG_ACCURATEDCT);
-    const std::string body(
-        reinterpret_cast<const char*>(encoded),
-        result == 0 ? static_cast<std::size_t>(encoded_size) : 0);
-    if (encoded != nullptr) {
-        tjFree(encoded);
-    }
-    tjDestroy(handle);
-
-    require(result == 0, "TurboJPEG should encode test JPEG");
-    return body;
+std::string jpeg_header_with_dimensions(std::uint16_t width, std::uint16_t height)
+{
+    const unsigned char bytes[] = {
+        0xff, 0xd8,
+        0xff, 0xc0,
+        0x00, 0x11,
+        0x08,
+        static_cast<unsigned char>((height >> 8) & 0xff),
+        static_cast<unsigned char>(height & 0xff),
+        static_cast<unsigned char>((width >> 8) & 0xff),
+        static_cast<unsigned char>(width & 0xff),
+        0x03,
+        0x01, 0x22, 0x00,
+        0x02, 0x11, 0x01,
+        0x03, 0x11, 0x01,
+        0xff, 0xd9,
+    };
+    return std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes));
 }
 
 std::string webp_body(pagecore::Color color, int width = 4, int height = 4)
@@ -2760,12 +2755,12 @@ void test_png_decoder_rgba()
 
 void test_jpeg_decoder_rgba()
 {
-    const auto body = jpeg_body(pagecore::Color{120, 80, 40, 255}, 4, 3);
+    const auto body = jpeg_body();
     const auto decoded = pagecore::decode_image_rgba(body);
 
     require(decoded != nullptr, "JPEG decoder should return an image");
-    require(decoded->width == 4 && decoded->height == 3, "JPEG decoder should preserve dimensions");
-    require(decoded->rgba.size() == 4 * 3 * 4, "JPEG decoder should emit RGBA pixels");
+    require(decoded->width == 4 && decoded->height == 4, "JPEG decoder should preserve dimensions");
+    require(decoded->rgba.size() == 4 * 4 * 4, "JPEG decoder should emit RGBA pixels");
     require(color_close(decoded->rgba, pagecore::Color{120, 80, 40, 255}, 8),
             "JPEG decoder should preserve approximate pixel color");
 }
@@ -2784,20 +2779,7 @@ void test_webp_decoder_rgba()
 
 void test_jpeg_decoder_rejects_huge_dimensions()
 {
-    std::string body = jpeg_body(pagecore::Color{120, 80, 40, 255}, 4, 3);
-    bool patched = false;
-    for (std::size_t offset = 0; offset + 9 < body.size(); ++offset) {
-        const auto marker = static_cast<unsigned char>(body[offset + 1]);
-        if (static_cast<unsigned char>(body[offset]) == 0xff && (marker == 0xc0 || marker == 0xc1 || marker == 0xc2)) {
-            body[offset + 5] = static_cast<char>(0x20);
-            body[offset + 6] = static_cast<char>(0x00);
-            body[offset + 7] = static_cast<char>(0x20);
-            body[offset + 8] = static_cast<char>(0x00);
-            patched = true;
-            break;
-        }
-    }
-    require(patched, "test JPEG should contain a SOF marker");
+    const std::string body = jpeg_header_with_dimensions(8192, 8192);
 
     require_runtime_error_contains(
         [&] {
@@ -2967,7 +2949,7 @@ void test_image_decoder_rejects_malformed_input()
 
     const auto png = png_body(pagecore::Color{10, 20, 30, 255});
     expect_throws(std::string_view(png).substr(0, png.size() / 3), "truncated PNG");
-    const auto jpeg = jpeg_body(pagecore::Color{10, 20, 30, 255});
+    const auto jpeg = jpeg_body();
     expect_throws(std::string_view(jpeg).substr(0, jpeg.size() / 3), "truncated JPEG");
     const auto gif = gif_body();
     expect_throws(std::string_view(gif).substr(0, gif.size() / 3), "truncated GIF");
@@ -4091,7 +4073,7 @@ void test_page_render_decodes_and_draws_jpeg_images()
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
     loader->add(
         "https://example.test/pixel.jpg",
-        jpeg_body(pagecore::Color{120, 80, 40, 255}, 4, 4),
+        jpeg_body(),
         "image/jpeg");
 
     pagecore::Page page;

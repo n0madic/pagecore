@@ -1,8 +1,17 @@
 #include "pagecore/image_decoder.hpp"
 
 #include <cairo.h>
+#if defined(PAGECORE_IMAGE_DECODER_STB)
+#define STBI_NO_STDIO
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_ONLY_GIF
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+#else
 #include <gif_lib.h>
 #include <turbojpeg.h>
+#endif
 #include <webp/decode.h>
 
 #include <algorithm>
@@ -27,6 +36,14 @@
 namespace pagecore {
 namespace {
 
+#if defined(PAGECORE_IMAGE_DECODER_STB)
+struct StbImageDeleter {
+    void operator()(stbi_uc* data) const
+    {
+        stbi_image_free(data);
+    }
+};
+#else
 struct StreamReader {
     std::string_view bytes;
     std::size_t offset = 0;
@@ -55,6 +72,7 @@ struct GifFileDeleter {
         }
     }
 };
+#endif
 
 struct SvgPaint {
     bool enabled = true;
@@ -1174,29 +1192,82 @@ bool is_svg(std::string_view bytes)
     return sample.find("<svg") != std::string::npos;
 }
 
-int read_gif_stream(GifFileType* gif, GifByteType* data, int length)
+bool is_jpeg_sof_marker(unsigned char marker)
 {
-    auto* reader = static_cast<GifMemoryReader*>(gif->UserData);
-    const std::size_t requested = static_cast<std::size_t>(std::max(length, 0));
-    const std::size_t available = reader->bytes.size() - std::min(reader->offset, reader->bytes.size());
-    const std::size_t count = std::min(requested, available);
-    if (count > 0) {
-        std::memcpy(data, reader->bytes.data() + static_cast<std::ptrdiff_t>(reader->offset), count);
-        reader->offset += count;
-    }
-    return static_cast<int>(count);
+    return marker >= 0xc0
+        && marker <= 0xcf
+        && marker != 0xc4
+        && marker != 0xc8
+        && marker != 0xcc;
 }
 
-cairo_status_t read_png_stream(void* closure, unsigned char* data, unsigned int length)
+bool has_jpeg_eoi_marker(std::string_view bytes)
 {
-    auto* reader = static_cast<StreamReader*>(closure);
-    if (reader->offset + length > reader->bytes.size()) {
-        return CAIRO_STATUS_READ_ERROR;
+    for (std::size_t offset = 0; offset + 1 < bytes.size(); ++offset) {
+        if (static_cast<unsigned char>(bytes[offset]) == 0xff
+            && static_cast<unsigned char>(bytes[offset + 1]) == 0xd9) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<std::pair<int, int>> jpeg_dimensions_from_header(std::string_view bytes)
+{
+    if (!is_jpeg(bytes)) {
+        return std::nullopt;
     }
 
-    std::memcpy(data, reader->bytes.data() + static_cast<std::ptrdiff_t>(reader->offset), length);
-    reader->offset += length;
-    return CAIRO_STATUS_SUCCESS;
+    std::size_t offset = 2;
+    while (offset + 1 < bytes.size()) {
+        if (static_cast<unsigned char>(bytes[offset]) != 0xff) {
+            ++offset;
+            continue;
+        }
+
+        while (offset < bytes.size() && static_cast<unsigned char>(bytes[offset]) == 0xff) {
+            ++offset;
+        }
+        if (offset >= bytes.size()) {
+            break;
+        }
+
+        const auto marker = static_cast<unsigned char>(bytes[offset++]);
+        if (marker == 0x00 || marker == 0xff) {
+            continue;
+        }
+        if (marker == 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+            continue;
+        }
+        if (offset + 2 > bytes.size()) {
+            break;
+        }
+
+        const auto segment_length =
+            (static_cast<std::size_t>(static_cast<unsigned char>(bytes[offset])) << 8)
+            | static_cast<std::size_t>(static_cast<unsigned char>(bytes[offset + 1]));
+        if (segment_length < 2 || offset + segment_length > bytes.size()) {
+            break;
+        }
+        if (is_jpeg_sof_marker(marker)) {
+            if (segment_length < 7 || offset + 7 > bytes.size()) {
+                break;
+            }
+            const int height =
+                (static_cast<int>(static_cast<unsigned char>(bytes[offset + 3])) << 8)
+                | static_cast<int>(static_cast<unsigned char>(bytes[offset + 4]));
+            const int width =
+                (static_cast<int>(static_cast<unsigned char>(bytes[offset + 5])) << 8)
+                | static_cast<int>(static_cast<unsigned char>(bytes[offset + 6]));
+            return std::pair<int, int>{width, height};
+        }
+        if (marker == 0xda) {
+            break;
+        }
+        offset += segment_length;
+    }
+
+    return std::nullopt;
 }
 
 std::uint8_t unpremultiply(std::uint8_t value, std::uint8_t alpha)
@@ -1242,6 +1313,33 @@ void resize_rgba(DecodedImage& image, int width, int height, const char* operati
     image.rgba.resize(checked_rgba_size(width, height, operation));
 }
 
+#if !defined(PAGECORE_IMAGE_DECODER_STB)
+int read_gif_stream(GifFileType* gif, GifByteType* data, int length)
+{
+    auto* reader = static_cast<GifMemoryReader*>(gif->UserData);
+    const std::size_t requested = static_cast<std::size_t>(std::max(length, 0));
+    const std::size_t available = reader->bytes.size() - std::min(reader->offset, reader->bytes.size());
+    const std::size_t count = std::min(requested, available);
+    if (count > 0) {
+        std::memcpy(data, reader->bytes.data() + static_cast<std::ptrdiff_t>(reader->offset), count);
+        reader->offset += count;
+    }
+    return static_cast<int>(count);
+}
+
+cairo_status_t read_png_stream(void* closure, unsigned char* data, unsigned int length)
+{
+    auto* reader = static_cast<StreamReader*>(closure);
+    if (reader->offset + length > reader->bytes.size()) {
+        return CAIRO_STATUS_READ_ERROR;
+    }
+
+    std::memcpy(data, reader->bytes.data() + static_cast<std::ptrdiff_t>(reader->offset), length);
+    reader->offset += length;
+    return CAIRO_STATUS_SUCCESS;
+}
+#endif
+
 std::shared_ptr<const DecodedImage> surface_to_decoded_image(cairo_surface_t* surface, const char* operation)
 {
     cairo_surface_flush(surface);
@@ -1280,6 +1378,59 @@ std::shared_ptr<const DecodedImage> surface_to_decoded_image(cairo_surface_t* su
     return image;
 }
 
+#if defined(PAGECORE_IMAGE_DECODER_STB)
+std::string stb_failure_message(const char* operation)
+{
+    const char* reason = stbi_failure_reason();
+    if (reason == nullptr || reason[0] == '\0') {
+        reason = "decode failed";
+    }
+    return std::string(operation) + ": " + reason;
+}
+
+std::shared_ptr<const DecodedImage> decode_stb_rgba(std::string_view bytes, const char* operation)
+{
+    if (bytes.empty()) {
+        throw std::runtime_error(std::string(operation) + ": empty input");
+    }
+    if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(std::string(operation) + ": input is too large");
+    }
+
+    const auto* input = reinterpret_cast<const stbi_uc*>(bytes.data());
+    const int length = static_cast<int>(bytes.size());
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    if (stbi_info_from_memory(input, length, &width, &height, &channels) == 0) {
+        throw std::runtime_error(stb_failure_message(operation));
+    }
+    (void) channels;
+    (void) checked_rgba_size(width, height, operation);
+
+    int decoded_width = 0;
+    int decoded_height = 0;
+    int decoded_channels = 0;
+    std::unique_ptr<stbi_uc, StbImageDeleter> decoded(stbi_load_from_memory(
+        input,
+        length,
+        &decoded_width,
+        &decoded_height,
+        &decoded_channels,
+        STBI_rgb_alpha));
+    if (!decoded) {
+        throw std::runtime_error(stb_failure_message(operation));
+    }
+    (void) decoded_channels;
+
+    auto image = std::make_shared<DecodedImage>();
+    resize_rgba(*image, decoded_width, decoded_height, operation);
+    std::copy(decoded.get(), decoded.get() + image->rgba.size(), image->rgba.begin());
+    return image;
+}
+#endif
+
 } // namespace
 
 std::shared_ptr<const DecodedImage> decode_image_rgba(std::string_view bytes)
@@ -1304,6 +1455,9 @@ std::shared_ptr<const DecodedImage> decode_image_rgba(std::string_view bytes)
 
 std::shared_ptr<const DecodedImage> decode_png_rgba(std::string_view bytes)
 {
+#if defined(PAGECORE_IMAGE_DECODER_STB)
+    return decode_stb_rgba(bytes, "decode PNG");
+#else
     if (bytes.empty()) {
         throw std::runtime_error("decode PNG: empty input");
     }
@@ -1318,6 +1472,7 @@ std::shared_ptr<const DecodedImage> decode_png_rgba(std::string_view bytes)
     }
 
     return surface_to_decoded_image(surface.get(), "decode PNG");
+#endif
 }
 
 std::shared_ptr<const DecodedImage> decode_jpeg_rgba(std::string_view bytes)
@@ -1325,7 +1480,16 @@ std::shared_ptr<const DecodedImage> decode_jpeg_rgba(std::string_view bytes)
     if (bytes.empty()) {
         throw std::runtime_error("decode JPEG: empty input");
     }
+    if (!has_jpeg_eoi_marker(bytes)) {
+        throw std::runtime_error("decode JPEG: truncated input");
+    }
+    if (auto dimensions = jpeg_dimensions_from_header(bytes)) {
+        (void) checked_rgba_size(dimensions->first, dimensions->second, "decode JPEG");
+    }
 
+#if defined(PAGECORE_IMAGE_DECODER_STB)
+    return decode_stb_rgba(bytes, "decode JPEG");
+#else
     tjhandle handle = tjInitDecompress();
     if (handle == nullptr) {
         throw std::runtime_error("decode JPEG: failed to initialize TurboJPEG");
@@ -1366,6 +1530,7 @@ std::shared_ptr<const DecodedImage> decode_jpeg_rgba(std::string_view bytes)
     }
 
     return image;
+#endif
 }
 
 std::shared_ptr<const DecodedImage> decode_webp_rgba(std::string_view bytes)
@@ -1400,6 +1565,9 @@ std::shared_ptr<const DecodedImage> decode_webp_rgba(std::string_view bytes)
 
 std::shared_ptr<const DecodedImage> decode_gif_rgba(std::string_view bytes)
 {
+#if defined(PAGECORE_IMAGE_DECODER_STB)
+    return decode_stb_rgba(bytes, "decode GIF");
+#else
     if (bytes.empty()) {
         throw std::runtime_error("decode GIF: empty input");
     }
@@ -1472,6 +1640,7 @@ std::shared_ptr<const DecodedImage> decode_gif_rgba(std::string_view bytes)
     }
 
     return image;
+#endif
 }
 
 std::shared_ptr<const DecodedImage> decode_svg_rgba(std::string_view bytes)

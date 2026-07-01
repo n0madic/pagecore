@@ -15,6 +15,14 @@ option(PAGECORE_BUILD_TOOLS "Build PageCore command-line tools" ${PAGECORE_DEFAU
 option(PAGECORE_BUILD_EXAMPLES "Build PageCore examples" OFF)
 set(PAGECORE_DEFAULT_ENABLE_RENDERING ${PAGECORE_BUILD_TOOLS})
 option(PAGECORE_ENABLE_RENDERING "Build the litehtml layout adapter and Cairo/Pango rendering pipeline" ${PAGECORE_DEFAULT_ENABLE_RENDERING})
+set(PAGECORE_IMAGE_DECODER "system" CACHE STRING "Raster image decoder backend: system or stb")
+set_property(CACHE PAGECORE_IMAGE_DECODER PROPERTY STRINGS system stb)
+set(PAGECORE_IMAGE_DECODER_CHOICES system stb)
+string(TOLOWER "${PAGECORE_IMAGE_DECODER}" PAGECORE_IMAGE_DECODER_NORMALIZED)
+if(NOT PAGECORE_IMAGE_DECODER_NORMALIZED IN_LIST PAGECORE_IMAGE_DECODER_CHOICES)
+    message(FATAL_ERROR "PAGECORE_IMAGE_DECODER must be one of: system, stb")
+endif()
+set(PAGECORE_IMAGE_DECODER "${PAGECORE_IMAGE_DECODER_NORMALIZED}" CACHE STRING "Raster image decoder backend: system or stb" FORCE)
 option(PAGECORE_OPTIMIZE_SIZE "Enable size-focused release flags, linker dead-code elimination, LTO when available, and executable stripping" OFF)
 option(PAGECORE_STRIP_RELEASE_BINARIES "Strip Release/MinSizeRel executables when PAGECORE_OPTIMIZE_SIZE is enabled" ON)
 option(PAGECORE_MINIFY_DOM_SHIM "Minify the generated DOM shim before embedding it" OFF)
@@ -224,32 +232,40 @@ function(pagecore_fetchcontent_make_available_excluded dependency)
 endfunction()
 
 if(PAGECORE_ENABLE_RENDERING)
-    pagecore_pkg_config_static_first(
-        pagecore_static_pkg_deps
+    set(PAGECORE_RENDERING_PKG_MODULES
         cairo
         pangocairo
         pangoft2
         fontconfig
         libbrotlidec
-        libturbojpeg
         libwebp
         libwebpdecoder
     )
+    if(PAGECORE_IMAGE_DECODER STREQUAL "system")
+        list(APPEND PAGECORE_RENDERING_PKG_MODULES libturbojpeg)
+    endif()
 
-    find_path(GIFLIB_INCLUDE_DIR NAMES gif_lib.h)
-    set(PAGECORE_SAVED_FIND_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_STATIC_LIBRARY_SUFFIX} ${CMAKE_FIND_LIBRARY_SUFFIXES})
-    find_library(GIFLIB_STATIC_LIBRARY NAMES gif)
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${PAGECORE_SAVED_FIND_LIBRARY_SUFFIXES})
-    find_library(GIFLIB_LIBRARY NAMES gif)
-    if(GIFLIB_STATIC_LIBRARY)
-        set(GIFLIB_LIBRARY "${GIFLIB_STATIC_LIBRARY}")
+    pagecore_pkg_config_static_first(
+        pagecore_static_pkg_deps
+        ${PAGECORE_RENDERING_PKG_MODULES}
+    )
+
+    if(PAGECORE_IMAGE_DECODER STREQUAL "system")
+        find_path(GIFLIB_INCLUDE_DIR NAMES gif_lib.h)
+        set(PAGECORE_SAVED_FIND_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
+        set(CMAKE_FIND_LIBRARY_SUFFIXES ${CMAKE_STATIC_LIBRARY_SUFFIX} ${CMAKE_FIND_LIBRARY_SUFFIXES})
+        find_library(GIFLIB_STATIC_LIBRARY NAMES gif)
+        set(CMAKE_FIND_LIBRARY_SUFFIXES ${PAGECORE_SAVED_FIND_LIBRARY_SUFFIXES})
+        find_library(GIFLIB_LIBRARY NAMES gif)
+        if(GIFLIB_STATIC_LIBRARY)
+            set(GIFLIB_LIBRARY "${GIFLIB_STATIC_LIBRARY}")
+        endif()
+        if(NOT GIFLIB_INCLUDE_DIR OR NOT GIFLIB_LIBRARY)
+            message(FATAL_ERROR "giflib is required for GIF first-frame decoding")
+        endif()
+        target_include_directories(pagecore_static_pkg_deps INTERFACE "${GIFLIB_INCLUDE_DIR}")
+        target_link_libraries(pagecore_static_pkg_deps INTERFACE "${GIFLIB_LIBRARY}")
     endif()
-    if(NOT GIFLIB_INCLUDE_DIR OR NOT GIFLIB_LIBRARY)
-        message(FATAL_ERROR "giflib is required for GIF first-frame decoding")
-    endif()
-    target_include_directories(pagecore_static_pkg_deps INTERFACE "${GIFLIB_INCLUDE_DIR}")
-    target_link_libraries(pagecore_static_pkg_deps INTERFACE "${GIFLIB_LIBRARY}")
 else()
     add_library(pagecore_static_pkg_deps INTERFACE)
 endif()
@@ -456,6 +472,12 @@ target_include_directories(pagecore
 
 if(PAGECORE_ENABLE_RENDERING)
     target_include_directories(pagecore PRIVATE "${woff2_SOURCE_DIR}/include")
+    if(PAGECORE_IMAGE_DECODER STREQUAL "stb")
+        target_include_directories(pagecore PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb")
+        target_compile_definitions(pagecore PRIVATE PAGECORE_IMAGE_DECODER_STB=1)
+    else()
+        target_compile_definitions(pagecore PRIVATE PAGECORE_IMAGE_DECODER_SYSTEM=1)
+    endif()
 endif()
 
 target_link_libraries(pagecore
