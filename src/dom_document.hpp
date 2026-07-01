@@ -25,6 +25,7 @@ struct DomDocument::Impl {
     std::uint64_t mutation_version = 1;
     std::uint64_t layout_mutation_version = 1;
     std::string last_layout_mutation_reason = "initial";
+    NodeId last_layout_mutation_node = kInvalidNodeId;
     std::unordered_set<std::string> layout_sensitive_attributes;
     bool layout_sensitive_attribute_wildcard = false;
     // Bumped only when a tracked node id is invalidated (forgotten) or the
@@ -54,7 +55,10 @@ struct DomDocument::Impl {
     void forget_node(lxb_dom_node_t* node);
     bool attribute_affects_layout(std::string_view name) const;
     bool node_affects_layout(lxb_dom_node_t* node) const;
-    void mark_mutated(bool affects_layout = true, std::string_view layout_reason = {});
+    void mark_mutated(
+        bool affects_layout = true,
+        std::string_view layout_reason = {},
+        NodeId layout_node = kInvalidNodeId);
 
     lxb_css_selector_list_t* compiled_selector(std::string_view selector);
     std::vector<NodeId> run_selector(lxb_dom_node_t* root, std::string_view selector, bool first_only);

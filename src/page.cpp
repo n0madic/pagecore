@@ -685,6 +685,9 @@ struct Page::Impl {
     std::unordered_map<NodeId, std::unordered_map<std::string, std::string>> last_known_computed_style_properties;
     static constexpr int kComputedStylePropertyForcedRebuildCountThreshold = 2;
     static constexpr long long kComputedStylePropertyForcedRebuildBudgetUs = 100'000; // 0.10s
+    std::uint64_t preflight_layout_html_size_version = 0;
+    std::size_t preflight_layout_html_size = 0;
+    static constexpr std::size_t kHeavyDocumentPreflightHtmlBytes = 50'000;
 
     // Sub-resource cache shared by every styled-document rebuild of the current
     // document, so a page that rebuilds many times during script execution
@@ -723,6 +726,8 @@ struct Page::Impl {
         computed_style_property_forced_rebuild_us = 0;
         computed_style_property_cache_forget_version = document.forget_version();
         last_known_computed_style_properties.clear();
+        preflight_layout_html_size_version = 0;
+        preflight_layout_html_size = 0;
     }
 
     void ensure_js()
@@ -1324,6 +1329,74 @@ struct Page::Impl {
         return value;
     }
 
+    std::size_t current_layout_html_size()
+    {
+        const std::uint64_t current_layout_version = document.layout_mutation_version();
+        if (preflight_layout_html_size_version != current_layout_version) {
+            preflight_layout_html_size = document.serialize_html_for_layout(options.enable_js).size();
+            preflight_layout_html_size_version = current_layout_version;
+        }
+        return preflight_layout_html_size;
+    }
+
+    bool can_answer_bounded_computed_style_property(NodeId node, std::string_view property)
+    {
+        if (!document.is_connected(node)) {
+            return false;
+        }
+        if (const auto inline_style = document.get_attribute(node, "style")) {
+            if (inline_style_property_value(*inline_style, property)) {
+                return true;
+            }
+        }
+        if (cached_computed_style_property(node, property)) {
+            return true;
+        }
+        return default_computed_style_property_value(property, document.tag_name(node)).has_value();
+    }
+
+    bool is_last_appended_layout_subtree(NodeId node)
+    {
+        const NodeId mutation_node = document.last_layout_mutation_node();
+        return document.last_layout_mutation_reason() == "append_child"
+            && mutation_node != kInvalidNodeId
+            && (node == mutation_node || document.contains(mutation_node, node));
+    }
+
+    bool should_preflight_append_child_computed_style_property(
+        const std::string& cache_reason,
+        NodeId node,
+        std::string_view property)
+    {
+        return cache_reason == "empty"
+            && is_last_appended_layout_subtree(node)
+            && can_answer_bounded_computed_style_property(node, property)
+            && current_layout_html_size() >= kHeavyDocumentPreflightHtmlBytes;
+    }
+
+    bool should_preflight_append_child_layout_read(const std::string& cache_reason, NodeId node)
+    {
+        return cache_reason == "empty"
+            && is_last_appended_layout_subtree(node)
+            && current_layout_html_size() >= kHeavyDocumentPreflightHtmlBytes;
+    }
+
+    bool is_structural_layout_mutation_reason(std::string_view reason) const
+    {
+        return reason == "append_child"
+            || reason == "insert_before"
+            || reason == "remove_child"
+            || reason == "replace_child"
+            || reason == "set_inner_html";
+    }
+
+    bool should_preflight_heavy_structural_layout_read(const std::string& cache_reason)
+    {
+        return cache_reason == "empty"
+            && is_structural_layout_mutation_reason(document.last_layout_mutation_reason())
+            && current_layout_html_size() >= kHeavyDocumentPreflightHtmlBytes;
+    }
+
     std::unique_ptr<LayoutEngine> build_layout(const RenderOptions& render_options)
     {
         if (!layout_factory) {
@@ -1462,6 +1535,14 @@ struct Page::Impl {
         trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
         trace.event().property = std::string(property);
 
+        if (!cache_hit && should_preflight_append_child_computed_style_property(cache_reason, node, property)) {
+            computed_style_property_bounded_mode = true;
+            trace.event().styled_document_cache_reason = "preflight_append_child:" + cache_reason;
+            auto value = bounded_computed_style_property(node, property);
+            trace.set_count(value && !value->empty() ? 1 : 0);
+            return value;
+        }
+
         if (!cache_hit && (computed_style_property_bounded_mode || styled_document_expensive)) {
             computed_style_property_bounded_mode = true;
             trace.event().styled_document_cache_reason = "bounded_mode:" + cache_reason;
@@ -1486,7 +1567,15 @@ struct Page::Impl {
 
     std::optional<ElementGeometry> element_geometry(NodeId node)
     {
+        const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
+        const std::string cache_reason = styled_document_cache_reason(key);
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::Geometry, "element_geometry", 1);
+        trace.event().node_id = node;
+        trace.event().mutation_version = document.mutation_version();
+        trace.event().layout_mutation_version = document.layout_mutation_version();
+        trace.event().styled_document_cache_hit = has_current_layout(last_render_options);
+        trace.event().styled_document_cache_reason = cache_reason;
+        trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
         sync_geometry_cache_for_forget_version();
         if (!document.is_connected(node)) {
             last_known_geometry.erase(node);
@@ -1500,8 +1589,21 @@ struct Page::Impl {
             return geometry;
         }
 
+        if (should_preflight_append_child_layout_read(cache_reason, node)) {
+            geometry_bounded_mode = true;
+            trace.event().styled_document_cache_reason = "preflight_append_child:" + cache_reason;
+            return cached_geometry(node);
+        }
+
+        if (should_preflight_heavy_structural_layout_read(cache_reason)) {
+            geometry_bounded_mode = true;
+            trace.event().styled_document_cache_reason = "preflight_heavy_structural:" + cache_reason;
+            return cached_geometry(node);
+        }
+
         if (geometry_bounded_mode || styled_document_expensive) {
             geometry_bounded_mode = true;
+            trace.event().styled_document_cache_reason = "bounded_mode:" + cache_reason;
             return cached_geometry(node);
         }
 

@@ -54,6 +54,7 @@ public:
     std::uint64_t mutation_version() const;
     std::uint64_t layout_mutation_version() const;
     std::string last_layout_mutation_reason() const;
+    NodeId last_layout_mutation_node() const;
     void set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard = false);
     // Monotonic counter bumped only when a node id is invalidated (forgotten via
     // innerHTML replacement) or the document is reparsed. Wrapper layers use it

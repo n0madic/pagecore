@@ -3268,6 +3268,9 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
     require(
         doc.last_layout_mutation_reason() == "set_attribute:data-state",
         "layout mutation reason should describe the attribute mutation");
+    require(
+        doc.last_layout_mutation_node() == node,
+        "layout mutation node should identify the element that changed");
 
     const auto selected_layout_version = doc.layout_mutation_version();
     doc.set_attribute(node, "aria-label", "Still service metadata");
@@ -3279,12 +3282,22 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
     require(
         doc.layout_mutation_version() == selected_layout_version + 1,
         "class writes must invalidate layout/style cache");
+    require(doc.last_layout_mutation_node() == node, "class mutation should record the changed node");
 
     const auto class_layout_version = doc.layout_mutation_version();
     doc.set_text_content(node, "changed");
     require(
         doc.layout_mutation_version() == class_layout_version + 1,
         "text mutations must invalidate layout/style cache");
+
+    const auto text_layout_version = doc.layout_mutation_version();
+    const pagecore::NodeId child = doc.create_element("span");
+    const pagecore::NodeId appended = doc.append_child(node, child);
+    require(
+        doc.layout_mutation_version() == text_layout_version + 1,
+        "append_child must invalidate layout/style cache");
+    require(doc.last_layout_mutation_reason() == "append_child", "append_child should record its mutation reason");
+    require(doc.last_layout_mutation_node() == appended, "append_child should record the appended node");
 
     doc.parse("<html><body><script id='s'>var a = 1;</script><div id='x'>layout</div></body></html>");
     const pagecore::NodeId script = doc.get_element_by_id("s");
@@ -5305,6 +5318,75 @@ void test_element_geometry_bounded_mode_drops_disconnected_stale_geometry()
     require(*factory->layout_calls == 2, "disconnected geometry read must not force another layout");
 }
 
+void test_element_geometry_preflights_first_append_child_on_heavy_document()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    std::string filler(60'000, 'x');
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><main>" + filler + "</main></body></html>", "https://example.test/");
+
+    const pagecore::NodeId body = page.document().body();
+    const pagecore::NodeId box = page.document().create_element("div");
+    page.document().append_child(body, box);
+
+    auto geometry = page.element_geometry(box);
+    require(!geometry, "preflight append-child geometry should use bounded null geometry");
+    require(*factory->layout_calls == 0, "preflight append-child geometry must not run layout");
+
+    const bool saw_preflight_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::Geometry
+            && event.name == "element_geometry"
+            && event.node_id == box
+            && event.styled_document_cache_reason == "preflight_append_child:empty";
+    });
+    require(saw_preflight_event, "perf trace should identify append-child preflight geometry reads");
+}
+
+void test_element_geometry_preflights_first_structural_mutation_on_heavy_document()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    std::string filler(60'000, 'x');
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(factory);
+    page.load_html(
+        "<html><body><main id='target'>" + filler + "</main><aside id='removed'></aside></body></html>",
+        "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId target = page.document().query_selector(root, "#target");
+    const pagecore::NodeId removed = page.document().query_selector(root, "#removed");
+    const pagecore::NodeId body = page.document().body();
+    require(target != pagecore::kInvalidNodeId && removed != pagecore::kInvalidNodeId, "expected fixture nodes");
+
+    page.document().remove_child(body, removed);
+    auto geometry = page.element_geometry(target);
+    require(!geometry, "heavy structural preflight geometry should use bounded null geometry");
+    require(*factory->layout_calls == 0, "heavy structural preflight geometry must not run layout");
+
+    const bool saw_preflight_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::Geometry
+            && event.name == "element_geometry"
+            && event.node_id == target
+            && event.styled_document_cache_reason == "preflight_heavy_structural:empty";
+    });
+    require(saw_preflight_event, "perf trace should identify heavy structural preflight geometry reads");
+}
+
 void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
 {
     std::vector<pagecore::PerfEvent> events;
@@ -5343,6 +5425,43 @@ void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
             && event.styled_document_cache_reason == "bounded_mode:layout_mutation_version_changed";
     });
     require(saw_bounded_event, "perf trace should identify bounded computed-style property reads");
+}
+
+void test_computed_style_property_preflights_first_append_child_on_heavy_document()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto factory = std::make_shared<SlowComputedStyleFactory>();
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    std::string filler(60'000, 'x');
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><main>" + filler + "</main></body></html>", "https://example.test/");
+
+    const pagecore::NodeId body = page.document().body();
+    const pagecore::NodeId box = page.document().create_element("div");
+    page.document().append_child(body, box);
+
+    auto width = page.computed_style_property(box, "width");
+    require(width && *width == "auto", "preflight append-child width should use the bounded CSS default");
+    require(*factory->compute_calls == 0, "preflight append-child read must not build a styled document");
+
+    page.document().set_attribute(box, "style", "width:30px");
+    auto inline_width = page.computed_style_property(box, "width");
+    require(inline_width && *inline_width == "30px", "bounded mode should still return inline values after preflight");
+    require(*factory->compute_calls == 0, "post-preflight bounded mode must not force a rebuild");
+
+    const bool saw_preflight_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ComputedStyle
+            && event.name == "computed_style_property"
+            && event.property == "width"
+            && event.styled_document_cache_reason == "preflight_append_child:empty";
+    });
+    require(saw_preflight_event, "perf trace should identify append-child preflight computed-style reads");
 }
 #endif
 
@@ -5501,7 +5620,10 @@ int main()
         test_element_geometry_reuses_cached_layout();
         test_element_geometry_bounded_mode_returns_cached_geometry();
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();
+        test_element_geometry_preflights_first_append_child_on_heavy_document();
+        test_element_geometry_preflights_first_structural_mutation_on_heavy_document();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
+        test_computed_style_property_preflights_first_append_child_on_heavy_document();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";
