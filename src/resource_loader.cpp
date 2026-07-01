@@ -1,5 +1,7 @@
 #include "pagecore/resource_loader.hpp"
 
+#include "base64_codec.hpp"
+
 #include <curl/curl.h>
 
 #include <algorithm>
@@ -506,115 +508,22 @@ std::string percent_decode_data_payload(
     return out;
 }
 
-int base64_value(unsigned char ch)
-{
-    if (ch >= 'A' && ch <= 'Z') {
-        return ch - 'A';
-    }
-    if (ch >= 'a' && ch <= 'z') {
-        return 26 + ch - 'a';
-    }
-    if (ch >= '0' && ch <= '9') {
-        return 52 + ch - '0';
-    }
-    if (ch == '+') {
-        return 62;
-    }
-    if (ch == '/') {
-        return 63;
-    }
-    return -1;
-}
-
 std::string base64_decode_data_payload(
     std::string_view input,
     const ResourceRequest& request,
     const ResourcePolicy& policy)
 {
-    std::string out;
-    out.reserve((input.size() / 4) * 3);
-
-    std::array<int, 4> quartet{};
-    int quartet_size = 0;
-    int padding = 0;
-    bool finished = false;
-
-    const auto emit_quartet = [&] {
-        if (quartet[0] < 0 || quartet[1] < 0) {
-            throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
-        }
-
-        append_data_byte(out, static_cast<char>((quartet[0] << 2) | (quartet[1] >> 4)), request, policy);
-        if (quartet[2] >= 0) {
-            append_data_byte(
-                out,
-                static_cast<char>(((quartet[1] & 0x0f) << 4) | (quartet[2] >> 2)),
-                request,
-                policy);
-            if (quartet[3] >= 0) {
-                append_data_byte(
-                    out,
-                    static_cast<char>(((quartet[2] & 0x03) << 6) | quartet[3]),
-                    request,
-                    policy);
-            }
-        } else if (quartet[3] >= 0) {
-            throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 padding");
-        }
-
-        if (padding > 0) {
-            finished = true;
-        }
-        quartet_size = 0;
-        padding = 0;
-    };
-
-    for (unsigned char ch : input) {
-        if (std::isspace(ch)) {
-            continue;
-        }
-        if (finished) {
-            throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
-        }
-
-        if (ch == '=') {
-            if (quartet_size < 2 || padding >= 2) {
-                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 padding");
-            }
-            quartet[quartet_size++] = -1;
-            ++padding;
-        } else {
-            if (padding > 0) {
-                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 padding");
-            }
-            const int value = base64_value(ch);
-            if (value < 0) {
-                throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
-            }
-            quartet[quartet_size++] = value;
-        }
-
-        if (quartet_size == 4) {
-            emit_quartet();
-        }
-    }
-
-    if (quartet_size == 0) {
-        return out;
-    }
-    if (padding > 0 || quartet_size == 1) {
+    std::string decoded;
+    try {
+        decoded = base64_decode(input, Base64DecodeMode::Forgiving);
+    } catch (const std::exception&) {
         throw ResourceError(ResourceErrorCode::InvalidRequest, request.url, "invalid data URL base64 payload");
     }
 
-    if (quartet_size == 2) {
-        append_data_byte(out, static_cast<char>((quartet[0] << 2) | (quartet[1] >> 4)), request, policy);
-    } else if (quartet_size == 3) {
-        append_data_byte(out, static_cast<char>((quartet[0] << 2) | (quartet[1] >> 4)), request, policy);
-        append_data_byte(
-            out,
-            static_cast<char>(((quartet[1] & 0x0f) << 4) | (quartet[2] >> 2)),
-            request,
-            policy);
+    std::string out;
+    out.reserve(decoded.size());
+    for (char byte : decoded) {
+        append_data_byte(out, byte, request, policy);
     }
 
     return out;

@@ -1,3 +1,5 @@
+#include "base64_codec.hpp"
+
 #include "pagecore/image_io.hpp"
 #include "pagecore/image_decoder.hpp"
 #include "pagecore/dom.hpp"
@@ -218,64 +220,6 @@ std::string png_body(pagecore::Color color, int width = 2, int height = 2)
     return std::string(reinterpret_cast<const char*>(png.data()), png.size());
 }
 
-std::string base64_encode(std::string_view bytes)
-{
-    static constexpr char kAlphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    std::string out;
-    out.reserve(((bytes.size() + 2) / 3) * 4);
-
-    for (std::size_t i = 0; i < bytes.size(); i += 3) {
-        const std::uint32_t a = static_cast<unsigned char>(bytes[i]);
-        const std::uint32_t b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
-        const std::uint32_t c = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
-        const std::uint32_t chunk = (a << 16) | (b << 8) | c;
-
-        out.push_back(kAlphabet[(chunk >> 18) & 0x3f]);
-        out.push_back(kAlphabet[(chunk >> 12) & 0x3f]);
-        out.push_back(i + 1 < bytes.size() ? kAlphabet[(chunk >> 6) & 0x3f] : '=');
-        out.push_back(i + 2 < bytes.size() ? kAlphabet[chunk & 0x3f] : '=');
-    }
-
-    return out;
-}
-
-std::string base64_decode(std::string_view text)
-{
-    const auto value_of = [](char ch) -> int {
-        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
-        if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
-        if (ch >= '0' && ch <= '9') return ch - '0' + 52;
-        if (ch == '+') return 62;
-        if (ch == '/') return 63;
-        return -1;
-    };
-
-    std::string out;
-    std::uint32_t buffer = 0;
-    int bits = 0;
-    for (char ch : text) {
-        if (std::isspace(static_cast<unsigned char>(ch))) {
-            continue;
-        }
-        if (ch == '=') {
-            break;
-        }
-        const int value = value_of(ch);
-        if (value < 0) {
-            throw std::runtime_error("invalid base64 fixture");
-        }
-        buffer = (buffer << 6) | static_cast<std::uint32_t>(value);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<char>((buffer >> bits) & 0xff));
-        }
-    }
-    return out;
-}
-
 int count_dark_pixels(
     const pagecore::RenderedImage& image,
     int x,
@@ -297,7 +241,7 @@ int count_dark_pixels(
 std::string pagecore_icon_font_body(std::string_view format)
 {
     if (format == "ttf") {
-        return base64_decode(
+        return pagecore::base64_decode(
             "AAEAAAAKAIAAAwAgT1MvMkUBM38AAAEoAAAAYGNtYXC/8SCdAAABlAAAADxnbHlmKNwP5AAAAdgAAAAa"
             "aGVhZC6lbSAAAACsAAAANmhoZWEFegJcAAAA5AAAACRobXR4BaoAAAAAAYgAAAAMbG9jYQAAAA0AAAHQ"
             "AAAACG1heHAABQAGAAABCAAAACBuYW1lWe7ItwAAAfQAAAFocG9zdEytn5sAAANcAAAAMAABAAAAAQAA"
@@ -316,7 +260,7 @@ std::string pagecore_icon_font_body(std::string_view format)
             "aUUwMDA=");
     }
     if (format == "woff") {
-        return base64_decode(
+        return pagecore::base64_decode(
             "d09GRgABAAAAAALAAAoAAAAAA4wAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAABPUy8yAAABZAAAAC4AAABg"
             "RQEzf2NtYXAAAAGgAAAAMQAAADy/8SCdZ2x5ZgAAAdwAAAAaAAAAGijcD+RoZWFkAAAA9AAAADYAAAA2"
             "LqVtIGhoZWEAAAEsAAAAHwAAACQFegJcaG10eAAAAZQAAAAMAAAADAWqAABsb2NhAAAB1AAAAAgAAAAI"
@@ -331,7 +275,7 @@ std::string pagecore_icon_font_body(std::string_view format)
             "9NTaPRNzmtyOfrffwDc5lnicY2BiwA+YQZiRib00L9PVwMAAAAs4AjQAAAA=");
     }
     if (format == "woff2") {
-        return base64_decode(
+        return pagecore::base64_decode(
             "d09GMgABAAAAAAGkAAoAAAAAA4wAAAFbAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmAAPAocOAE2AiQD"
             "DAsIAAQgBYJoBzAb8QIongPu7FRE3BkPi04Wyot1sf7yEZLMElTL1rO7d09M8hW8isLgEBpFVhQ2Cov+"
             "wgiUQlhciOVTgmibpym9dEFDFsPaWFiX8YgwfPgx2IDTFCIIjGc5eSFx/nY+9xOO3nmUdql2UZdIGOBv"
@@ -776,6 +720,17 @@ void test_browser_like_web_api_shims()
       checks.push(screen.width === window.innerWidth);
       checks.push(screen.height === window.innerHeight);
       checks.push(screen.colorDepth === 24);
+      checks.push(btoa('abc') === 'YWJj');
+      checks.push(atob('YWJj') === 'abc');
+      checks.push(btoa('\xff') === '/w==');
+      checks.push(atob('/w==').charCodeAt(0) === 255);
+      let invalidBase64Input = false;
+      try {
+        btoa('\u0100');
+      } catch (error) {
+        invalidBase64Input = error && error.name === 'InvalidCharacterError';
+      }
+      checks.push(invalidBase64Input);
 
       const iframe = document.createElement('iframe');
       iframe.src = 'https://frame.test/start';
@@ -2200,6 +2155,25 @@ void test_resource_loader_decodes_data_urls()
     require(png.status == 200, "memory loader should handle inline data URLs directly");
     require(png.mime_type == "image/png", "base64 data URL should expose the image media type");
     require(png.body == "ABCD", "base64 data URL should decode its payload");
+
+    const auto relaxed = memory_loader.load(pagecore::ResourceRequest{
+        "data:text/plain;base64,QU JD\nRA",
+        pagecore::ResourceKind::Other,
+    });
+    require(relaxed.body == "ABCD", "base64 data URL decode should allow whitespace and missing padding");
+
+    pagecore::ResourcePolicy tiny;
+    tiny.max_response_bytes = 3;
+    pagecore::MemoryResourceLoader tiny_loader(tiny);
+    require_resource_error(
+        pagecore::ResourceErrorCode::TooLarge,
+        [&] {
+            (void) tiny_loader.load(pagecore::ResourceRequest{
+                "data:text/plain;base64,QUJDRA==",
+                pagecore::ResourceKind::Other,
+            });
+        },
+        "base64 data URL decode should preserve max_response_bytes enforcement");
 }
 
 void test_resource_policy_errors()
@@ -4055,7 +4029,7 @@ void test_page_render_decodes_and_draws_png_images()
 void test_page_render_decodes_and_draws_data_url_images()
 {
     const std::string data_url =
-        "data:image/png;base64," + base64_encode(png_body(pagecore::Color{24, 160, 220, 255}));
+        "data:image/png;base64," + pagecore::base64_encode(png_body(pagecore::Color{24, 160, 220, 255}));
 
     pagecore::Page page;
     page.load_html(
@@ -4083,7 +4057,7 @@ void test_page_render_decodes_and_draws_data_url_images()
 void test_page_render_decodes_css_data_url_background_images()
 {
     const std::string data_url =
-        "data:image/png;base64," + base64_encode(png_body(pagecore::Color{210, 32, 90, 255}));
+        "data:image/png;base64," + pagecore::base64_encode(png_body(pagecore::Color{210, 32, 90, 255}));
 
     pagecore::Page page;
     page.load_html(

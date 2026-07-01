@@ -19,7 +19,15 @@
       const { DOMException, EventTarget } = api.events;
       const { document } = api.dom;
 
-      const base64Characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      const nativeBase64Encode = ctx.host && typeof ctx.host.base64Encode === 'function'
+        ? ctx.host.base64Encode
+        : null;
+      const nativeBase64Decode = ctx.host && typeof ctx.host.base64Decode === 'function'
+        ? ctx.host.base64Decode
+        : null;
+      if (!nativeBase64Encode || !nativeBase64Decode) {
+        throw new Error('PageCore base64 host bridge is not installed.');
+      }
 
       function invalidCharacter(message) {
         return new DOMException(message, 'InvalidCharacterError');
@@ -27,47 +35,44 @@
 
       function btoa(input = '') {
         const text = String(input);
-        let output = '';
         for (let index = 0; index < text.length; index++) {
           if (text.charCodeAt(index) > 0xff) {
             throw invalidCharacter('The string to be encoded contains characters outside of the Latin1 range.');
           }
         }
-        for (let index = 0; index < text.length; index += 3) {
-          const first = text.charCodeAt(index);
-          const second = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
-          const third = index + 2 < text.length ? text.charCodeAt(index + 2) : 0;
-          const triple = (first << 16) | (second << 8) | third;
-          output += base64Characters[(triple >> 18) & 0x3f];
-          output += base64Characters[(triple >> 12) & 0x3f];
-          output += index + 1 < text.length ? base64Characters[(triple >> 6) & 0x3f] : '=';
-          output += index + 2 < text.length ? base64Characters[triple & 0x3f] : '=';
+        try {
+          return nativeBase64Encode(text);
+        } catch (_nativeError) {
+          throw invalidCharacter('The string to be encoded contains characters outside of the Latin1 range.');
         }
-        return output;
+      }
+
+      function normalizeBase64Input(input = '') {
+        let text = String(input).replace(/[\t\n\f\r ]+/g, '');
+        if (text.length % 4 === 0) {
+          const paddingMatch = /=+$/.exec(text);
+          if (paddingMatch) {
+            if (paddingMatch[0].length > 2) {
+              throw invalidCharacter('The string to be decoded is not correctly encoded.');
+            }
+            text = text.slice(0, -paddingMatch[0].length);
+          }
+        } else if (text.indexOf('=') !== -1) {
+          throw invalidCharacter('The string to be decoded is not correctly encoded.');
+        }
+        if (text.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(text)) {
+          throw invalidCharacter('The string to be decoded is not correctly encoded.');
+        }
+        return text;
       }
 
       function atob(input = '') {
-        let text = String(input).replace(/[\t\n\f\r ]+/g, '');
-        if (text.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(text)) {
+        const text = normalizeBase64Input(input);
+        try {
+          return nativeBase64Decode(text);
+        } catch (_nativeError) {
           throw invalidCharacter('The string to be decoded is not correctly encoded.');
         }
-        const padding = text.indexOf('=');
-        if (padding >= 0 && /[^=]/.test(text.slice(padding))) {
-          throw invalidCharacter('The string to be decoded is not correctly encoded.');
-        }
-        text = text.replace(/=+$/, '');
-        let output = '';
-        for (let index = 0; index < text.length; index += 4) {
-          const first = base64Characters.indexOf(text[index]);
-          const second = index + 1 < text.length ? base64Characters.indexOf(text[index + 1]) : 0;
-          const third = index + 2 < text.length ? base64Characters.indexOf(text[index + 2]) : 0;
-          const fourth = index + 3 < text.length ? base64Characters.indexOf(text[index + 3]) : 0;
-          const triple = (first << 18) | (second << 12) | (third << 6) | fourth;
-          output += String.fromCharCode((triple >> 16) & 0xff);
-          if (index + 2 < text.length) output += String.fromCharCode((triple >> 8) & 0xff);
-          if (index + 3 < text.length) output += String.fromCharCode(triple & 0xff);
-        }
-        return output;
       }
 
       function cssEscape(value = '') {

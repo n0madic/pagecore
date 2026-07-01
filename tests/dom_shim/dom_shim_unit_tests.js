@@ -24,6 +24,14 @@ function makeBridge() {
   };
 }
 
+function base64EncodeLatin1(value) {
+  return Buffer.from(String(value), 'latin1').toString('base64');
+}
+
+function base64DecodeLatin1(value) {
+  return Buffer.from(String(value), 'base64').toString('latin1');
+}
+
 function makeDomBridge() {
   let nextId = 1;
   let version = 1;
@@ -305,7 +313,9 @@ function installDomEnvironment() {
       baseURL: 'https://example.test/app/index.html',
       userAgent: 'PageCoreTest/1.0',
       loadResource: () => ({ body: '', status: 200 }),
-      log: (...args) => logs.push(args)
+      log: (...args) => logs.push(args),
+      base64Encode: base64EncodeLatin1,
+      base64Decode: base64DecodeLatin1
     }
   };
   const core = coreDefinition.install(ctx, Object.create(null));
@@ -575,7 +585,12 @@ test('compat installs browser utilities without silent worker support', async ()
 
   assert.strictEqual(compat.btoa('abc'), 'YWJj');
   assert.strictEqual(compat.atob('YWJj'), 'abc');
+  assert.strictEqual(compat.btoa('\xff'), '/w==');
+  assert.strictEqual(compat.atob('/w==').charCodeAt(0), 255);
+  assert.strictEqual(compat.atob('Y W\nJj'), 'abc');
+  assert.strictEqual(compat.atob('YWI'), 'ab');
   assert.throws(() => compat.btoa('\u0100'), /InvalidCharacterError/);
+  assert.throws(() => compat.atob('YQ='), /InvalidCharacterError/);
   assert.strictEqual(compat.CSS.escape('a b'), 'a\\ b');
   assert.strictEqual(compat.CSS.supports('display', 'block'), true);
   assert.strictEqual(compat.CSS.supports('display', 'block; color: red'), false);

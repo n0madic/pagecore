@@ -1,5 +1,6 @@
 #include "js_runtime.hpp"
 
+#include "base64_codec.hpp"
 #include "dom_shim.hpp"
 #include "pagecore/resource_loader.hpp"
 
@@ -57,6 +58,93 @@ std::string to_string(JSContext* ctx, JSValueConst value)
 JSValue js_string(JSContext* ctx, const std::string& value)
 {
     return JS_NewStringLen(ctx, value.data(), value.size());
+}
+
+std::string latin1_bytes_from_js_string(JSContext* ctx, JSValueConst value)
+{
+    size_t len = 0;
+    const char* data = JS_ToCStringLen(ctx, &len, value);
+    if (data == nullptr) {
+        throw std::runtime_error("expected string");
+    }
+
+    std::string out;
+    try {
+        out.reserve(len);
+        for (std::size_t i = 0; i < len;) {
+            const auto first = static_cast<unsigned char>(data[i]);
+            std::uint32_t codepoint = 0;
+            std::size_t width = 0;
+
+            if (first < 0x80) {
+                codepoint = first;
+                width = 1;
+            } else if ((first & 0xe0) == 0xc0) {
+                if (i + 1 >= len) {
+                    throw std::runtime_error("invalid utf-8 string");
+                }
+                const auto second = static_cast<unsigned char>(data[i + 1]);
+                if ((second & 0xc0) != 0x80) {
+                    throw std::runtime_error("invalid utf-8 string");
+                }
+                codepoint = ((first & 0x1f) << 6) | (second & 0x3f);
+                width = 2;
+            } else if ((first & 0xf0) == 0xe0) {
+                if (i + 2 >= len) {
+                    throw std::runtime_error("invalid utf-8 string");
+                }
+                const auto second = static_cast<unsigned char>(data[i + 1]);
+                const auto third = static_cast<unsigned char>(data[i + 2]);
+                if ((second & 0xc0) != 0x80 || (third & 0xc0) != 0x80) {
+                    throw std::runtime_error("invalid utf-8 string");
+                }
+                codepoint = ((first & 0x0f) << 12) | ((second & 0x3f) << 6) | (third & 0x3f);
+                width = 3;
+            } else if ((first & 0xf8) == 0xf0) {
+                if (i + 3 >= len) {
+                    throw std::runtime_error("invalid utf-8 string");
+                }
+                const auto second = static_cast<unsigned char>(data[i + 1]);
+                const auto third = static_cast<unsigned char>(data[i + 2]);
+                const auto fourth = static_cast<unsigned char>(data[i + 3]);
+                if ((second & 0xc0) != 0x80 || (third & 0xc0) != 0x80 || (fourth & 0xc0) != 0x80) {
+                    throw std::runtime_error("invalid utf-8 string");
+                }
+                codepoint =
+                    ((first & 0x07) << 18) | ((second & 0x3f) << 12) | ((third & 0x3f) << 6) | (fourth & 0x3f);
+                width = 4;
+            } else {
+                throw std::runtime_error("invalid utf-8 string");
+            }
+
+            if (codepoint > 0xff) {
+                throw std::runtime_error("string contains characters outside of the Latin1 range");
+            }
+            out.push_back(static_cast<char>(codepoint));
+            i += width;
+        }
+    } catch (...) {
+        JS_FreeCString(ctx, data);
+        throw;
+    }
+
+    JS_FreeCString(ctx, data);
+    return out;
+}
+
+JSValue js_latin1_string(JSContext* ctx, std::string_view bytes)
+{
+    std::string utf8;
+    utf8.reserve(bytes.size());
+    for (unsigned char byte : bytes) {
+        if (byte < 0x80) {
+            utf8.push_back(static_cast<char>(byte));
+        } else {
+            utf8.push_back(static_cast<char>(0xc0 | (byte >> 6)));
+            utf8.push_back(static_cast<char>(0x80 | (byte & 0x3f)));
+        }
+    }
+    return JS_NewStringLen(ctx, utf8.data(), utf8.size());
 }
 
 JSValue js_id(JSContext* ctx, NodeId id)
@@ -791,6 +879,22 @@ JSValue host_random_bytes(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue host_base64_encode(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
+        if (argc < 1) throw std::runtime_error("base64Encode requires input");
+        return js_string(ctx, base64_encode(latin1_bytes_from_js_string(ctx, argv[0])));
+    });
+}
+
+JSValue host_base64_decode(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
+        if (argc < 1) throw std::runtime_error("base64Decode requires input");
+        return js_latin1_string(ctx, base64_decode(to_string(ctx, argv[0]), Base64DecodeMode::Forgiving));
+    });
+}
+
 char* JsRuntime::normalize_module(JSContext* ctx, const char* module_base_name, const char* module_name, void* opaque)
 {
     auto* js = static_cast<JsRuntime*>(opaque);
@@ -938,6 +1042,8 @@ void JsRuntime::install()
     set_function(context_, host, "log", host_log, 1);
     set_function(context_, host, "loadResource", host_load_resource, 2);
     set_function(context_, host, "randomBytes", host_random_bytes, 1);
+    set_function(context_, host, "base64Encode", host_base64_encode, 1);
+    set_function(context_, host, "base64Decode", host_base64_decode, 1);
     JS_SetPropertyStr(context_, host, "baseURL", js_string(context_, options_.base_url));
     JS_SetPropertyStr(context_, host, "userAgent", js_string(context_, options_.user_agent));
 

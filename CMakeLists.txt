@@ -422,6 +422,7 @@ endif()
 
 add_library(pagecore
     "${PAGECORE_DOM_SHIM_HEADER}"
+    src/base64_codec.cpp
     src/display_list_dump.cpp
     src/dom_document.cpp
     src/image_io.cpp
@@ -449,6 +450,7 @@ target_include_directories(pagecore
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/base64/include
         ${PAGECORE_GENERATED_DIR}
 )
 
@@ -522,6 +524,7 @@ if(PAGECORE_BUILD_TESTS)
             PAGECORE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
             PAGECORE_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}"
     )
+    target_include_directories(pagecore_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps)
     pagecore_strip_release_binary(pagecore_tests)
     add_test(NAME pagecore_tests COMMAND pagecore_tests)
