@@ -230,6 +230,10 @@ void write_perf_event_jsonl(std::ostream& out, const pagecore::PerfEvent& event)
         out << ",\"property\":";
         write_json_string(out, event.property);
     }
+    if (!event.url.empty()) {
+        out << ",\"url\":";
+        write_json_string(out, event.url);
+    }
     out << "}\n";
 }
 

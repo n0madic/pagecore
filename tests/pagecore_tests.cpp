@@ -711,6 +711,32 @@ void test_timer_wait_budget()
             "timer should fire after enough wait budget has been advanced");
 }
 
+void test_zero_wait_does_not_run_timer_callbacks()
+{
+    pagecore::LoadOptions options;
+    options.wait_time = std::chrono::milliseconds(0);
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html><body>
+  <div id="timer" data-sync="no"></div>
+  <script>
+    document.getElementById('timer').setAttribute('data-sync', 'yes');
+    setTimeout(() => document.getElementById('timer').setAttribute('data-fired', 'yes'), 0);
+  </script>
+</body></html>
+)HTML");
+
+    require(page.outer_html("#timer[data-sync='yes']").has_value(),
+            "wait_time=0 must still execute synchronous scripts");
+    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
+            "wait_time=0 must not run zero-delay timer callbacks during load");
+
+    page.run_until_idle();
+    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
+            "wait_time=0 run_until_idle must keep timer callbacks pending");
+}
+
 void test_browser_like_web_api_shims()
 {
     pagecore::LoadOptions options;
@@ -5013,6 +5039,64 @@ void test_perf_trace_records_render_geometry_and_png_phases()
         "computed style event should report styled-document cache reason");
 }
 
+void test_perf_trace_records_document_and_initial_script_resources()
+{
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add(
+        "https://example.test/index.html",
+        "<html><body><script src='/app.js'></script></body></html>",
+        "text/html");
+    loader->add(
+        "https://example.test/app.js",
+        "document.body.setAttribute('data-script-loaded', 'yes');",
+        "text/javascript");
+
+    pagecore::Page page(load_options);
+    page.set_resource_loader(loader);
+    page.load_url("https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-script-loaded='yes']").has_value(),
+        "external script should execute during load_url");
+
+    auto document_load = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ResourceLoad && event.name == "document_load";
+    });
+    require(document_load != events.end(), "perf trace should record the top-level document load");
+    require(document_load->property == "document", "document load trace should identify the resource class");
+    require(
+        document_load->url == "https://example.test/index.html",
+        "document load trace should report the effective URL");
+    require(document_load->count > 0, "document load trace should report loaded bytes");
+
+    auto script_batch = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ResourceLoad && event.name == "initial_script_load_all";
+    });
+    require(script_batch != events.end(), "perf trace should record the initial script batch load");
+    require(script_batch->property == "script", "initial script batch trace should identify script resources");
+    require(script_batch->count > 0, "initial script batch trace should report loaded bytes");
+
+    auto script_response = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ResourceLoad
+            && event.name == "initial_script_response"
+            && event.url == "https://example.test/app.js";
+    });
+    require(script_response != events.end(), "perf trace should list initial script responses by URL");
+    require(script_response->property == "script", "fresh initial script response should be marked as script");
+    require(script_response->count > 0, "initial script response trace should report loaded bytes");
+
+    auto script_execute = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::Script && event.name == "execute";
+    });
+    require(script_execute != events.end(), "perf trace should record script execution during load");
+}
+
 void test_computed_style_property_uses_layout_mutation_version_cache()
 {
     std::vector<pagecore::PerfEvent> events;
@@ -5479,6 +5563,7 @@ int main()
         test_inner_html_invalidates_stale_wrappers();
         test_wrapper_cache_prunes_only_on_forget();
         test_timer_wait_budget();
+        test_zero_wait_does_not_run_timer_callbacks();
         test_browser_like_web_api_shims();
         test_event_constructor_ignores_prototype_accessors();
         test_document_lifecycle_ignores_ready_state_overrides();
@@ -5616,6 +5701,7 @@ int main()
         test_window_viewport_reflects_last_render_options();
         test_geometry_apis_return_zero_for_display_none();
         test_perf_trace_records_render_geometry_and_png_phases();
+        test_perf_trace_records_document_and_initial_script_resources();
         test_computed_style_property_uses_layout_mutation_version_cache();
         test_element_geometry_reuses_cached_layout();
         test_element_geometry_bounded_mode_returns_cached_geometry();

@@ -11,6 +11,9 @@ namespace pagecore {
 enum class PerfPhase {
     SerializeHtml,
     SubresourceScan,
+    Script,
+    DomBridge,
+    ResourceLoad,
     LitehtmlLoadHtml,
     LitehtmlLayout,
     ComputedStyle,
@@ -21,7 +24,7 @@ enum class PerfPhase {
 
 struct PerfEvent {
     PerfPhase phase = PerfPhase::SerializeHtml;
-    std::string_view name;
+    std::string name;
     long long elapsed_us = 0;
     std::uint64_t count = 0;
 
@@ -32,6 +35,7 @@ struct PerfEvent {
     std::string styled_document_cache_reason;
     std::string layout_mutation_reason;
     std::string property;
+    std::string url;
 };
 
 using PerfTraceCallback = std::function<void(const PerfEvent&)>;
@@ -43,6 +47,12 @@ inline std::string_view perf_phase_name(PerfPhase phase)
         return "serialize_html";
     case PerfPhase::SubresourceScan:
         return "subresource_scan";
+    case PerfPhase::Script:
+        return "script";
+    case PerfPhase::DomBridge:
+        return "dom_bridge";
+    case PerfPhase::ResourceLoad:
+        return "resource_load";
     case PerfPhase::LitehtmlLoadHtml:
         return "litehtml_load_html";
     case PerfPhase::LitehtmlLayout:
@@ -79,7 +89,7 @@ inline void emit_perf_trace(
     if (!callback) {
         return;
     }
-    emit_perf_trace(callback, PerfEvent{phase, name, elapsed_us, count});
+    emit_perf_trace(callback, PerfEvent{phase, std::string(name), elapsed_us, count});
 }
 
 } // namespace pagecore

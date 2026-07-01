@@ -8,8 +8,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -69,7 +71,15 @@ public:
     void set_viewport_resolver(ViewportResolver resolver);
     Viewport viewport();
 
+    void record_dom_bridge_perf(std::string_view name, long long elapsed_us);
+    void flush_dom_bridge_perf();
+
 private:
+    struct DomBridgePerfAggregate {
+        long long elapsed_us = 0;
+        std::uint64_t calls = 0;
+    };
+
     JSRuntime* runtime_ = nullptr;
     JSContext* context_ = nullptr;
     DomDocument* document_ = nullptr;
@@ -79,6 +89,7 @@ private:
     ComputedStylePropertyResolver computed_style_property_resolver_;
     ElementGeometryResolver element_geometry_resolver_;
     ViewportResolver viewport_resolver_;
+    std::unordered_map<std::string, DomBridgePerfAggregate> dom_bridge_perf_;
     std::chrono::steady_clock::time_point deadline_{};
     bool deadline_active_ = false;
 
@@ -89,6 +100,7 @@ private:
     void clear_deadline();
     void drain_jobs();
     void check_exception(JSValue value, std::string_view source_name = {});
+    void emit_script_perf(std::string_view name, std::chrono::steady_clock::time_point start, std::uint64_t count);
 };
 
 } // namespace pagecore

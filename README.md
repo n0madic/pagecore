@@ -187,14 +187,18 @@ Each event has the shape:
 {"phase":"litehtml_layout","name":"layout","elapsed_us":21438,"count":3211}
 ```
 
-Current phases are `serialize_html`, `subresource_scan`, `litehtml_load_html`,
-`litehtml_layout`, `computed_style`, `geometry`, `raster`, and `png_encode`.
+Current phases are `serialize_html`, `subresource_scan`, `script`, `dom_bridge`,
+`resource_load`, `litehtml_load_html`, `litehtml_layout`, `computed_style`,
+`geometry`, `raster`, and `png_encode`.
 `count` is phase-specific: serialized HTML bytes, discovered first-wave
-subresources, bytes passed to litehtml, display-list command count, returned
-computed-style property count, geometry reads, rasterized command count, or
-encoded PNG bytes. Timings are wall-clock elapsed microseconds for the traced
-operation and are not exclusive: for example, a `geometry` read can include a
-forced `load_html`/`layout` rebuild, which will also emit its own events.
+subresources, script bytes or idle iterations, aggregated DOM bridge call count,
+loaded resource bytes, bytes passed to litehtml, display-list command count,
+returned computed-style property count, geometry reads, rasterized command
+count, or encoded PNG bytes. Timings are wall-clock elapsed microseconds for the
+traced operation and are not exclusive: for example, a `script` event can
+include `dom_bridge` and `resource_load` events, and a `geometry` read can
+include a forced `load_html`/`layout` rebuild, which will also emit its own
+events.
 `--full-page` may emit multiple load/layout events because it probes content
 height, then renders again with the expanded viewport.
 Computed-style and geometry events may also include diagnostic fields such as `node_id`,
@@ -207,6 +211,15 @@ instead of forcing another styled-document rebuild. A prefix of
 `preflight_append_child:` or `preflight_heavy_structural:` means the read was
 bounded before paying the first rebuild for a large, dynamically mutated
 document.
+`resource_load` events may include `url` and `property`; top-level document
+loads are emitted as `document_load`, initial parser-discovered external scripts
+as `initial_script_load_all` plus one `initial_script_response` per response,
+and JS-initiated `fetch`/XHR loads as `js_load_resource`.
+
+`LoadOptions::wait_time` controls timer draining after scripts and lifecycle
+events. A zero wait budget (`pagecore_cli --wait-ms 0`) still runs synchronous
+scripts and microtasks, but leaves `setTimeout`/`setInterval` callbacks pending
+instead of executing zero-delay timers during load.
 
 ## Embedding
 

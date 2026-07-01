@@ -8,6 +8,7 @@ extern "C" {
 #include <quickjs.h>
 }
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -244,6 +245,23 @@ JSValue bridge_call(JSContext* ctx, Func&& func)
         // Never let a non-std exception unwind through QuickJS's C frames.
         return JS_ThrowInternalError(ctx, "native exception");
     }
+}
+
+long long elapsed_us_since(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+template <typename Func>
+JSValue timed_bridge_call(JSContext* ctx, std::string_view name, Func&& func)
+{
+    return bridge_call(ctx, [ctx, name, func = std::forward<Func>(func)](JsRuntime& js) mutable {
+        const auto start = std::chrono::steady_clock::now();
+        JSValue result = func(js);
+        js.record_dom_bridge_perf(name, elapsed_us_since(start));
+        return result;
+    });
 }
 
 void set_function(JSContext* ctx, JSValueConst object, const char* name, JSCFunction* function, int argc)
@@ -567,7 +585,7 @@ JSValue bridge_children(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_describe_node(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "describeNode", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("describeNode requires node id");
         const NodeId id = to_node_id(ctx, argv[0]);
         if (!js.document().has_node(id)) {
@@ -579,7 +597,7 @@ JSValue bridge_describe_node(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_child_nodes_described(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "childNodesDescribed", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("childNodesDescribed requires node id");
         return js_node_descriptors(ctx, js.document(), js.document().child_nodes(to_node_id(ctx, argv[0])));
     });
@@ -587,7 +605,7 @@ JSValue bridge_child_nodes_described(JSContext* ctx, JSValue, int argc, JSValue*
 
 JSValue bridge_children_described(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "childrenDescribed", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("childrenDescribed requires node id");
         return js_node_descriptors(ctx, js.document(), js.document().children(to_node_id(ctx, argv[0])));
     });
@@ -699,7 +717,7 @@ JSValue bridge_viewport(JSContext* ctx, JSValue, int, JSValue*)
 
 JSValue bridge_get_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "getAttribute", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("getAttribute requires node id and name");
         auto value = js.document().get_attribute(to_node_id(ctx, argv[0]), to_string(ctx, argv[1]));
         return value ? js_string(ctx, *value) : JS_NULL;
@@ -708,7 +726,7 @@ JSValue bridge_get_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_has_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "hasAttribute", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("hasAttribute requires node id and name");
         return JS_NewBool(ctx, js.document().has_attribute(to_node_id(ctx, argv[0]), to_string(ctx, argv[1])));
     });
@@ -716,7 +734,7 @@ JSValue bridge_has_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_attributes(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "attributes", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("attributes requires node id");
         return js_attributes(ctx, js.document().attributes(to_node_id(ctx, argv[0])));
     });
@@ -724,7 +742,7 @@ JSValue bridge_attributes(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_set_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "setAttribute", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 3) throw std::runtime_error("setAttribute requires node id, name and value");
         js.document().set_attribute(to_node_id(ctx, argv[0]), to_string(ctx, argv[1]), to_string(ctx, argv[2]));
         return JS_UNDEFINED;
@@ -733,7 +751,7 @@ JSValue bridge_set_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_remove_attribute(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "removeAttribute", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("removeAttribute requires node id and name");
         js.document().remove_attribute(to_node_id(ctx, argv[0]), to_string(ctx, argv[1]));
         return JS_UNDEFINED;
@@ -759,7 +777,7 @@ JSValue bridge_set_text_content(JSContext* ctx, JSValue, int argc, JSValue* argv
 
 JSValue bridge_inner_html(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "innerHTML", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("innerHTML requires node id");
         return js_string(ctx, js.document().inner_html(to_node_id(ctx, argv[0])));
     });
@@ -767,7 +785,7 @@ JSValue bridge_inner_html(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_set_inner_html(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "setInnerHTML", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("setInnerHTML requires node id and html");
         js.document().set_inner_html(to_node_id(ctx, argv[0]), to_string(ctx, argv[1]));
         return JS_UNDEFINED;
@@ -784,7 +802,7 @@ JSValue bridge_outer_html(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_append_child(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "appendChild", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("appendChild requires parent and child ids");
         return js_id(ctx, js.document().append_child(to_node_id(ctx, argv[0]), to_node_id(ctx, argv[1])));
     });
@@ -792,7 +810,7 @@ JSValue bridge_append_child(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_insert_before(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "insertBefore", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 3) throw std::runtime_error("insertBefore requires parent, child and reference ids");
         return js_id(
             ctx,
@@ -805,7 +823,7 @@ JSValue bridge_insert_before(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_remove_child(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "removeChild", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("removeChild requires parent and child ids");
         return js_id(ctx, js.document().remove_child(to_node_id(ctx, argv[0]), to_node_id(ctx, argv[1])));
     });
@@ -813,7 +831,7 @@ JSValue bridge_remove_child(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_replace_child(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "replaceChild", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 3) throw std::runtime_error("replaceChild requires parent, child and replaced child ids");
         return js_id(
             ctx,
@@ -834,7 +852,7 @@ JSValue bridge_clone_node(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_query_selector(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "querySelector", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("querySelector requires root id and selector");
         return js_id(ctx, js.document().query_selector(to_node_id(ctx, argv[0]), to_string(ctx, argv[1])));
     });
@@ -842,7 +860,7 @@ JSValue bridge_query_selector(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue bridge_query_selector_all(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "querySelectorAll", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 2) throw std::runtime_error("querySelectorAll requires root id and selector");
         return js_ids(ctx, js.document().query_selector_all(to_node_id(ctx, argv[0]), to_string(ctx, argv[1])));
     });
@@ -850,7 +868,7 @@ JSValue bridge_query_selector_all(JSContext* ctx, JSValue, int argc, JSValue* ar
 
 JSValue bridge_get_element_by_id(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "getElementById", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("getElementById requires id");
         return js_id(ctx, js.document().get_element_by_id(to_string(ctx, argv[0])));
     });
@@ -882,7 +900,7 @@ JSValue host_log(JSContext* ctx, JSValue, int argc, JSValue* argv)
 
 JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
-    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+    return timed_bridge_call(ctx, "loadResource", [ctx, argc, argv](JsRuntime& js) {
         if (argc < 1) throw std::runtime_error("loadResource requires url");
         const std::string url = to_string(ctx, argv[0]);
         const std::string kind = argc > 1 ? to_string(ctx, argv[1]) : "other";
@@ -1122,46 +1140,67 @@ void JsRuntime::install()
 
 void JsRuntime::execute(std::string_view script, std::string_view filename)
 {
+    const auto perf_start = std::chrono::steady_clock::now();
     start_deadline();
-    const std::string filename_string(filename);
-    JSValue value = JS_Eval(
-        context_,
-        script.data(),
-        script.size(),
-        filename_string.c_str(),
-        JS_EVAL_TYPE_GLOBAL);
-    check_exception(value, filename_string);
-    JS_FreeValue(context_, value);
-    drain_jobs();
-    clear_deadline();
+    try {
+        const std::string filename_string(filename);
+        JSValue value = JS_Eval(
+            context_,
+            script.data(),
+            script.size(),
+            filename_string.c_str(),
+            JS_EVAL_TYPE_GLOBAL);
+        check_exception(value, filename_string);
+        JS_FreeValue(context_, value);
+        drain_jobs();
+        clear_deadline();
+        flush_dom_bridge_perf();
+        emit_script_perf("execute", perf_start, script.size());
+    } catch (...) {
+        clear_deadline();
+        flush_dom_bridge_perf();
+        emit_script_perf("execute", perf_start, script.size());
+        throw;
+    }
 }
 
 void JsRuntime::execute_module(std::string_view script, std::string_view filename)
 {
+    const auto perf_start = std::chrono::steady_clock::now();
     start_deadline();
-    const std::string filename_string(filename);
-    JSValue module_value = JS_Eval(
-        context_,
-        script.data(),
-        script.size(),
-        filename_string.c_str(),
-        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    check_exception(module_value, filename_string);
+    try {
+        const std::string filename_string(filename);
+        JSValue module_value = JS_Eval(
+            context_,
+            script.data(),
+            script.size(),
+            filename_string.c_str(),
+            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        check_exception(module_value, filename_string);
 
-    if (set_import_meta(context_, module_value, true) < 0) {
-        JS_FreeValue(context_, module_value);
-        check_exception(JS_EXCEPTION, filename_string);
+        if (set_import_meta(context_, module_value, true) < 0) {
+            JS_FreeValue(context_, module_value);
+            check_exception(JS_EXCEPTION, filename_string);
+        }
+
+        JSValue value = JS_EvalFunction(context_, module_value);
+        check_exception(value, filename_string);
+        JS_FreeValue(context_, value);
+        drain_jobs();
+        clear_deadline();
+        flush_dom_bridge_perf();
+        emit_script_perf("execute_module", perf_start, script.size());
+    } catch (...) {
+        clear_deadline();
+        flush_dom_bridge_perf();
+        emit_script_perf("execute_module", perf_start, script.size());
+        throw;
     }
-
-    JSValue value = JS_EvalFunction(context_, module_value);
-    check_exception(value, filename_string);
-    JS_FreeValue(context_, value);
-    drain_jobs();
-    clear_deadline();
 }
 
 std::string JsRuntime::evaluate(std::string_view script, std::string_view filename)
 {
+    const auto perf_start = std::chrono::steady_clock::now();
     start_deadline();
     const std::string filename_string(filename);
     JSValue value = JS_Eval(
@@ -1179,6 +1218,8 @@ std::string JsRuntime::evaluate(std::string_view script, std::string_view filena
     } catch (...) {
         JS_FreeValue(context_, value);
         clear_deadline();
+        flush_dom_bridge_perf();
+        emit_script_perf("evaluate", perf_start, script.size());
         throw;
     }
 
@@ -1193,19 +1234,29 @@ std::string JsRuntime::evaluate(std::string_view script, std::string_view filena
     }
     JS_FreeValue(context_, value);
     clear_deadline();
+    flush_dom_bridge_perf();
+    emit_script_perf("evaluate", perf_start, script.size());
     return result;
 }
 
 void JsRuntime::run_until_idle()
 {
+    const auto perf_start = std::chrono::steady_clock::now();
     start_deadline();
     bool timer_budget_available = true;
+    int iterations = 0;
 
     for (int i = 0; i < 100; ++i) {
+        ++iterations;
         try {
             drain_jobs();
         } catch (const std::exception& error) {
             log_console("error", error.what());
+            break;
+        }
+
+        const auto wait_time = options_.wait_time.count();
+        if (wait_time <= 0) {
             break;
         }
 
@@ -1218,7 +1269,6 @@ void JsRuntime::run_until_idle()
             break;
         }
 
-        const auto wait_time = options_.wait_time.count();
         const auto timer_budget = timer_budget_available && wait_time > 0 ? wait_time : 0;
         timer_budget_available = false;
 
@@ -1250,6 +1300,8 @@ void JsRuntime::run_until_idle()
     }
 
     clear_deadline();
+    flush_dom_bridge_perf();
+    emit_script_perf("run_until_idle", perf_start, static_cast<std::uint64_t>(iterations));
 }
 
 DomDocument& JsRuntime::document()
@@ -1309,6 +1361,39 @@ Viewport JsRuntime::viewport()
     return viewport_resolver_();
 }
 
+void JsRuntime::record_dom_bridge_perf(std::string_view name, long long elapsed_us)
+{
+    if (!options_.perf_trace) {
+        return;
+    }
+    auto& aggregate = dom_bridge_perf_[std::string(name)];
+    aggregate.elapsed_us += std::max<long long>(0, elapsed_us);
+    ++aggregate.calls;
+}
+
+void JsRuntime::flush_dom_bridge_perf()
+{
+    if (dom_bridge_perf_.empty()) {
+        return;
+    }
+    if (options_.perf_trace) {
+        for (const auto& [name, aggregate] : dom_bridge_perf_) {
+            emit_perf_trace(
+                options_.perf_trace,
+                PerfEvent{PerfPhase::DomBridge, name, aggregate.elapsed_us, aggregate.calls});
+        }
+    }
+    dom_bridge_perf_.clear();
+}
+
+void JsRuntime::emit_script_perf(
+    std::string_view name,
+    std::chrono::steady_clock::time_point start,
+    std::uint64_t count)
+{
+    emit_perf_trace(options_.perf_trace, PerfPhase::Script, name, elapsed_us_since(start), count);
+}
+
 ResourceResponse JsRuntime::load_resource(
     std::string_view url,
     std::string_view kind,
@@ -1320,7 +1405,7 @@ ResourceResponse JsRuntime::load_resource(
         throw std::runtime_error("resource loader is not available");
     }
     const std::string base = options_.base_url;
-    return loader_->load(ResourceRequest{
+    ResourceRequest request{
         resolve_url(base, url),
         resource_kind_from_string(kind),
         base,
@@ -1328,7 +1413,23 @@ ResourceResponse JsRuntime::load_resource(
         std::move(method),
         std::move(body),
         std::move(headers),
-    });
+    };
+
+    const auto perf_start = std::chrono::steady_clock::now();
+    try {
+        auto response = loader_->load(request);
+        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us_since(perf_start), response.body.size()};
+        event.property = resource_kind_name(request.kind);
+        event.url = request.url;
+        emit_perf_trace(options_.perf_trace, std::move(event));
+        return response;
+    } catch (...) {
+        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us_since(perf_start), 0};
+        event.property = resource_kind_name(request.kind);
+        event.url = request.url;
+        emit_perf_trace(options_.perf_trace, std::move(event));
+        throw;
+    }
 }
 
 void JsRuntime::log_console(std::string_view severity, std::string_view message)

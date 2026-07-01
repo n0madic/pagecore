@@ -344,7 +344,7 @@ class PerfScope final {
 public:
     PerfScope(const PerfTraceCallback& callback, PerfPhase phase, std::string_view name, std::uint64_t count = 0)
         : callback_(callback)
-        , event_{phase, name, 0, count}
+        , event_{phase, std::string(name), 0, count}
         , start_(std::chrono::steady_clock::now())
     {
     }
@@ -694,6 +694,7 @@ struct Page::Impl {
     // fetches each image/stylesheet once instead of on every rebuild. Reset when
     // the document or loader identity changes (invalidate_display_list_cache).
     std::shared_ptr<CachingResourceLoader> render_resource_cache;
+    std::shared_ptr<CachingResourceLoader> js_resource_cache;
 
     explicit Impl(LoadOptions init_options)
         : options(std::move(init_options))
@@ -716,6 +717,7 @@ struct Page::Impl {
         // so drop the cross-rebuild cache when the document/loader identity
         // changes.
         render_resource_cache.reset();
+        js_resource_cache.reset();
         geometry_bounded_mode = false;
         geometry_forced_layout_count = 0;
         geometry_forced_layout_us = 0;
@@ -733,7 +735,7 @@ struct Page::Impl {
     void ensure_js()
     {
         if (!js) {
-            js = std::make_unique<JsRuntime>(document, options, loader);
+            js = std::make_unique<JsRuntime>(document, options, script_resource_loader());
             js->set_computed_style_resolver([this](NodeId node) { return computed_style(node); });
             js->set_computed_style_property_resolver(
                 [this](NodeId node, std::string_view property) { return computed_style_property(node, property); });
@@ -741,6 +743,14 @@ struct Page::Impl {
             js->set_viewport_resolver([this] { return last_render_options.viewport; });
             js->install();
         }
+    }
+
+    std::shared_ptr<CachingResourceLoader> script_resource_loader()
+    {
+        if (!js_resource_cache) {
+            js_resource_cache = std::make_shared<CachingResourceLoader>(loader, 4096);
+        }
+        return js_resource_cache;
     }
 
     std::vector<ScriptSource> collect_scripts()
@@ -789,12 +799,27 @@ struct Page::Impl {
         }
 
         if (!external_requests.empty()) {
-            std::vector<ResourceResponse> responses = loader->load_all(external_requests);
+            PerfScope trace(options.perf_trace, PerfPhase::ResourceLoad, "initial_script_load_all", external_requests.size());
+            trace.event().property = "script";
+            trace.event().url = current_url.empty() ? options.base_url : current_url;
+            std::vector<ResourceResponse> responses = script_resource_loader()->load_all(external_requests);
+            std::uint64_t loaded_bytes = 0;
             for (std::size_t i = 0; i < responses.size() && i < external_slots.size(); ++i) {
+                loaded_bytes += responses[i].body.size();
+                PerfEvent response_event{
+                    PerfPhase::ResourceLoad,
+                    "initial_script_response",
+                    0,
+                    responses[i].body.size(),
+                };
+                response_event.property = responses[i].from_cache ? "script:cache" : "script";
+                response_event.url = responses[i].url.empty() ? external_requests[i].url : responses[i].url;
+                emit_perf_trace(options.perf_trace, std::move(response_event));
                 ScriptSource& slot = scripts[external_slots[i]];
                 slot.filename = std::move(responses[i].url);
                 slot.code = std::move(responses[i].body);
             }
+            trace.set_count(loaded_bytes);
         }
 
         return scripts;
@@ -1670,7 +1695,14 @@ void Page::load_html(std::string_view html, std::string base_url)
 
 void Page::load_url(std::string_view url)
 {
+    const auto t0 = std::chrono::steady_clock::now();
     auto response = impl_->loader->load(ResourceRequest{std::string(url), ResourceKind::Document});
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    PerfEvent event{PerfPhase::ResourceLoad, "document_load", elapsed_us, response.body.size()};
+    event.property = "document";
+    event.url = response.url.empty() ? std::string(url) : response.url;
+    emit_perf_trace(impl_->options.perf_trace, std::move(event));
     load_html(response.body, response.url.empty() ? std::string(url) : response.url);
 }
 

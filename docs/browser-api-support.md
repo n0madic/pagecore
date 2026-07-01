@@ -42,7 +42,7 @@ positive.
 | `TextEncoder`, `TextDecoder` | UTF-8 encode/decode helpers. | `test_text_encoder_decoder_utf8_shims`, `pagecore_dom_shim_unit_tests` |
 | `btoa`, `atob` | Browser-compatible Latin-1 base64 behavior backed by the host C++ base64 bridge. | `test_browser_like_web_api_shims`, `pagecore_dom_shim_unit_tests` |
 | `crypto.getRandomValues`, `crypto.randomUUID` | Host CSPRNG-backed random values and UUID v4 formatting. | `test_message_channel_and_crypto_shims`, `test_web_shim_crypto_url_input` |
-| Basic timers | `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, deterministic idle draining, and logged callback errors. | `test_timers_and_events`, `test_timer_wait_budget`, `pagecore_dom_shim_unit_tests` |
+| Basic timers | `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, deterministic idle draining, and logged callback errors. A zero wait budget leaves timer callbacks pending while still draining microtasks. | `test_timers_and_events`, `test_timer_wait_budget`, `test_zero_wait_does_not_run_timer_callbacks`, `pagecore_dom_shim_unit_tests` |
 | `localStorage`, `sessionStorage`, `Storage` | In-memory storage for a page runtime. | `test_browser_like_web_api_shims` |
 | `document.cookie`, `document.domain` | Basic cookie string state and domain property behavior. | `test_document_domain_and_cookie_jar` |
 | `MessageChannel`, `MessagePort` | Basic in-process port messaging. | `test_message_channel_and_crypto_shims` |
