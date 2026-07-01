@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -49,6 +51,58 @@ void require(bool condition, const std::string& message)
         throw std::runtime_error(message);
     }
 }
+
+#if !defined(_WIN32)
+struct BoundTestServer {
+    int fd = -1;
+    int port = 0;
+};
+
+BoundTestServer bind_loopback_test_server(int backlog, std::string_view label)
+{
+    std::string last_error;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            last_error = std::strerror(errno);
+            continue;
+        }
+
+        int reuse = 1;
+        (void) ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        address.sin_len = sizeof(address);
+#endif
+
+        if (::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            last_error = std::strerror(errno);
+            ::close(server_fd);
+            continue;
+        }
+        if (::listen(server_fd, backlog) != 0) {
+            last_error = std::strerror(errno);
+            ::close(server_fd);
+            continue;
+        }
+
+        socklen_t address_len = sizeof(address);
+        if (::getsockname(server_fd, reinterpret_cast<sockaddr*>(&address), &address_len) != 0) {
+            last_error = std::strerror(errno);
+            ::close(server_fd);
+            continue;
+        }
+
+        return BoundTestServer{server_fd, ntohs(address.sin_port)};
+    }
+
+    throw std::runtime_error(std::string(label) + " test server should bind/listen on loopback: " + last_error);
+}
+#endif
 
 class RecordingResourceLoader final : public pagecore::ResourceLoader {
 public:
@@ -3458,24 +3512,9 @@ void test_resource_blocks_file_from_network_origin()
 #if !defined(_WIN32)
 void test_curl_loader_preserves_set_cookie_headers_across_redirects()
 {
-    const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    require(server_fd >= 0, "redirect cookie test server socket should open");
-
-    int reuse = 1;
-    (void) ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    require(::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
-            "redirect cookie test server should bind");
-    require(::listen(server_fd, 2) == 0, "redirect cookie test server should listen");
-
-    socklen_t address_len = sizeof(address);
-    require(::getsockname(server_fd, reinterpret_cast<sockaddr*>(&address), &address_len) == 0,
-            "redirect cookie test server should expose its port");
-    const int port = ntohs(address.sin_port);
+    const BoundTestServer bound = bind_loopback_test_server(2, "redirect cookie");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
 
     std::atomic<int> accepted{0};
     std::thread server([server_fd, port, &accepted] {
@@ -3559,24 +3598,9 @@ void test_curl_loader_preserves_set_cookie_headers_across_redirects()
 
 void test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths()
 {
-    const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    require(server_fd >= 0, "header capture test server socket should open");
-
-    int reuse = 1;
-    (void) ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    require(::bind(server_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
-            "header capture test server should bind");
-    require(::listen(server_fd, 6) == 0, "header capture test server should listen");
-
-    socklen_t address_len = sizeof(address);
-    require(::getsockname(server_fd, reinterpret_cast<sockaddr*>(&address), &address_len) == 0,
-            "header capture test server should expose its port");
-    const int port = ntohs(address.sin_port);
+    const BoundTestServer bound = bind_loopback_test_server(6, "header capture");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
 
     std::vector<std::string> received_requests;
     std::thread server([server_fd, &received_requests] {
@@ -6158,6 +6182,465 @@ void test_geometry_box_model_apis_reflect_real_layout()
         "box-model geometry APIs should reflect the real litehtml layout");
 }
 
+void test_layout_serialization_materializes_cached_absolute_width()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; background:#eee; }
+  .wrap { position:relative; width:944px; height:300px; }
+  .cell {
+    width:25%;
+    padding-left:9px;
+    padding-right:9px;
+    box-sizing:border-box;
+  }
+  .card {
+    width:100%;
+    height:100px;
+    background:#fff;
+    border:1px solid #000;
+    box-sizing:border-box;
+  }
+</style></head><body>
+  <div class="wrap" id="wrap"><div class="cell" id="cell"><div class="card" id="card">card</div></div></div>
+  <script>
+    const cell = document.getElementById('cell');
+    const measuredWidth = cell.offsetWidth;
+    document.body.setAttribute('data-cell-width-ok', measuredWidth > 200 ? 'true' : 'false');
+    cell.style.position = 'absolute';
+    cell.style.left = '0px';
+    cell.style.top = '0px';
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-cell-width-ok='true']").has_value(),
+        "test fixture should cache the absolute element's browser-facing geometry before render");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{1280, 720, 1.0f};
+    const auto& display = page.display_list(options);
+
+    const bool saw_wide_card_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        return fill
+            && fill->color.r == 255
+            && fill->color.g == 255
+            && fill->color.b == 255
+            && fill->rect.x >= 0.0f
+            && fill->rect.x < 20.0f
+            && fill->rect.y >= 0.0f
+            && fill->rect.y < 20.0f
+            && fill->rect.width > 200.0f
+            && fill->rect.height >= 90.0f;
+    });
+    require(
+        saw_wide_card_fill,
+        "render serialization should preserve cached used width for JS-positioned absolute elements");
+    const auto cell_html = page.outer_html("#cell");
+    require(cell_html.has_value(), "test fixture should keep the positioned cell in the DOM");
+    require(
+        cell_html->find("width:") == std::string::npos,
+        "transient layout width overrides must not mutate user-visible serialized HTML");
+}
+
+void test_layout_serialization_keeps_cached_absolute_width_after_unrelated_ancestor_mutation()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; background:#eee; }
+  .wrap { position:relative; width:944px; height:300px; }
+  .cell {
+    width:25%;
+    padding-left:9px;
+    padding-right:9px;
+    box-sizing:border-box;
+  }
+  .card {
+    width:100%;
+    height:100px;
+    background:#fff;
+    border:1px solid #000;
+    box-sizing:border-box;
+  }
+</style></head><body>
+  <div class="wrap" id="wrap"><div class="cell" id="cell"><div class="card" id="card">card</div></div></div>
+  <script>
+    const cell = document.getElementById('cell');
+    const measuredWidth = cell.offsetWidth;
+    document.body.setAttribute('data-cell-width-ok', measuredWidth > 200 ? 'true' : 'false');
+    cell.style.position = 'absolute';
+    cell.style.left = '0px';
+    cell.style.top = '0px';
+    document.body.setAttribute('data-positioned-width-ok', cell.offsetWidth > 200 ? 'true' : 'false');
+    for (let i = 0; i < 20; ++i) {
+      const marker = document.createElement('div');
+      marker.setAttribute('data-marker', String(i));
+      document.body.appendChild(marker);
+    }
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-cell-width-ok='true']").has_value(),
+        "test fixture should cache the absolute element's browser-facing geometry before the late mutation");
+    require(
+        page.outer_html("body[data-positioned-width-ok='true']").has_value(),
+        "test fixture should cache the positioned absolute element's browser-facing geometry before history overflow");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{1280, 720, 1.0f};
+    const auto& display = page.display_list(options);
+
+    const bool saw_wide_card_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        return fill
+            && fill->color.r == 255
+            && fill->color.g == 255
+            && fill->color.b == 255
+            && fill->rect.x >= 0.0f
+            && fill->rect.x < 20.0f
+            && fill->rect.y >= 0.0f
+            && fill->rect.y < 20.0f
+            && fill->rect.width > 200.0f
+            && fill->rect.height >= 90.0f;
+    });
+    require(
+        saw_wide_card_fill,
+        "render serialization should keep cached used width after unrelated ancestor DOM mutations with complete history");
+
+    const auto cell_html = page.outer_html("#cell");
+    require(cell_html.has_value(), "test fixture should keep the positioned cell in the DOM");
+    require(
+        cell_html->find("width:") == std::string::npos,
+        "transient layout width overrides must not leak into user-visible serialized HTML");
+}
+
+void test_layout_serialization_keeps_cached_absolute_width_after_unrelated_history_rollover()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; background:#eee; }
+  .wrap { position:relative; width:944px; height:300px; }
+  .cell {
+    width:25%;
+    padding-left:9px;
+    padding-right:9px;
+    box-sizing:border-box;
+  }
+  .card {
+    width:100%;
+    height:100px;
+    background:#fff;
+    border:1px solid #000;
+    box-sizing:border-box;
+  }
+</style></head><body>
+  <div class="wrap" id="wrap"><div class="cell" id="cell"><div class="card" id="card">card</div></div></div>
+  <script>
+    const cell = document.getElementById('cell');
+    const measuredWidth = cell.offsetWidth;
+    document.body.setAttribute('data-cell-width-ok', measuredWidth > 200 ? 'true' : 'false');
+    cell.style.position = 'absolute';
+    cell.style.left = '0px';
+    cell.style.top = '0px';
+    document.body.setAttribute('data-positioned-width-ok', cell.offsetWidth > 200 ? 'true' : 'false');
+    for (let i = 0; i < 160; ++i) {
+      const marker = document.createElement('div');
+      marker.setAttribute('data-marker', String(i));
+      document.body.appendChild(marker);
+    }
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-cell-width-ok='true']").has_value(),
+        "test fixture should cache the absolute element's browser-facing geometry before the late mutation");
+    require(
+        page.outer_html("body[data-positioned-width-ok='true']").has_value(),
+        "test fixture should cache the positioned absolute element's browser-facing geometry before history overflow");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{1280, 720, 1.0f};
+    const auto& display = page.display_list(options);
+
+    const bool saw_wide_card_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        return fill
+            && fill->color.r == 255
+            && fill->color.g == 255
+            && fill->color.b == 255
+            && fill->rect.x >= 0.0f
+            && fill->rect.x < 20.0f
+            && fill->rect.y >= 0.0f
+            && fill->rect.y < 20.0f
+            && fill->rect.width > 200.0f
+            && fill->rect.height >= 90.0f;
+    });
+    require(
+        saw_wide_card_fill,
+        "render serialization should keep cached used width after unrelated DOM churn rolls over history");
+
+    const auto cell_html = page.outer_html("#cell");
+    require(cell_html.has_value(), "test fixture should keep the positioned cell in the DOM");
+    require(
+        cell_html->find("width:") == std::string::npos,
+        "transient layout width overrides must not leak into user-visible serialized HTML");
+}
+
+void test_layout_serialization_materializes_absolute_percentage_width_without_js_measure()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; background:#eee; }
+  .wrap { position:relative; width:872px; height:260px; }
+  .cell {
+    width:25%;
+    padding-left:9px;
+    padding-right:9px;
+    box-sizing:border-box;
+  }
+  .card {
+    width:100%;
+    height:100px;
+    background:#fff;
+    border:1px solid #000;
+    box-sizing:border-box;
+  }
+</style></head><body>
+  <div class="wrap" id="wrap">
+    <div class="cell" id="cell" style="position:absolute;left:0px;top:0px">
+      <div class="card" id="card">card</div>
+    </div>
+  </div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{1280, 720, 1.0f};
+    const auto& display = page.display_list(options);
+
+    const bool saw_wide_card_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        return fill
+            && fill->color.r == 255
+            && fill->color.g == 255
+            && fill->color.b == 255
+            && fill->rect.x >= 0.0f
+            && fill->rect.x < 20.0f
+            && fill->rect.y >= 0.0f
+            && fill->rect.y < 20.0f
+            && fill->rect.width > 190.0f
+            && fill->rect.height >= 90.0f;
+    });
+    require(
+        saw_wide_card_fill,
+        "render serialization should materialize absolute percentage widths even without a prior JS geometry read");
+
+    const auto cell_html = page.outer_html("#cell");
+    require(cell_html.has_value(), "test fixture should keep the positioned cell in the DOM");
+    require(
+        cell_html->find("width:") == std::string::npos,
+        "transient layout width overrides must not leak into user-visible serialized HTML");
+}
+
+void test_layout_serialization_skips_stale_cached_width_after_history_rollover()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; }
+  #parent { position:relative; width:400px; height:60px; }
+  #child {
+    height:20px;
+    background:rgb(12, 34, 56);
+  }
+  #child.wide { width:200px; }
+  #child.narrow { width:100px; }
+</style></head><body>
+  <div id="parent"><div id="child" class="wide"></div></div>
+  <script>
+    const child = document.getElementById('child');
+    document.body.setAttribute('data-measured', String(child.offsetWidth));
+    child.className = 'narrow';
+    child.style.position = 'absolute';
+    child.style.left = '0px';
+    child.style.top = '0px';
+    for (let i = 0; i < 160; ++i) {
+      const marker = document.createElement('div');
+      marker.setAttribute('data-marker', String(i));
+      document.body.appendChild(marker);
+    }
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-measured='200']").has_value(),
+        "test fixture should cache the old wide geometry before class mutation");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{640, 240, 1.0f};
+    const auto& display = page.display_list(options);
+
+    bool saw_narrow_child_fill = false;
+    bool saw_stale_wide_child_fill = false;
+    for (const auto& command : display.commands) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        if (!fill
+            || fill->color.r != 12
+            || fill->color.g != 34
+            || fill->color.b != 56) {
+            continue;
+        }
+        saw_narrow_child_fill = saw_narrow_child_fill
+            || (fill->rect.width > 95.0f && fill->rect.width < 105.0f);
+        saw_stale_wide_child_fill = saw_stale_wide_child_fill
+            || (fill->rect.width > 195.0f && fill->rect.width < 205.0f);
+    }
+
+    require(saw_narrow_child_fill, "render should use the post-mutation narrow CSS width");
+    require(!saw_stale_wide_child_fill, "history rollover must not materialize stale cached width");
+}
+
+void test_layout_serialization_skips_stale_cached_absolute_width_after_parent_resize()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; }
+  #parent { position:relative; width:200px; height:40px; }
+  #child { width:50%; height:20px; background:rgb(12, 34, 56); }
+</style></head><body>
+  <div id="parent"><div id="child"></div></div>
+  <script>
+    const child = document.getElementById('child');
+    document.body.setAttribute('data-measured', String(child.offsetWidth));
+    document.getElementById('parent').style.width = '400px';
+    child.style.position = 'absolute';
+    child.style.left = '0px';
+    child.style.top = '0px';
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-measured='100']").has_value(),
+        "test fixture should cache the old child width before parent resize");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{640, 240, 1.0f};
+    const auto& display = page.display_list(options);
+
+    const bool saw_resized_child_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        return fill
+            && fill->color.r == 12
+            && fill->color.g == 34
+            && fill->color.b == 56
+            && fill->rect.width > 190.0f
+            && fill->rect.width < 210.0f;
+    });
+    require(
+        saw_resized_child_fill,
+        "render-time width materialization must ignore stale cached geometry after parent layout changes");
+}
+
+void test_geometry_absolute_percentage_width_uses_positioned_parent()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  .container { width: 1258px; margin: 0 auto; padding-left: 9px; padding-right: 9px; }
+  .row { margin-left: -9px; margin-right: -9px; }
+  .col-md-10, .col-sm-3 { position: relative; min-height: 1px; padding-left: 9px; padding-right: 9px; }
+  .col-md-10 { float: left; width: 83.33333333%; }
+  .col-md-offset-2 { margin-left: 16.66666667%; }
+  .col-sm-3 { float: left; width: 25%; }
+</style></head><body>
+  <div class="container">
+    <div class="row">
+      <div class="col-md-offset-2 col-md-10">
+        <div class="row">
+          <div class="col-md-10">
+            <div class="row">
+              <div id="flat" style="position:relative">
+                <div class="col-sm-3 cell" id="cell" style="position:absolute;left:0;top:0">x</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId flat = page.document().query_selector(root, "#flat");
+    const pagecore::NodeId cell = page.document().query_selector(root, "#cell");
+    require(flat != pagecore::kInvalidNodeId && cell != pagecore::kInvalidNodeId, "expected absolute percentage fixture");
+
+    const auto flat_geometry = page.element_geometry(flat);
+    const auto cell_geometry = page.element_geometry(cell);
+    require(flat_geometry && cell_geometry, "expected exact geometry for absolute percentage fixture");
+
+    const float expected_width = flat_geometry->padding_box.width * 0.25f;
+    require(
+        std::abs(cell_geometry->border_box.width - expected_width) < 0.5f,
+        "absolute percentage width should resolve against the positioned parent's padding box");
+}
+
+void test_geometry_reads_load_stylesheets_but_skip_images_until_render()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/styles.css",
+        "#box { width: 123px; height: 20px; background-image: url('/pixel.png'); }",
+        "text/css");
+    loader->add(
+        "https://example.test/pixel.png",
+        png_body(pagecore::Color{240, 20, 30, 255}),
+        "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head>
+  <link rel="stylesheet" href="/styles.css">
+</head><body>
+  <div id="box"></div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#box");
+    require(box != pagecore::kInvalidNodeId, "expected #box");
+
+    const auto geometry = page.element_geometry(box);
+    require(geometry && std::abs(geometry->border_box.width - 123.0f) < 0.5f,
+            "geometry reads should still apply external CSS");
+    require(
+        has_request_kind(*loader, "https://example.test/styles.css", pagecore::ResourceKind::Stylesheet),
+        "geometry reads should load external stylesheets");
+    require(
+        !has_request_kind(*loader, "https://example.test/pixel.png", pagecore::ResourceKind::Image),
+        "geometry reads should not load image bytes");
+
+    (void) page.display_list();
+    require(
+        has_request_kind(*loader, "https://example.test/pixel.png", pagecore::ResourceKind::Image),
+        "final display-list rendering should still load images");
+}
+
 // offsetTop/offsetLeft must be measured relative to offsetParent's
 // border-box, not the viewport — an absolutely positioned child inside a
 // position:relative container offsets exactly by its own top/left.
@@ -6682,7 +7165,7 @@ void test_element_geometry_reuses_cached_layout()
         "a DOM mutation must invalidate the cache and force a fresh layout() on next access");
 }
 
-void test_element_geometry_bounded_mode_returns_cached_geometry()
+void test_element_geometry_bounded_mode_rejects_cached_geometry_after_sizing_change()
 {
     auto factory = std::make_shared<SlowGeometryFactory>();
 
@@ -6704,8 +7187,139 @@ void test_element_geometry_bounded_mode_returns_cached_geometry()
 
     page.document().set_attribute(box, "style", "width:30px");
     auto third = page.element_geometry(box);
-    require(third && third->border_box.width == 20.0f, "bounded mode should return last known geometry");
-    require(*factory->layout_calls == 2, "bounded mode must not force another layout");
+    require(third && third->border_box.width == 30.0f, "inline width changes should use bounded inline-size geometry");
+    require(*factory->layout_calls == 2, "bounded inline-size geometry must not force another full layout");
+}
+
+void test_element_geometry_bounded_mode_invalidates_cached_descendant_after_ancestor_mutation()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='parent'><div id='x'></div></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId parent = page.document().query_selector(root, "#parent");
+    const pagecore::NodeId box = page.document().query_selector(root, "#x");
+    require(parent != pagecore::kInvalidNodeId && box != pagecore::kInvalidNodeId, "expected nested fixture");
+
+    auto first = page.element_geometry(box);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(box, "style", "display:block");
+    auto second = page.element_geometry(box);
+    require(second && second->border_box.width == 20.0f, "second geometry read should enter bounded mode with exact geometry");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    page.document().set_attribute(parent, "style", "width:40px");
+    auto third = page.element_geometry(box);
+    require(!third, "ancestor layout mutations must not reuse stale descendant geometry");
+    require(*factory->layout_calls == 2, "bounded ancestor-invalidated geometry should not force unbounded full layouts");
+}
+
+void test_element_geometry_bounded_mode_adjusts_cached_position_style()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected #x");
+
+    auto first = page.element_geometry(box);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(box, "style", "display:block");
+    auto second = page.element_geometry(box);
+    require(second && second->border_box.width == 20.0f, "second geometry read should be exact");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    page.document().set_attribute(box, "style", "position:absolute;left:25px;top:7px");
+    auto third = page.element_geometry(box);
+    require(third && third->border_box.x == 25.0f && third->border_box.y == 7.0f,
+            "bounded mode should adjust cached geometry for own inline left/top positioning");
+    require(*factory->layout_calls == 2, "own position-only style changes should not force another layout in bounded mode");
+}
+
+void test_element_geometry_bounded_mode_rejects_relative_position_cache()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected #x");
+
+    auto first = page.element_geometry(box);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(box, "style", "display:block");
+    auto second = page.element_geometry(box);
+    require(second && second->border_box.width == 20.0f, "second geometry read should be exact");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    page.document().set_attribute(box, "style", "position:relative;left:20px;top:4px");
+    auto third = page.element_geometry(box);
+    require(third && third->border_box.width == 30.0f,
+            "relative positioning should force exact geometry instead of double-applying offsets");
+    require(*factory->layout_calls == 3, "relative position changes must not use stale cached geometry");
+}
+
+void test_element_geometry_bounded_mode_snapshots_sibling_geometry_after_expensive_layout()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='a'></div><div id='b'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId a = page.document().query_selector(root, "#a");
+    const pagecore::NodeId b = page.document().query_selector(root, "#b");
+    require(a != pagecore::kInvalidNodeId && b != pagecore::kInvalidNodeId, "expected sibling geometry fixture");
+
+    auto first = page.element_geometry(a);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(a, "style", "display:block");
+    auto second = page.element_geometry(a);
+    require(second && second->border_box.width == 20.0f, "second geometry read should be exact and snapshot siblings");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    page.document().set_attribute(b, "style", "position:absolute;left:11px;top:3px");
+    auto third = page.element_geometry(b);
+    require(
+        third && third->border_box.width == 20.0f && third->border_box.x == 11.0f && third->border_box.y == 3.0f,
+        "bounded mode should reuse the expensive-layout geometry snapshot for sibling position-only reads");
+    require(*factory->layout_calls == 2, "snapshot-backed sibling geometry must not force another full layout");
+}
+
+void test_element_geometry_bounded_mode_caps_uncached_exact_layouts()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='a'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId body = page.document().body();
+    const pagecore::NodeId a = page.document().query_selector(root, "#a");
+    require(body != pagecore::kInvalidNodeId && a != pagecore::kInvalidNodeId, "expected uncached geometry cap fixture");
+
+    auto first = page.element_geometry(a);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(a, "style", "display:block");
+    auto second = page.element_geometry(a);
+    require(second && second->border_box.width == 20.0f, "second geometry read should still be exact");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    const pagecore::NodeId b = page.document().create_element("div");
+    const pagecore::NodeId appended = page.document().append_child(body, b);
+    auto third = page.element_geometry(appended);
+    require(!third, "uncached geometry after the bounded threshold should use bounded null geometry");
+    require(*factory->layout_calls == 2, "bounded uncached geometry must not force unbounded full layouts");
 }
 
 void test_element_geometry_bounded_mode_drops_disconnected_stale_geometry()
@@ -6733,7 +7347,7 @@ void test_element_geometry_bounded_mode_drops_disconnected_stale_geometry()
     require(*factory->layout_calls == 2, "disconnected geometry read must not force another layout");
 }
 
-void test_element_geometry_preflights_first_append_child_on_heavy_document()
+void test_element_geometry_after_heavy_append_child_runs_first_exact_layout()
 {
     std::vector<pagecore::PerfEvent> events;
     auto factory = std::make_shared<SlowGeometryFactory>();
@@ -6753,8 +7367,8 @@ void test_element_geometry_preflights_first_append_child_on_heavy_document()
     page.document().append_child(body, box);
 
     auto geometry = page.element_geometry(box);
-    require(!geometry, "preflight append-child geometry should use bounded null geometry");
-    require(*factory->layout_calls == 0, "preflight append-child geometry must not run layout");
+    require(geometry && geometry->border_box.width == 10.0f, "first append-child geometry read should be exact");
+    require(*factory->layout_calls == 1, "first append-child geometry read should run one layout");
 
     const bool saw_preflight_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
         return event.phase == pagecore::PerfPhase::Geometry
@@ -6762,10 +7376,10 @@ void test_element_geometry_preflights_first_append_child_on_heavy_document()
             && event.node_id == box
             && event.styled_document_cache_reason == "preflight_append_child:empty";
     });
-    require(saw_preflight_event, "perf trace should identify append-child preflight geometry reads");
+    require(!saw_preflight_event, "geometry reads must not preflight newly appended nodes to zero geometry");
 }
 
-void test_element_geometry_preflights_first_structural_mutation_on_heavy_document()
+void test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout()
 {
     std::vector<pagecore::PerfEvent> events;
     auto factory = std::make_shared<SlowGeometryFactory>();
@@ -6790,8 +7404,8 @@ void test_element_geometry_preflights_first_structural_mutation_on_heavy_documen
 
     page.document().remove_child(body, removed);
     auto geometry = page.element_geometry(target);
-    require(!geometry, "heavy structural preflight geometry should use bounded null geometry");
-    require(*factory->layout_calls == 0, "heavy structural preflight geometry must not run layout");
+    require(geometry && geometry->border_box.width == 10.0f, "first structural geometry read should be exact");
+    require(*factory->layout_calls == 1, "first structural geometry read should run one layout");
 
     const bool saw_preflight_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
         return event.phase == pagecore::PerfPhase::Geometry
@@ -6799,7 +7413,7 @@ void test_element_geometry_preflights_first_structural_mutation_on_heavy_documen
             && event.node_id == target
             && event.styled_document_cache_reason == "preflight_heavy_structural:empty";
     });
-    require(saw_preflight_event, "perf trace should identify heavy structural preflight geometry reads");
+    require(!saw_preflight_event, "geometry reads must not preflight heavy structural mutations to zero geometry");
 }
 
 void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
@@ -7047,6 +7661,14 @@ int main()
         test_layout_serialization_preserves_user_layout_id_attribute();
         test_visual_fixture_regression();
         test_geometry_box_model_apis_reflect_real_layout();
+        test_layout_serialization_materializes_cached_absolute_width();
+        test_layout_serialization_keeps_cached_absolute_width_after_unrelated_ancestor_mutation();
+        test_layout_serialization_keeps_cached_absolute_width_after_unrelated_history_rollover();
+        test_layout_serialization_materializes_absolute_percentage_width_without_js_measure();
+        test_layout_serialization_skips_stale_cached_width_after_history_rollover();
+        test_layout_serialization_skips_stale_cached_absolute_width_after_parent_resize();
+        test_geometry_absolute_percentage_width_uses_positioned_parent();
+        test_geometry_reads_load_stylesheets_but_skip_images_until_render();
         test_geometry_offset_top_left_relative_to_offset_parent();
         test_geometry_offset_parent_finds_nearest_positioned_ancestor();
         test_geometry_offset_parent_cache_invalidates_after_style_mutation();
@@ -7056,10 +7678,15 @@ int main()
         test_perf_trace_records_document_and_initial_script_resources();
         test_computed_style_property_uses_layout_mutation_version_cache();
         test_element_geometry_reuses_cached_layout();
-        test_element_geometry_bounded_mode_returns_cached_geometry();
+        test_element_geometry_bounded_mode_rejects_cached_geometry_after_sizing_change();
+        test_element_geometry_bounded_mode_invalidates_cached_descendant_after_ancestor_mutation();
+        test_element_geometry_bounded_mode_adjusts_cached_position_style();
+        test_element_geometry_bounded_mode_rejects_relative_position_cache();
+        test_element_geometry_bounded_mode_snapshots_sibling_geometry_after_expensive_layout();
+        test_element_geometry_bounded_mode_caps_uncached_exact_layouts();
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();
-        test_element_geometry_preflights_first_append_child_on_heavy_document();
-        test_element_geometry_preflights_first_structural_mutation_on_heavy_document();
+        test_element_geometry_after_heavy_append_child_runs_first_exact_layout();
+        test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
         test_computed_style_property_preflights_first_append_child_on_heavy_document();
 #endif

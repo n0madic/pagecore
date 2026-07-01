@@ -21,6 +21,17 @@ public:
         std::string value;
     };
 
+    struct LayoutStyleOverride {
+        NodeId node = kInvalidNodeId;
+        std::string extra_style;
+    };
+
+    struct LayoutMutationRecord {
+        std::uint64_t version = 0;
+        std::string reason;
+        NodeId node = kInvalidNodeId;
+    };
+
     DomDocument();
     ~DomDocument();
 
@@ -55,6 +66,9 @@ public:
     std::uint64_t layout_mutation_version() const;
     std::string last_layout_mutation_reason() const;
     NodeId last_layout_mutation_node() const;
+    std::vector<LayoutMutationRecord> layout_mutations_since(std::uint64_t version) const;
+    std::uint64_t cached_width_self_blocking_layout_mutation_version(NodeId id) const;
+    std::uint64_t cached_width_ancestor_blocking_layout_mutation_version(NodeId id) const;
     void set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard = false);
     // Monotonic counter bumped only when a node id is invalidated (forgotten via
     // innerHTML replacement) or the document is reparsed. Wrapper layers use it
@@ -81,7 +95,9 @@ public:
     // When omit_js_disabled_content is true, the layout serialization also
     // skips <noscript> subtrees and direct text children of <head>, matching the
     // rendered DOM that JavaScript-enabled pages should expose to litehtml.
-    std::string serialize_html_for_layout(bool omit_js_disabled_content = false) const;
+    std::string serialize_html_for_layout(
+        bool omit_js_disabled_content = false,
+        const std::vector<LayoutStyleOverride>& style_overrides = {}) const;
 
     NodeId append_child(NodeId parent, NodeId child);
     NodeId insert_before(NodeId parent, NodeId child, NodeId reference_child);

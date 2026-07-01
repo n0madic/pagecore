@@ -106,6 +106,18 @@ bool is_always_layout_attribute(std::string_view lower)
         || lower == "open";
 }
 
+bool mutation_blocks_cached_width_for_self(std::string_view reason)
+{
+    return reason != "set_attribute:style";
+}
+
+bool mutation_blocks_cached_width_for_descendants(std::string_view reason)
+{
+    return reason != "append_child"
+        && reason != "remove_child"
+        && reason != "set_inner_html";
+}
+
 // Iterative pre-order traversal — recursion here would overflow the native
 // stack on deeply nested DOM trees (attacker-controlled via HTML or JS).
 void append_descendant_text(lxb_dom_node_t* node, std::string& out)
@@ -151,8 +163,9 @@ void collect_subtree(lxb_dom_node_t* node, std::vector<lxb_dom_node_t*>& out)
 
 constexpr std::string_view kLayoutIdAttribute = "data-pc-sid";
 
-struct LayoutIdRestore {
+struct TransientAttributeRestore {
     lxb_dom_element_t* element = nullptr;
+    std::string name;
     bool had_attribute = false;
     std::string value;
 };
@@ -160,34 +173,44 @@ struct LayoutIdRestore {
 // Bypasses DomDocument::set_attribute/remove_attribute, which bump
 // mutation_version: layout tagging is an internal serialization detail and must
 // stay invisible to layout-cache keys.
-void set_layout_id_attribute(lxb_dom_element_t* element, NodeId id, std::vector<LayoutIdRestore>& restore)
+void set_transient_attribute(
+    lxb_dom_element_t* element,
+    std::string_view name,
+    std::string_view value,
+    std::vector<TransientAttributeRestore>& restore)
 {
     size_t old_len = 0;
     const auto* old_value = lxb_dom_element_get_attribute(
         element,
-        reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
-        kLayoutIdAttribute.size(),
+        reinterpret_cast<const lxb_char_t*>(name.data()),
+        name.size(),
         &old_len);
 
-    restore.push_back(LayoutIdRestore{
+    restore.push_back(TransientAttributeRestore{
         element,
+        std::string(name),
         old_value != nullptr,
         old_value == nullptr ? std::string() : to_string(old_value, old_len),
     });
 
-    const std::string value = std::to_string(id);
     auto* attr = lxb_dom_element_set_attribute(
         element,
-        reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
-        kLayoutIdAttribute.size(),
+        reinterpret_cast<const lxb_char_t*>(name.data()),
+        name.size(),
         reinterpret_cast<const lxb_char_t*>(value.data()),
         value.size());
     if (attr == nullptr) {
-        throw std::runtime_error("failed to set transient layout id attribute");
+        throw std::runtime_error("failed to set transient layout attribute");
     }
 }
 
-void restore_layout_id_attributes(std::vector<LayoutIdRestore>& restore)
+void set_layout_id_attribute(lxb_dom_element_t* element, NodeId id, std::vector<TransientAttributeRestore>& restore)
+{
+    const std::string value = std::to_string(id);
+    set_transient_attribute(element, kLayoutIdAttribute, value, restore);
+}
+
+void restore_transient_attributes(std::vector<TransientAttributeRestore>& restore)
 {
     for (auto it = restore.rbegin(); it != restore.rend(); ++it) {
         if (it->element == nullptr) {
@@ -196,18 +219,28 @@ void restore_layout_id_attributes(std::vector<LayoutIdRestore>& restore)
         if (it->had_attribute) {
             lxb_dom_element_set_attribute(
                 it->element,
-                reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
-                kLayoutIdAttribute.size(),
+                reinterpret_cast<const lxb_char_t*>(it->name.data()),
+                it->name.size(),
                 reinterpret_cast<const lxb_char_t*>(it->value.data()),
                 it->value.size());
         } else {
             lxb_dom_element_remove_attribute(
                 it->element,
-                reinterpret_cast<const lxb_char_t*>(kLayoutIdAttribute.data()),
-                kLayoutIdAttribute.size());
+                reinterpret_cast<const lxb_char_t*>(it->name.data()),
+                it->name.size());
         }
     }
     restore.clear();
+}
+
+std::string append_css_declarations(std::string_view style, std::string_view extra_style)
+{
+    std::string out(style);
+    if (!out.empty() && out.back() != ';') {
+        out.push_back(';');
+    }
+    out.append(extra_style);
+    return out;
 }
 
 bool is_document_like_node(lxb_dom_node_t* node)
@@ -338,6 +371,11 @@ DomDocument::Impl::Impl()
         throw std::runtime_error("failed to create Lexbor document");
     }
     lxb_html_document_scripting_set(document, true);
+    layout_mutation_history.push_back(DomDocument::LayoutMutationRecord{
+        layout_mutation_version,
+        last_layout_mutation_reason,
+        last_layout_mutation_node,
+    });
 }
 
 DomDocument::Impl::~Impl()
@@ -476,6 +514,8 @@ void DomDocument::Impl::forget_node(lxb_dom_node_t* node)
 
     const auto id = static_cast<NodeId>(reinterpret_cast<uintptr_t>(node->user));
     id_to_node.erase(id);
+    cached_width_self_blockers.erase(id);
+    cached_width_ancestor_blockers.erase(id);
     node->user = nullptr;
     // A previously tracked id just became invalid; signal the wrapper layer.
     ++forget_version;
@@ -527,6 +567,22 @@ void DomDocument::Impl::mark_mutated(bool affects_layout, std::string_view layou
             last_layout_mutation_reason = "unknown";
         }
         last_layout_mutation_node = layout_node;
+        layout_mutation_history.push_back(DomDocument::LayoutMutationRecord{
+            layout_mutation_version,
+            last_layout_mutation_reason,
+            last_layout_mutation_node,
+        });
+        if (layout_node != kInvalidNodeId) {
+            if (mutation_blocks_cached_width_for_self(last_layout_mutation_reason)) {
+                cached_width_self_blockers[layout_node] = layout_mutation_version;
+            }
+            if (mutation_blocks_cached_width_for_descendants(last_layout_mutation_reason)) {
+                cached_width_ancestor_blockers[layout_node] = layout_mutation_version;
+            }
+        }
+        if (layout_mutation_history.size() > kMaxLayoutMutationHistory) {
+            layout_mutation_history.erase(layout_mutation_history.begin());
+        }
     }
 }
 
@@ -600,6 +656,12 @@ void DomDocument::parse(std::string_view html)
     impl_->layout_mutation_version = carried_layout_mutation_version + 1;
     impl_->last_layout_mutation_reason = "parse";
     impl_->last_layout_mutation_node = kInvalidNodeId;
+    impl_->layout_mutation_history.clear();
+    impl_->layout_mutation_history.push_back(DomDocument::LayoutMutationRecord{
+        impl_->layout_mutation_version,
+        impl_->last_layout_mutation_reason,
+        impl_->last_layout_mutation_node,
+    });
     impl_->forget_version = carried_forget_version + 1;
 
     const auto status = lxb_html_document_parse(
@@ -783,6 +845,38 @@ std::string DomDocument::last_layout_mutation_reason() const
 NodeId DomDocument::last_layout_mutation_node() const
 {
     return impl_ == nullptr ? kInvalidNodeId : impl_->last_layout_mutation_node;
+}
+
+std::vector<DomDocument::LayoutMutationRecord> DomDocument::layout_mutations_since(std::uint64_t version) const
+{
+    std::vector<LayoutMutationRecord> records;
+    if (impl_ == nullptr) {
+        return records;
+    }
+    for (const auto& record : impl_->layout_mutation_history) {
+        if (record.version > version) {
+            records.push_back(record);
+        }
+    }
+    return records;
+}
+
+std::uint64_t DomDocument::cached_width_self_blocking_layout_mutation_version(NodeId id) const
+{
+    if (impl_ == nullptr) {
+        return 0;
+    }
+    const auto found = impl_->cached_width_self_blockers.find(id);
+    return found == impl_->cached_width_self_blockers.end() ? 0 : found->second;
+}
+
+std::uint64_t DomDocument::cached_width_ancestor_blocking_layout_mutation_version(NodeId id) const
+{
+    if (impl_ == nullptr) {
+        return 0;
+    }
+    const auto found = impl_->cached_width_ancestor_blockers.find(id);
+    return found == impl_->cached_width_ancestor_blockers.end() ? 0 : found->second;
 }
 
 void DomDocument::set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard)
@@ -1002,13 +1096,15 @@ std::string DomDocument::serialize_html() const
     return out;
 }
 
-std::string DomDocument::serialize_html_for_layout(bool omit_js_disabled_content) const
+std::string DomDocument::serialize_html_for_layout(
+    bool omit_js_disabled_content,
+    const std::vector<LayoutStyleOverride>& style_overrides) const
 {
     std::vector<lxb_dom_node_t*> nodes;
     collect_subtree(lxb_dom_interface_node(impl_->document), nodes);
 
     std::string html;
-    std::vector<LayoutIdRestore> layout_id_restore;
+    std::vector<TransientAttributeRestore> transient_restore;
     std::vector<lxb_dom_node_t*> detach_nodes;
     std::vector<DetachedLayoutNode> detached;
 
@@ -1017,7 +1113,29 @@ std::string DomDocument::serialize_html_for_layout(bool omit_js_disabled_content
             if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
                 continue;
             }
-            set_layout_id_attribute(lxb_dom_interface_element(node), impl_->id_for(node), layout_id_restore);
+            set_layout_id_attribute(lxb_dom_interface_element(node), impl_->id_for(node), transient_restore);
+        }
+
+        for (const auto& override : style_overrides) {
+            const auto found = impl_->id_to_node.find(override.node);
+            if (found == impl_->id_to_node.end()
+                || found->second == nullptr
+                || found->second->type != LXB_DOM_NODE_TYPE_ELEMENT
+                || override.extra_style.empty()) {
+                continue;
+            }
+
+            auto* element = lxb_dom_interface_element(found->second);
+            size_t old_len = 0;
+            const auto* old_style = lxb_dom_element_get_attribute(
+                element,
+                reinterpret_cast<const lxb_char_t*>("style"),
+                5,
+                &old_len);
+            const std::string merged_style = append_css_declarations(
+                old_style == nullptr ? std::string_view() : std::string_view(reinterpret_cast<const char*>(old_style), old_len),
+                override.extra_style);
+            set_transient_attribute(element, "style", merged_style, transient_restore);
         }
 
         collect_layout_detach_nodes(
@@ -1035,12 +1153,12 @@ std::string DomDocument::serialize_html_for_layout(bool omit_js_disabled_content
         }
     } catch (...) {
         restore_detached_layout_nodes(detached);
-        restore_layout_id_attributes(layout_id_restore);
+        restore_transient_attributes(transient_restore);
         throw;
     }
 
     restore_detached_layout_nodes(detached);
-    restore_layout_id_attributes(layout_id_restore);
+    restore_transient_attributes(transient_restore);
 
     return html;
 }

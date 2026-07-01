@@ -604,6 +604,36 @@ if(PAGECORE_BUILD_TESTS)
                 --viewport 40x10
                 --full-page
         )
+        add_test(
+            NAME pagecore_cli_full_page_viewport_dependent_height
+            COMMAND
+                $<TARGET_FILE:pagecore_cli>
+                --html "<html><body style='margin:0'><div style='height:100vh;background:#f00'></div><div style='height:300px;background:#0f0'></div></body></html>"
+                --dump-display-list -
+                --viewport 40x10
+                --full-page
+        )
+        set_tests_properties(
+            pagecore_cli_full_page_viewport_dependent_height
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "\"viewport\":\\{\"width\":40,\"height\":310"
+        )
+        add_test(
+            NAME pagecore_cli_full_page_png_perf_trace_raster
+            COMMAND
+                $<TARGET_FILE:pagecore_cli>
+                --html "<html><body style='margin:0'><div style='width:40px;height:300px;background:#f00'></div></body></html>"
+                --format png
+                --output "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_full_page_trace_test.png"
+                --viewport 40x10
+                --full-page
+                --perf-trace -
+        )
+        set_tests_properties(
+            pagecore_cli_full_page_png_perf_trace_raster
+            PROPERTIES
+                PASS_REGULAR_EXPRESSION "\"phase\":\"raster\""
+        )
 
         # Negative argument-parsing cases must exit non-zero with a clear error.
         add_test(

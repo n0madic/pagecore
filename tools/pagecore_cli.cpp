@@ -1,5 +1,6 @@
 #include "pagecore/page.hpp"
 #include "pagecore/image_io.hpp"
+#include "pagecore/perf.hpp"
 #include "pagecore/render.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -73,6 +75,33 @@ void usage(const char* argv0)
 // small enough that width*height*4 cannot exhaust memory by accident.
 constexpr int kMaxViewportDimension = 16384;
 constexpr float kMaxScale = 8.0f;
+
+void validate_full_page_height(int content_height)
+{
+    if (content_height > kMaxViewportDimension) {
+        throw std::runtime_error(
+            "--full-page content height (" + std::to_string(content_height)
+            + ") exceeds max viewport dimension (" + std::to_string(kMaxViewportDimension) + ")");
+    }
+}
+
+pagecore::RenderedImage render_display_list_traced(
+    pagecore::RasterBackend& backend,
+    const pagecore::DisplayList& display,
+    const pagecore::PerfTraceCallback& perf_trace)
+{
+    const auto start = std::chrono::steady_clock::now();
+    pagecore::RenderedImage image = backend.render(display);
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    pagecore::emit_perf_trace(
+        perf_trace,
+        pagecore::PerfPhase::Raster,
+        "raster",
+        elapsed_us,
+        display.commands.size());
+    return image;
+}
 
 int parse_int_in_range(const std::string& value, const std::string& name, int min_value, int max_value)
 {
@@ -413,22 +442,20 @@ int main(int argc, char** argv)
             eval_result = page.eval(eval);
         }
 
-        if (full_page) {
-            // The raster/PDF backends size their canvas strictly off
-            // render_options.viewport (not content_width/content_height), so
-            // expanding the viewport to the real content height up front
-            // makes every later display_list()/render()/write_pdf() call
-            // (and the --dump-display-list path below) capture the whole
-            // page in a single, cached layout pass instead of cropping it
-            // to the originally requested viewport height.
-            const int content_height = page.display_list(render_options).content_height;
-            if (content_height > kMaxViewportDimension) {
-                throw std::runtime_error(
-                    "--full-page content height (" + std::to_string(content_height)
-                    + ") exceeds max viewport dimension (" + std::to_string(kMaxViewportDimension) + ")");
+        std::optional<pagecore::DisplayList> full_page_display_list;
+        auto full_page_display = [&]() -> const pagecore::DisplayList& {
+            if (!full_page_display_list) {
+                // Browser full-page screenshots keep the layout viewport fixed
+                // and only expand the capture surface. Re-layouting with a
+                // page-tall viewport changes vh/%, fixed-position, and
+                // geometry-dependent JS results.
+                pagecore::DisplayList display = page.display_list(render_options);
+                validate_full_page_height(display.content_height);
+                display.viewport.height = std::max(display.viewport.height, std::max(1, display.content_height));
+                full_page_display_list = std::move(display);
             }
-            render_options.viewport.height = std::max(1, content_height);
-        }
+            return *full_page_display_list;
+        };
 
         if (output_format == OutputFormat::Html) {
             if (!output.empty()) {
@@ -446,14 +473,23 @@ int main(int argc, char** argv)
             }
 
             if (output_format == OutputFormat::Png) {
-                pagecore::write_png_rgba(page.render(render_options), output, render_options.perf_trace);
+                if (full_page) {
+                    auto backend = pagecore::create_default_raster_backend();
+                    pagecore::write_png_rgba(
+                        render_display_list_traced(*backend, full_page_display(), render_options.perf_trace),
+                        output,
+                        render_options.perf_trace);
+                } else {
+                    pagecore::write_png_rgba(page.render(render_options), output, render_options.perf_trace);
+                }
             } else if (output_format == OutputFormat::Pdf) {
-                pagecore::write_pdf(page.display_list(render_options), output);
+                pagecore::write_pdf(full_page ? full_page_display() : page.display_list(render_options), output);
             }
         }
 
         if (!display_list_dump.empty()) {
-            const std::string dump = pagecore::display_list_to_json(page.display_list(render_options));
+            const pagecore::DisplayList& display = full_page ? full_page_display() : page.display_list(render_options);
+            const std::string dump = pagecore::display_list_to_json(display);
             if (display_list_dump == "-") {
                 std::cout << dump << "\n";
             } else {

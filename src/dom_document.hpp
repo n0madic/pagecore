@@ -26,6 +26,10 @@ struct DomDocument::Impl {
     std::uint64_t layout_mutation_version = 1;
     std::string last_layout_mutation_reason = "initial";
     NodeId last_layout_mutation_node = kInvalidNodeId;
+    std::vector<DomDocument::LayoutMutationRecord> layout_mutation_history;
+    std::unordered_map<NodeId, std::uint64_t> cached_width_self_blockers;
+    std::unordered_map<NodeId, std::uint64_t> cached_width_ancestor_blockers;
+    static constexpr std::size_t kMaxLayoutMutationHistory = 128;
     std::unordered_set<std::string> layout_sensitive_attributes;
     bool layout_sensitive_attribute_wildcard = false;
     // Bumped only when a tracked node id is invalidated (forgotten) or the

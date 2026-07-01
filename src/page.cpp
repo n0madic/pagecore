@@ -11,8 +11,10 @@
 #include <memory>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <chrono>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -79,6 +81,11 @@ bool is_module_script_type(const std::optional<std::string>& type)
     return normalized_script_type(*type) == "module";
 }
 
+enum class LayoutResourceMode {
+    Full,
+    StylesheetsOnly,
+};
+
 // Identifies the inputs that fully determine a built styled document (the
 // litehtml document backing both the rendered DisplayList and
 // getComputedStyle()). If these match a previous build, the cached engine is
@@ -92,6 +99,8 @@ struct StyledDocumentCacheKey {
     int viewport_height = 0;
     float device_scale_factor = 0.0f;
     bool load_external_resources = false;
+    bool materialize_cached_geometry_widths = false;
+    LayoutResourceMode resource_mode = LayoutResourceMode::Full;
     std::string base_url;
 
     bool operator==(const StyledDocumentCacheKey&) const = default;
@@ -116,6 +125,11 @@ struct PendingFontRequest {
 
 struct GeometryCacheEntry {
     std::optional<ElementGeometry> geometry;
+    std::uint64_t layout_mutation_version = 0;
+    std::vector<std::pair<NodeId, std::optional<std::string>>> style_fingerprint;
+    std::optional<float> render_width;
+    std::uint64_t render_width_layout_mutation_version = 0;
+    std::vector<std::pair<NodeId, std::optional<std::string>>> render_width_style_fingerprint;
 };
 
 std::string ascii_lower(std::string_view value)
@@ -244,6 +258,58 @@ std::optional<std::string> inline_style_property_value(std::string_view style, s
         }
     }
 
+    return std::nullopt;
+}
+
+std::optional<float> parse_css_px_length(std::string_view value)
+{
+    value = trim_ascii(value);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    if (ends_with_important(value)) {
+        value = trim_ascii(value.substr(0, value.size() - 10));
+    }
+
+    std::string text(value);
+    char* end = nullptr;
+    const float number = std::strtof(text.c_str(), &end);
+    if (end == text.c_str()) {
+        return std::nullopt;
+    }
+
+    const std::string_view unit = trim_ascii(std::string_view(
+        end,
+        static_cast<std::size_t>((text.c_str() + text.size()) - end)));
+    if (unit == "px" || (number == 0.0f && unit.empty())) {
+        return number;
+    }
+    return std::nullopt;
+}
+
+std::optional<float> parse_css_percentage(std::string_view value)
+{
+    value = trim_ascii(value);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    if (ends_with_important(value)) {
+        value = trim_ascii(value.substr(0, value.size() - 10));
+    }
+
+    std::string text(value);
+    char* end = nullptr;
+    const float number = std::strtof(text.c_str(), &end);
+    if (end == text.c_str()) {
+        return std::nullopt;
+    }
+
+    const std::string_view unit = trim_ascii(std::string_view(
+        end,
+        static_cast<std::size_t>((text.c_str() + text.size()) - end)));
+    if (unit == "%") {
+        return number;
+    }
     return std::nullopt;
 }
 
@@ -503,6 +569,74 @@ private:
     std::size_t load_count_ = 0;
     std::uint64_t loaded_bytes_ = 0;
     long long elapsed_us_ = 0;
+};
+
+class StylesheetOnlyResourceLoader final : public ResourceLoader {
+public:
+    using ResourceLoader::load;
+
+    StylesheetOnlyResourceLoader(
+        std::shared_ptr<ResourceLoader> inner,
+        PerfTraceCallback perf_trace)
+        : inner_(std::move(inner))
+        , perf_trace_(std::move(perf_trace))
+    {
+        if (!inner_) {
+            throw std::runtime_error("stylesheet-only resource loader requires an inner loader");
+        }
+    }
+
+    ResourceResponse load(const ResourceRequest& request) override
+    {
+        if (request.kind != ResourceKind::Stylesheet) {
+            return skipped_response(request);
+        }
+        return inner_->load(request);
+    }
+
+    std::vector<ResourceResponse> load_all(
+        const std::vector<ResourceRequest>& requests,
+        BatchErrorMode mode = BatchErrorMode::FailFast) override
+    {
+        std::vector<ResourceResponse> responses(requests.size());
+        std::vector<ResourceRequest> stylesheet_requests;
+        std::vector<std::size_t> stylesheet_indices;
+        stylesheet_requests.reserve(requests.size());
+        stylesheet_indices.reserve(requests.size());
+
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            if (requests[i].kind != ResourceKind::Stylesheet) {
+                responses[i] = skipped_response(requests[i]);
+                continue;
+            }
+            stylesheet_indices.push_back(i);
+            stylesheet_requests.push_back(requests[i]);
+        }
+
+        if (stylesheet_requests.empty()) {
+            return responses;
+        }
+
+        const auto fetched = inner_->load_all(stylesheet_requests, mode);
+        for (std::size_t i = 0; i < fetched.size() && i < stylesheet_indices.size(); ++i) {
+            responses[stylesheet_indices[i]] = fetched[i];
+        }
+        return responses;
+    }
+
+private:
+    ResourceResponse skipped_response(const ResourceRequest& request) const
+    {
+        PerfEvent event{PerfPhase::ResourceLoad, "render_resource_skipped", 0, 0};
+        event.property = resource_kind_name(request.kind);
+        event.url = request.url;
+        event.reason = "geometry:stylesheets_only";
+        emit_perf_trace(perf_trace_, std::move(event));
+        return ResourceResponse{request.url, {}, 0, {}, request.kind, false};
+    }
+
+    std::shared_ptr<ResourceLoader> inner_;
+    PerfTraceCallback perf_trace_;
 };
 
 class CookieAwareResourceLoader final : public ResourceLoader {
@@ -865,10 +999,11 @@ struct Page::Impl {
     // a full layout. On a large DOM that's seconds per read; a script that reads
     // geometry in a tight read-modify-write loop (e.g. jQuery init) can then trip
     // the per-script execution deadline. Once forced geometry layouts consume a
-    // small budget, later post-mutation geometry reads return the last exact
-    // value seen for that NodeId (or nullopt/0 if none exists) until a render or
-    // another non-geometry caller produces a fresh current layout. Cheap pages
-    // keep exact synchronous geometry.
+    // small budget, later post-mutation geometry reads reuse the last exact
+    // value seen for that NodeId. An uncached connected element still gets one
+    // exact layout read, because JS layout libraries treat zero geometry as a
+    // real measurement and can permanently commit bad inline layout state.
+    // Cheap pages keep exact synchronous geometry.
     bool styled_document_expensive = false;
     static constexpr long long kExpensiveStyledDocumentUs = 250'000; // 0.25s
     bool geometry_bounded_mode = false;
@@ -1089,10 +1224,64 @@ struct Page::Impl {
         return render_options.perf_trace ? render_options.perf_trace : options.perf_trace;
     }
 
-    std::string serialized_html_for_render(const RenderOptions& render_options) const
+    std::vector<DomDocument::LayoutStyleOverride> layout_style_overrides_for_render()
+    {
+        std::vector<DomDocument::LayoutStyleOverride> overrides;
+        sync_geometry_cache_for_forget_version();
+        for (const auto& [node, entry] : last_known_geometry) {
+            if (!entry.render_width) {
+                continue;
+            }
+            if (!document.is_connected(node)) {
+                continue;
+            }
+            if (!can_materialize_cached_width_for_render(node, entry)) {
+                continue;
+            }
+            const float width = *entry.render_width;
+            if (width < 1.0f) {
+                continue;
+            }
+            const auto style = document.get_attribute(node, "style");
+            if (!style) {
+                continue;
+            }
+            const auto inline_position = inline_style_property_value(*style, "position");
+            if (!inline_position || ascii_lower(trim_ascii(*inline_position)) != "absolute") {
+                continue;
+            }
+            if (inline_style_property_value(*style, "width")) {
+                continue;
+            }
+
+            const int width_px = std::max(1, static_cast<int>(width + 0.5f));
+            overrides.push_back(DomDocument::LayoutStyleOverride{
+                node,
+                "width:" + std::to_string(width_px) + "px;",
+            });
+        }
+        return overrides;
+    }
+
+    bool has_layout_style_overrides_for_render()
+    {
+        return !layout_style_overrides_for_render().empty();
+    }
+
+    std::string serialized_html_for_layout(
+        const RenderOptions& render_options,
+        bool materialize_cached_geometry_widths)
     {
         PerfScope trace(perf_trace_for(render_options), PerfPhase::SerializeHtml, "serialize_html_for_layout");
-        std::string html = document.serialize_html_for_layout(options.enable_js);
+        auto style_overrides = materialize_cached_geometry_widths
+            ? layout_style_overrides_for_render()
+            : std::vector<DomDocument::LayoutStyleOverride>{};
+        trace.event().property = "materialize:" + std::to_string(materialize_cached_geometry_widths ? 1 : 0)
+            + ";style_overrides:" + std::to_string(style_overrides.size())
+            + ";geometry_cache:" + std::to_string(last_known_geometry.size());
+        std::string html = document.serialize_html_for_layout(
+            options.enable_js,
+            style_overrides);
         trace.set_count(html.size());
         return html;
     }
@@ -1235,8 +1424,12 @@ struct Page::Impl {
 
     std::shared_ptr<const FontEnvironment> prepare_font_environment(
         const RenderOptions& render_options,
-        const std::shared_ptr<ResourceLoader>& render_loader)
+        const std::shared_ptr<ResourceLoader>& render_loader,
+        LayoutResourceMode resource_mode)
     {
+        if (resource_mode != LayoutResourceMode::Full) {
+            return nullptr;
+        }
         if (!render_options.load_external_resources || !render_loader) {
             return nullptr;
         }
@@ -1319,7 +1512,8 @@ struct Page::Impl {
 #else
     std::shared_ptr<const FontEnvironment> prepare_font_environment(
         const RenderOptions&,
-        const std::shared_ptr<ResourceLoader>&)
+        const std::shared_ptr<ResourceLoader>&,
+        LayoutResourceMode)
     {
         return nullptr;
     }
@@ -1369,7 +1563,9 @@ struct Page::Impl {
     // them from the network every time; a persistent one fetches each resource
     // once. It is reset whenever the loader or document identity changes (see
     // invalidate_display_list_cache).
-    std::shared_ptr<ResourceLoader> prepare_render_loader(const RenderOptions& render_options)
+    std::shared_ptr<ResourceLoader> prepare_render_loader(
+        const RenderOptions& render_options,
+        LayoutResourceMode resource_mode)
     {
         CssAttributeSelectorUsage attribute_usage;
         collect_inline_style_attribute_selectors(attribute_usage);
@@ -1388,6 +1584,11 @@ struct Page::Impl {
             &cookie_jar,
             render_base_url(render_options),
             CookieCredentials::SameOrigin);
+        if (resource_mode == LayoutResourceMode::StylesheetsOnly) {
+            render_loader = std::make_shared<StylesheetOnlyResourceLoader>(
+                render_loader,
+                perf_trace_for(render_options));
+        }
         if (render_options.max_external_resource_loads
             || render_options.max_external_resource_bytes
             || render_options.max_external_resource_time) {
@@ -1404,6 +1605,14 @@ struct Page::Impl {
         {
             PerfScope trace(perf_trace_for(render_options), PerfPhase::SubresourceScan, "collect_dom_subresources");
             collect_dom_subresources(effective_base, wave1, seen);
+            if (resource_mode == LayoutResourceMode::StylesheetsOnly) {
+                wave1.erase(
+                    std::remove_if(
+                        wave1.begin(),
+                        wave1.end(),
+                        [](const ResourceRequest& request) { return request.kind != ResourceKind::Stylesheet; }),
+                    wave1.end());
+            }
             trace.set_count(wave1.size());
         }
         if (wave1.empty()) {
@@ -1415,7 +1624,7 @@ struct Page::Impl {
             // Lenient: a failed sub-resource must not abort the render; litehtml
             // will fall back to its placeholder for it.
             PerfScope trace(perf_trace_for(render_options), PerfPhase::ResourceLoad, "render_prefetch_wave1", wave1.size());
-            trace.event().property = "render";
+            trace.event().property = resource_mode == LayoutResourceMode::Full ? "render" : "geometry";
             trace.event().reason = "wave1";
             fetched = render_loader->load_all(wave1, BatchErrorMode::Lenient);
             trace.set_count(render_prefetch_loaded_bytes(fetched));
@@ -1439,6 +1648,9 @@ struct Page::Impl {
                 continue;
             }
             collect_css_attribute_selectors(sheet.body, attribute_usage);
+            if (resource_mode != LayoutResourceMode::Full) {
+                continue;
+            }
             const std::string sheet_base = sheet.url.empty() ? wave1[i].url : sheet.url;
             for (const auto& ref : extract_css_urls(sheet.body)) {
                 add_subresource(wave2, seen, sheet_base, effective_base, ref.url, ref.kind);
@@ -1461,7 +1673,10 @@ struct Page::Impl {
         return render_loader;
     }
 
-    StyledDocumentCacheKey styled_document_cache_key(const RenderOptions& render_options) const
+    StyledDocumentCacheKey styled_document_cache_key(
+        const RenderOptions& render_options,
+        bool materialize_cached_geometry_widths,
+        LayoutResourceMode resource_mode) const
     {
         return StyledDocumentCacheKey{
             document.layout_mutation_version(),
@@ -1469,6 +1684,8 @@ struct Page::Impl {
             render_options.viewport.height,
             render_options.viewport.device_scale_factor,
             render_options.load_external_resources,
+            materialize_cached_geometry_widths,
+            resource_mode,
             render_base_url(render_options),
         };
     }
@@ -1491,17 +1708,26 @@ struct Page::Impl {
         if (styled_document_key.load_external_resources != key.load_external_resources) {
             return "load_external_resources_changed";
         }
+        if (styled_document_key.materialize_cached_geometry_widths != key.materialize_cached_geometry_widths) {
+            return "layout_serialization_mode_changed";
+        }
+        if (styled_document_key.resource_mode != key.resource_mode) {
+            return "resource_mode_changed";
+        }
         if (styled_document_key.base_url != key.base_url) {
             return "base_url_changed";
         }
         return "valid";
     }
 
-    bool has_current_layout(const RenderOptions& render_options) const
+    bool has_current_layout(
+        const RenderOptions& render_options,
+        bool materialize_cached_geometry_widths,
+        LayoutResourceMode resource_mode) const
     {
         return styled_document_valid
             && styled_document_laid_out
-            && styled_document_key == styled_document_cache_key(render_options);
+            && styled_document_key == styled_document_cache_key(render_options, materialize_cached_geometry_widths, resource_mode);
     }
 
     void sync_geometry_cache_for_forget_version()
@@ -1514,6 +1740,527 @@ struct Page::Impl {
         last_known_geometry.clear();
     }
 
+    std::vector<std::pair<NodeId, std::optional<std::string>>> geometry_style_fingerprint(NodeId node)
+    {
+        std::vector<std::pair<NodeId, std::optional<std::string>>> fingerprint;
+        const NodeId document_node = document.document_node();
+        for (NodeId current = document.parent_node(node);
+             current != kInvalidNodeId && current != document_node;
+             current = document.parent_node(current)) {
+            fingerprint.push_back({current, document.get_attribute(current, "style")});
+        }
+        return fingerprint;
+    }
+
+    bool geometry_style_fingerprint_matches(NodeId node, const GeometryCacheEntry& entry)
+    {
+        return entry.style_fingerprint == geometry_style_fingerprint(node);
+    }
+
+    bool render_width_style_fingerprint_matches(NodeId node, const GeometryCacheEntry& entry)
+    {
+        return entry.render_width_style_fingerprint == geometry_style_fingerprint(node);
+    }
+
+    bool cached_width_blocker_watermark_allows(NodeId node, const GeometryCacheEntry& entry)
+    {
+        if (document.cached_width_self_blocking_layout_mutation_version(node) > entry.render_width_layout_mutation_version) {
+            return false;
+        }
+
+        const NodeId document_node = document.document_node();
+        for (NodeId current = document.parent_node(node);
+             current != kInvalidNodeId && current != document_node;
+             current = document.parent_node(current)) {
+            if (document.cached_width_ancestor_blocking_layout_mutation_version(current) > entry.render_width_layout_mutation_version) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    std::optional<ElementGeometry> cached_positioning_anchor_geometry(NodeId node)
+    {
+        const NodeId root = document.document_node();
+        for (NodeId parent = document.parent_node(node);
+             parent != kInvalidNodeId && parent != root;
+             parent = document.parent_node(parent)) {
+            const auto style = document.get_attribute(parent, "style");
+            if (!style) {
+                continue;
+            }
+            const auto position = inline_style_property_value(*style, "position");
+            if (!position) {
+                continue;
+            }
+            const std::string normalized = ascii_lower(trim_ascii(*position));
+            if (normalized.empty() || normalized == "static") {
+                continue;
+            }
+            const auto found = last_known_geometry.find(parent);
+            if (found == last_known_geometry.end()) {
+                return std::nullopt;
+            }
+            return found->second.geometry;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<ElementGeometry> cached_geometry_with_inline_position(NodeId node, const GeometryCacheEntry& entry)
+    {
+        if (!entry.geometry) {
+            return std::nullopt;
+        }
+
+        const auto style = document.get_attribute(node, "style");
+        if (!style) {
+            return entry.geometry;
+        }
+        const auto position = inline_style_property_value(*style, "position");
+        if (!position) {
+            return entry.geometry;
+        }
+
+        const std::string normalized_position = ascii_lower(trim_ascii(*position));
+        const bool positioned = normalized_position == "absolute"
+            || normalized_position == "fixed";
+        if (!positioned) {
+            return entry.geometry;
+        }
+
+        std::optional<float> left;
+        if (const auto value = inline_style_property_value(*style, "left")) {
+            left = parse_css_px_length(*value);
+        }
+        std::optional<float> top;
+        if (const auto value = inline_style_property_value(*style, "top")) {
+            top = parse_css_px_length(*value);
+        }
+        if (!left && !top) {
+            return entry.geometry;
+        }
+
+        ElementGeometry adjusted = *entry.geometry;
+        float new_x = adjusted.border_box.x;
+        float new_y = adjusted.border_box.y;
+
+        if (normalized_position == "absolute") {
+            float anchor_x = 0.0f;
+            float anchor_y = 0.0f;
+            if (const auto anchor = cached_positioning_anchor_geometry(node)) {
+                anchor_x = anchor->border_box.x;
+                anchor_y = anchor->border_box.y;
+            }
+            if (left) {
+                new_x = anchor_x + *left;
+            }
+            if (top) {
+                new_y = anchor_y + *top;
+            }
+        } else if (normalized_position == "fixed") {
+            if (left) {
+                new_x = *left;
+            }
+            if (top) {
+                new_y = *top;
+            }
+        }
+
+        const float dx = new_x - adjusted.border_box.x;
+        const float dy = new_y - adjusted.border_box.y;
+        adjusted.border_box.x += dx;
+        adjusted.border_box.y += dy;
+        adjusted.padding_box.x += dx;
+        adjusted.padding_box.y += dy;
+        return adjusted;
+    }
+
+    std::optional<ElementGeometry> cached_geometry_with_inline_size(NodeId node, const GeometryCacheEntry& entry)
+    {
+        if (!entry.geometry) {
+            return std::nullopt;
+        }
+        if (entry.layout_mutation_version == document.layout_mutation_version()) {
+            return std::nullopt;
+        }
+        if (document.last_layout_mutation_node() != node
+            || document.last_layout_mutation_reason() != "set_attribute:style") {
+            return std::nullopt;
+        }
+
+        const auto style = document.get_attribute(node, "style");
+        if (!style) {
+            return std::nullopt;
+        }
+
+        std::optional<float> width;
+        if (const auto value = inline_style_property_value(*style, "width")) {
+            width = parse_css_px_length(*value);
+        }
+        std::optional<float> height;
+        if (const auto value = inline_style_property_value(*style, "height")) {
+            height = parse_css_px_length(*value);
+        }
+        if (!width && !height) {
+            return std::nullopt;
+        }
+
+        ElementGeometry adjusted = *entry.geometry;
+        const auto box_sizing = inline_style_property_value(*style, "box-sizing");
+        const bool border_box_sizing = box_sizing && ascii_lower(trim_ascii(*box_sizing)) == "border-box";
+
+        if (width) {
+            const float border_delta = adjusted.border_box.width - adjusted.padding_box.width;
+            if (border_box_sizing) {
+                adjusted.border_box.width = *width;
+                adjusted.padding_box.width = std::max(0.0f, *width - border_delta);
+            } else {
+                adjusted.padding_box.width = *width;
+                adjusted.border_box.width = std::max(0.0f, *width + border_delta);
+            }
+        }
+        if (height) {
+            const float border_delta = adjusted.border_box.height - adjusted.padding_box.height;
+            if (border_box_sizing) {
+                adjusted.border_box.height = *height;
+                adjusted.padding_box.height = std::max(0.0f, *height - border_delta);
+            } else {
+                adjusted.padding_box.height = *height;
+                adjusted.border_box.height = std::max(0.0f, *height + border_delta);
+            }
+        }
+
+        return adjusted;
+    }
+
+    bool is_own_relative_position_style_mutation(NodeId node)
+    {
+        if (document.last_layout_mutation_node() != node
+            || document.last_layout_mutation_reason() != "set_attribute:style") {
+            return false;
+        }
+        const auto style = document.get_attribute(node, "style");
+        if (!style) {
+            return false;
+        }
+        const auto position = inline_style_property_value(*style, "position");
+        return position && ascii_lower(trim_ascii(*position)) == "relative";
+    }
+
+    bool can_reuse_stale_cached_geometry(NodeId node, const GeometryCacheEntry& entry)
+    {
+        const std::uint64_t current_layout_version = document.layout_mutation_version();
+        if (entry.layout_mutation_version == current_layout_version) {
+            return true;
+        }
+
+        const auto records = document.layout_mutations_since(entry.layout_mutation_version);
+        if (records.size() != current_layout_version - entry.layout_mutation_version) {
+            return cached_width_blocker_watermark_allows(node, entry);
+        }
+
+        bool node_is_size_stable_positioned = false;
+        if (const auto style = document.get_attribute(node, "style")) {
+            const auto position = inline_style_property_value(*style, "position");
+            const std::string normalized_position = position ? ascii_lower(trim_ascii(*position)) : std::string();
+            node_is_size_stable_positioned = (normalized_position == "absolute" || normalized_position == "fixed")
+                && !inline_style_property_value(*style, "width")
+                && !inline_style_property_value(*style, "height");
+        }
+
+        for (const auto& record : records) {
+            const NodeId mutation_node = record.node;
+            if (mutation_node == kInvalidNodeId) {
+                return false;
+            }
+            if (document.contains(mutation_node, node) && mutation_node != node) {
+                return false;
+            }
+            if (node_is_size_stable_positioned && mutation_node != node) {
+                continue;
+            }
+            if (record.reason != "set_attribute:style") {
+                return false;
+            }
+
+            const auto mutation_style = document.get_attribute(mutation_node, "style");
+            if (!mutation_style
+                || inline_style_property_value(*mutation_style, "width")
+                || inline_style_property_value(*mutation_style, "height")) {
+                return false;
+            }
+            const auto position = inline_style_property_value(*mutation_style, "position");
+            if (!position) {
+                return false;
+            }
+            const std::string normalized_position = ascii_lower(trim_ascii(*position));
+            if (normalized_position != "absolute" && normalized_position != "fixed") {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool can_materialize_cached_width_for_render(NodeId node, const GeometryCacheEntry& entry)
+    {
+        if (!entry.render_width) {
+            return false;
+        }
+
+        const std::uint64_t current_layout_version = document.layout_mutation_version();
+        if (entry.render_width_layout_mutation_version == current_layout_version) {
+            return true;
+        }
+
+        if (!render_width_style_fingerprint_matches(node, entry)) {
+            return false;
+        }
+
+        const auto records = document.layout_mutations_since(entry.render_width_layout_mutation_version);
+        if (records.size() != current_layout_version - entry.render_width_layout_mutation_version) {
+            return cached_width_blocker_watermark_allows(node, entry);
+        }
+
+        for (const auto& record : records) {
+            const NodeId mutation_node = record.node;
+            if (mutation_node == kInvalidNodeId) {
+                return false;
+            }
+
+            if (mutation_node == node) {
+                if (record.reason != "set_attribute:style") {
+                    return false;
+                }
+                const auto style = document.get_attribute(node, "style");
+                if (!style
+                    || inline_style_property_value(*style, "width")
+                    || inline_style_property_value(*style, "height")) {
+                    return false;
+                }
+                const auto position = inline_style_property_value(*style, "position");
+                if (!position) {
+                    return false;
+                }
+                const std::string normalized_position = ascii_lower(trim_ascii(*position));
+                if (normalized_position != "absolute" && normalized_position != "fixed") {
+                    return false;
+                }
+                continue;
+            }
+
+            if (!document.contains(mutation_node, node)) {
+                continue;
+            }
+
+            if (record.reason == "set_attribute:style") {
+                const auto mutation_style = document.get_attribute(mutation_node, "style");
+                if (!mutation_style) {
+                    return false;
+                }
+                if (inline_style_property_value(*mutation_style, "width")
+                    || inline_style_property_value(*mutation_style, "height")
+                    || inline_style_property_value(*mutation_style, "min-width")
+                    || inline_style_property_value(*mutation_style, "max-width")
+                    || inline_style_property_value(*mutation_style, "padding-left")
+                    || inline_style_property_value(*mutation_style, "padding-right")
+                    || inline_style_property_value(*mutation_style, "border-left-width")
+                    || inline_style_property_value(*mutation_style, "border-right-width")) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (record.reason == "append_child"
+                || record.reason == "remove_child"
+                || record.reason == "set_inner_html") {
+                continue;
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    std::optional<float> absolute_percentage_border_box_width(LayoutEngine& engine, NodeId node)
+    {
+        const std::string node_key = std::to_string(node);
+        const auto position = engine.computed_style_property(node_key, "position");
+        if (!position || ascii_lower(trim_ascii(*position)) != "absolute") {
+            return std::nullopt;
+        }
+
+        const auto box_sizing = engine.computed_style_property(node_key, "box-sizing");
+        if (!box_sizing || ascii_lower(trim_ascii(*box_sizing)) != "border-box") {
+            return std::nullopt;
+        }
+
+        const auto width = engine.computed_style_property(node_key, "width");
+        if (!width) {
+            return std::nullopt;
+        }
+        const auto percent = parse_css_percentage(*width);
+        if (!percent) {
+            return std::nullopt;
+        }
+
+        std::optional<ElementGeometry> containing_block;
+        const NodeId root = document.document_node();
+        for (NodeId parent = document.parent_node(node);
+             parent != kInvalidNodeId && parent != root;
+             parent = document.parent_node(parent)) {
+            const std::string parent_key = std::to_string(parent);
+            const auto parent_position = engine.computed_style_property(parent_key, "position");
+            if (!parent_position) {
+                continue;
+            }
+            const std::string normalized = ascii_lower(trim_ascii(*parent_position));
+            if (normalized.empty() || normalized == "static") {
+                continue;
+            }
+            containing_block = engine.element_geometry(parent_key);
+            break;
+        }
+        if (!containing_block) {
+            return std::nullopt;
+        }
+
+        const float corrected_width = containing_block->padding_box.width * (*percent / 100.0f);
+        if (corrected_width <= 0.0f) {
+            return std::nullopt;
+        }
+        return corrected_width;
+    }
+
+    std::optional<ElementGeometry> adjust_absolute_percentage_width_geometry(
+        LayoutEngine& engine,
+        NodeId node,
+        std::optional<ElementGeometry> geometry)
+    {
+        if (!geometry) {
+            return std::nullopt;
+        }
+
+        const auto corrected_width = absolute_percentage_border_box_width(engine, node);
+        if (!corrected_width) {
+            return geometry;
+        }
+
+        ElementGeometry adjusted = *geometry;
+        const float border_delta = adjusted.border_box.width - adjusted.padding_box.width;
+        adjusted.border_box.width = *corrected_width;
+        adjusted.padding_box.width = std::max(0.0f, *corrected_width - border_delta);
+        return adjusted;
+    }
+
+    bool should_snapshot_geometry_after_forced_layout(long long elapsed_us) const
+    {
+        const long long normalized_elapsed = std::max<long long>(0, elapsed_us);
+        return styled_document_expensive
+            || normalized_elapsed > kExpensiveStyledDocumentUs
+            || (geometry_forced_layout_count + 1 >= kGeometryForcedLayoutCountThreshold
+                && geometry_forced_layout_us + normalized_elapsed > kGeometryForcedLayoutBudgetUs);
+    }
+
+    bool is_positioned_without_inline_size(NodeId node)
+    {
+        const auto style = document.get_attribute(node, "style");
+        if (!style) {
+            return false;
+        }
+
+        const auto position = inline_style_property_value(*style, "position");
+        if (!position) {
+            return false;
+        }
+
+        const std::string normalized_position = ascii_lower(trim_ascii(*position));
+        return (normalized_position == "absolute" || normalized_position == "fixed")
+            && !inline_style_property_value(*style, "width")
+            && !inline_style_property_value(*style, "height");
+    }
+
+    bool has_positioned_without_inline_size_candidates()
+    {
+        const NodeId root = document.document_node();
+        if (root == kInvalidNodeId) {
+            return false;
+        }
+        for (NodeId node : document.query_selector_all(root, "*")) {
+            if (document.is_connected(node) && is_positioned_without_inline_size(node)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    GeometryCacheEntry make_geometry_cache_entry(
+        NodeId node,
+        std::optional<ElementGeometry> geometry,
+        bool allow_new_render_width)
+    {
+        GeometryCacheEntry entry{
+            std::move(geometry),
+            document.layout_mutation_version(),
+            geometry_style_fingerprint(node),
+            std::nullopt,
+            0,
+            {},
+        };
+
+        const auto existing = last_known_geometry.find(node);
+        if (existing != last_known_geometry.end()
+            && existing->second.render_width
+            && is_positioned_without_inline_size(node)) {
+            entry.render_width = existing->second.render_width;
+            entry.render_width_layout_mutation_version = existing->second.render_width_layout_mutation_version;
+            entry.render_width_style_fingerprint = existing->second.render_width_style_fingerprint;
+            return entry;
+        }
+
+        if (allow_new_render_width && entry.geometry) {
+            entry.render_width = entry.geometry->border_box.width;
+            entry.render_width_layout_mutation_version = entry.layout_mutation_version;
+            entry.render_width_style_fingerprint = entry.style_fingerprint;
+        }
+
+        return entry;
+    }
+
+    void snapshot_layout_geometry(LayoutEngine& engine)
+    {
+        sync_geometry_cache_for_forget_version();
+        const NodeId root = document.document_node();
+        if (root == kInvalidNodeId) {
+            return;
+        }
+
+        for (NodeId node : document.query_selector_all(root, "*")) {
+            if (!document.is_connected(node)) {
+                last_known_geometry.erase(node);
+                continue;
+            }
+            auto raw_geometry = engine.element_geometry(std::to_string(node));
+            const auto corrected_render_width = absolute_percentage_border_box_width(engine, node);
+            auto geometry = adjust_absolute_percentage_width_geometry(engine, node, raw_geometry);
+            const bool corrected_absolute_percentage_width = raw_geometry
+                && geometry
+                && std::abs(geometry->border_box.width - raw_geometry->border_box.width) > 0.5f;
+            auto entry = make_geometry_cache_entry(
+                node,
+                std::move(geometry),
+                corrected_absolute_percentage_width);
+            if (corrected_render_width) {
+                entry.render_width = *corrected_render_width;
+                entry.render_width_layout_mutation_version = document.layout_mutation_version();
+                entry.render_width_style_fingerprint = geometry_style_fingerprint(node);
+            }
+            last_known_geometry[node] = std::move(entry);
+        }
+    }
+
     std::optional<ElementGeometry> cached_geometry(NodeId node)
     {
         sync_geometry_cache_for_forget_version();
@@ -1523,7 +2270,10 @@ struct Page::Impl {
         }
 
         const auto found = last_known_geometry.find(node);
-        return found == last_known_geometry.end() ? std::nullopt : found->second.geometry;
+        if (found == last_known_geometry.end() || !can_reuse_stale_cached_geometry(node, found->second)) {
+            return std::nullopt;
+        }
+        return cached_geometry_with_inline_position(node, found->second);
     }
 
     void remember_geometry(NodeId node, std::optional<ElementGeometry> geometry)
@@ -1533,7 +2283,10 @@ struct Page::Impl {
             last_known_geometry.erase(node);
             return;
         }
-        last_known_geometry[node] = GeometryCacheEntry{std::move(geometry)};
+        last_known_geometry[node] = make_geometry_cache_entry(
+            node,
+            std::move(geometry),
+            /*allow_new_render_width=*/true);
     }
 
     void note_geometry_forced_layout(long long elapsed_us)
@@ -1665,30 +2418,9 @@ struct Page::Impl {
             && current_layout_html_size() >= kHeavyDocumentPreflightHtmlBytes;
     }
 
-    bool should_preflight_append_child_layout_read(const std::string& cache_reason, NodeId node)
-    {
-        return cache_reason == "empty"
-            && is_last_appended_layout_subtree(node)
-            && current_layout_html_size() >= kHeavyDocumentPreflightHtmlBytes;
-    }
-
-    bool is_structural_layout_mutation_reason(std::string_view reason) const
-    {
-        return reason == "append_child"
-            || reason == "insert_before"
-            || reason == "remove_child"
-            || reason == "replace_child"
-            || reason == "set_inner_html";
-    }
-
-    bool should_preflight_heavy_structural_layout_read(const std::string& cache_reason)
-    {
-        return cache_reason == "empty"
-            && is_structural_layout_mutation_reason(document.last_layout_mutation_reason())
-            && current_layout_html_size() >= kHeavyDocumentPreflightHtmlBytes;
-    }
-
-    std::unique_ptr<LayoutEngine> build_layout(const RenderOptions& render_options)
+    std::unique_ptr<LayoutEngine> build_layout(
+        const RenderOptions& render_options,
+        LayoutResourceMode resource_mode = LayoutResourceMode::Full)
     {
         if (!layout_factory) {
             throw std::runtime_error("no layout engine factory configured; build with PAGECORE_ENABLE_RENDERING or set one explicitly");
@@ -1699,12 +2431,14 @@ struct Page::Impl {
             throw std::runtime_error("layout engine factory returned null");
         }
 
-        auto render_loader = prepare_render_loader(render_options);
-        auto font_environment = prepare_font_environment(render_options, render_loader);
+        auto render_loader = prepare_render_loader(render_options, resource_mode);
+        auto font_environment = prepare_font_environment(render_options, render_loader, resource_mode);
         layout->set_viewport(render_options.viewport);
         layout->set_resource_loader(std::move(render_loader));
         layout->set_font_environment(std::move(font_environment));
-        std::string html = serialized_html_for_render(render_options);
+        std::string html = serialized_html_for_layout(
+            render_options,
+            has_layout_style_overrides_for_render());
         {
             PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
             layout->load_html(html, render_base_url(render_options));
@@ -1721,9 +2455,12 @@ struct Page::Impl {
     // DisplayList and getComputedStyle(), without running layout() on it —
     // callers decide whether they need a full layout pass or just the
     // cascade (compute_styles_only()).
-    LayoutEngine& ensure_styled_document(const RenderOptions& render_options)
+    LayoutEngine& ensure_styled_document(
+        const RenderOptions& render_options,
+        bool materialize_cached_geometry_widths,
+        LayoutResourceMode resource_mode)
     {
-        StyledDocumentCacheKey key = styled_document_cache_key(render_options);
+        StyledDocumentCacheKey key = styled_document_cache_key(render_options, materialize_cached_geometry_widths, resource_mode);
 
         if (styled_document_valid && styled_document_key == key) {
             return *styled_document;
@@ -1738,14 +2475,14 @@ struct Page::Impl {
             throw std::runtime_error("layout engine factory returned null");
         }
 
-        auto render_loader = prepare_render_loader(render_options);
-        auto font_environment = prepare_font_environment(render_options, render_loader);
+        auto render_loader = prepare_render_loader(render_options, resource_mode);
+        auto font_environment = prepare_font_environment(render_options, render_loader, resource_mode);
         engine->set_viewport(render_options.viewport);
         engine->set_resource_loader(std::move(render_loader));
         engine->set_font_environment(std::move(font_environment));
         {
             const auto t0 = std::chrono::steady_clock::now();
-            std::string html = serialized_html_for_render(render_options);
+            std::string html = serialized_html_for_layout(render_options, materialize_cached_geometry_widths);
             {
                 PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
                 engine->load_html(html, render_base_url(render_options));
@@ -1768,9 +2505,12 @@ struct Page::Impl {
     // on it if that hasn't happened yet for this build. Shared by
     // cached_display_list() and element_geometry(), both of which need real
     // render_item geometry rather than just the cascade.
-    LayoutEngine& ensure_layout(const RenderOptions& render_options)
+    LayoutEngine& ensure_layout(
+        const RenderOptions& render_options,
+        bool materialize_cached_geometry_widths,
+        LayoutResourceMode resource_mode)
     {
-        auto& engine = ensure_styled_document(render_options);
+        auto& engine = ensure_styled_document(render_options, materialize_cached_geometry_widths, resource_mode);
         if (!styled_document_laid_out) {
             const auto t0 = std::chrono::steady_clock::now();
             {
@@ -1791,13 +2531,37 @@ struct Page::Impl {
     const DisplayList& cached_display_list(const RenderOptions& render_options)
     {
         last_render_options = render_options;
-        return ensure_layout(render_options).display_list();
+        const bool materialize_before_layout = has_layout_style_overrides_for_render();
+        auto* engine = &ensure_layout(
+            render_options,
+            materialize_before_layout,
+            LayoutResourceMode::Full);
+
+        if (!materialize_before_layout && has_positioned_without_inline_size_candidates()) {
+            snapshot_layout_geometry(*engine);
+            if (has_layout_style_overrides_for_render()) {
+                engine = &ensure_layout(
+                    render_options,
+                    /*materialize_cached_geometry_widths=*/true,
+                    LayoutResourceMode::Full);
+            }
+        }
+
+        return engine->display_list();
     }
 
     std::optional<ComputedStyle> computed_style(NodeId node)
     {
-        const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
-        const std::string cache_reason = styled_document_cache_reason(key);
+        const StyledDocumentCacheKey key = styled_document_cache_key(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::StylesheetsOnly);
+        const StyledDocumentCacheKey full_key = styled_document_cache_key(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::Full);
+        const bool full_cache_hit = styled_document_valid && styled_document_key == full_key;
+        const std::string cache_reason = full_cache_hit ? "valid" : styled_document_cache_reason(key);
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style", 1);
         trace.event().node_id = node;
         trace.event().mutation_version = document.mutation_version();
@@ -1805,7 +2569,12 @@ struct Page::Impl {
         trace.event().styled_document_cache_hit = cache_reason == "valid";
         trace.event().styled_document_cache_reason = cache_reason;
         trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
-        auto& engine = ensure_styled_document(last_render_options);
+        auto& engine = full_cache_hit
+            ? *styled_document
+            : ensure_styled_document(
+                last_render_options,
+                /*materialize_cached_geometry_widths=*/false,
+                LayoutResourceMode::StylesheetsOnly);
         engine.compute_styles_only();
         auto style = engine.computed_style(std::to_string(node));
         trace.set_count(style ? style->properties.size() : 0);
@@ -1814,8 +2583,16 @@ struct Page::Impl {
 
     std::optional<std::string> computed_style_property(NodeId node, std::string_view property)
     {
-        const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
-        const std::string cache_reason = styled_document_cache_reason(key);
+        const StyledDocumentCacheKey key = styled_document_cache_key(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::StylesheetsOnly);
+        const StyledDocumentCacheKey full_key = styled_document_cache_key(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::Full);
+        const bool full_cache_hit = styled_document_valid && styled_document_key == full_key;
+        const std::string cache_reason = full_cache_hit ? "valid" : styled_document_cache_reason(key);
         const bool cache_hit = cache_reason == "valid";
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style_property", 1);
         trace.event().node_id = node;
@@ -1843,7 +2620,12 @@ struct Page::Impl {
         }
 
         const auto t0 = std::chrono::steady_clock::now();
-        auto& engine = ensure_styled_document(last_render_options);
+        auto& engine = full_cache_hit
+            ? *styled_document
+            : ensure_styled_document(
+                last_render_options,
+                /*materialize_cached_geometry_widths=*/false,
+                LayoutResourceMode::StylesheetsOnly);
         engine.compute_styles_only();
         auto value = engine.computed_style_property(std::to_string(node), property);
         if (!cache_hit) {
@@ -1858,13 +2640,23 @@ struct Page::Impl {
 
     std::optional<ElementGeometry> element_geometry(NodeId node)
     {
-        const StyledDocumentCacheKey key = styled_document_cache_key(last_render_options);
-        const std::string cache_reason = styled_document_cache_reason(key);
+        const StyledDocumentCacheKey key = styled_document_cache_key(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::StylesheetsOnly);
+        const bool full_layout_hit = has_current_layout(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::Full);
+        const std::string cache_reason = full_layout_hit ? "valid" : styled_document_cache_reason(key);
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::Geometry, "element_geometry", 1);
         trace.event().node_id = node;
         trace.event().mutation_version = document.mutation_version();
         trace.event().layout_mutation_version = document.layout_mutation_version();
-        trace.event().styled_document_cache_hit = has_current_layout(last_render_options);
+        trace.event().styled_document_cache_hit = full_layout_hit || has_current_layout(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::StylesheetsOnly);
         trace.event().styled_document_cache_reason = cache_reason;
         trace.event().layout_mutation_reason = document.last_layout_mutation_reason();
         sync_geometry_cache_for_forget_version();
@@ -1874,47 +2666,56 @@ struct Page::Impl {
         }
 
         const std::string node_key = std::to_string(node);
-        if (has_current_layout(last_render_options)) {
-            auto geometry = styled_document->element_geometry(node_key);
+        if (full_layout_hit
+            || has_current_layout(
+                last_render_options,
+                /*materialize_cached_geometry_widths=*/false,
+                LayoutResourceMode::StylesheetsOnly)) {
+            auto geometry = adjust_absolute_percentage_width_geometry(
+                *styled_document,
+                node,
+                styled_document->element_geometry(node_key));
             remember_geometry(node, geometry);
             return geometry;
         }
 
-        if (should_preflight_append_child_layout_read(cache_reason, node)) {
-            geometry_bounded_mode = true;
-            trace.event().styled_document_cache_reason = "preflight_append_child:" + cache_reason;
-            return cached_geometry(node);
-        }
-
-        if (should_preflight_heavy_structural_layout_read(cache_reason)) {
-            geometry_bounded_mode = true;
-            trace.event().styled_document_cache_reason = "preflight_heavy_structural:" + cache_reason;
-            return cached_geometry(node);
-        }
-
         if (geometry_bounded_mode || styled_document_expensive) {
-            geometry_bounded_mode = true;
-            trace.event().styled_document_cache_reason = "bounded_mode:" + cache_reason;
-            return cached_geometry(node);
+            if (auto cached = cached_geometry(node)) {
+                geometry_bounded_mode = true;
+                trace.event().styled_document_cache_reason = "bounded_mode:" + cache_reason;
+                return cached;
+            }
+            if (const auto found = last_known_geometry.find(node); found != last_known_geometry.end()) {
+                if (auto adjusted = cached_geometry_with_inline_size(node, found->second)) {
+                    geometry_bounded_mode = true;
+                    trace.event().styled_document_cache_reason = "bounded_mode_inline_size:" + cache_reason;
+                    remember_geometry(node, adjusted);
+                    return adjusted;
+                }
+            }
+            if (geometry_forced_layout_count >= kGeometryForcedLayoutCountThreshold
+                && !is_own_relative_position_style_mutation(node)) {
+                geometry_bounded_mode = true;
+                trace.event().styled_document_cache_reason = "bounded_mode_uncached:" + cache_reason;
+                remember_geometry(node, std::nullopt);
+                return std::nullopt;
+            }
         }
 
-        // The (re)build itself may reveal the page is expensive; re-check before
-        // paying for a full layout() so the first geometry read on a heavy page
-        // costs at most the cascade build it would have paid for anyway. The
-        // time still counts against the geometry budget.
         const auto t0 = std::chrono::steady_clock::now();
-        ensure_styled_document(last_render_options);
-        if (styled_document_expensive) {
-            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0).count();
-            note_geometry_forced_layout(elapsed_us);
-            return cached_geometry(node);
-        }
-
-        auto& engine = ensure_layout(last_render_options);
+        auto& engine = ensure_layout(
+            last_render_options,
+            /*materialize_cached_geometry_widths=*/false,
+            LayoutResourceMode::StylesheetsOnly);
         const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        auto geometry = engine.element_geometry(node_key);
+        auto geometry = adjust_absolute_percentage_width_geometry(
+            engine,
+            node,
+            engine.element_geometry(node_key));
+        if (should_snapshot_geometry_after_forced_layout(elapsed_us)) {
+            snapshot_layout_geometry(engine);
+        }
         remember_geometry(node, geometry);
         note_geometry_forced_layout(elapsed_us);
         return geometry;
