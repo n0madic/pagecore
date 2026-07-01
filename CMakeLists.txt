@@ -159,6 +159,11 @@ function(pagecore_pkg_config_static_first target)
     endforeach()
     list(APPEND pkg_lib_dirs "/opt/homebrew/lib" "/usr/local/lib")
 
+    # Fontconfig has process-global state used by Cairo/Pango. When Cairo is
+    # dynamic, mixing it with a static libfontconfig copy leaves two independent
+    # registries in one process and can trigger spurious FcInit warnings.
+    set(pkg_dynamic_state_libs fontconfig)
+
     list(LENGTH pkg_libs_list pkg_libs_len)
     set(i 0)
     while(i LESS pkg_libs_len)
@@ -175,14 +180,16 @@ function(pagecore_pkg_config_static_first target)
         elseif(flag MATCHES "^-l(.+)")
             set(lib_name "${CMAKE_MATCH_1}")
             set(found_static_lib "")
-            foreach(lib_dir IN LISTS pkg_lib_dirs)
-                if(EXISTS "${lib_dir}/lib${lib_name}.a")
-                    set(found_static_lib "${lib_dir}/lib${lib_name}.a")
-                    break()
-                endif()
-            endforeach()
+            if(NOT lib_name IN_LIST pkg_dynamic_state_libs)
+                foreach(lib_dir IN LISTS pkg_lib_dirs)
+                    if(EXISTS "${lib_dir}/lib${lib_name}.a")
+                        set(found_static_lib "${lib_dir}/lib${lib_name}.a")
+                        break()
+                    endif()
+                endforeach()
+            endif()
 
-            if(found_static_lib)
+            if(NOT found_static_lib STREQUAL "")
                 target_link_libraries(${target} INTERFACE "${found_static_lib}")
             else()
                 target_link_libraries(${target} INTERFACE "${flag}")
@@ -221,6 +228,9 @@ if(PAGECORE_ENABLE_RENDERING)
         pagecore_static_pkg_deps
         cairo
         pangocairo
+        pangoft2
+        fontconfig
+        libbrotlidec
         libturbojpeg
         libwebp
         libwebpdecoder
@@ -273,6 +283,7 @@ pagecore_fetchcontent_make_available_excluded(lexbor)
 pagecore_fetchcontent_make_available_excluded(quickjs_ng)
 
 find_package(CURL REQUIRED COMPONENTS libz)
+find_package(ZLIB REQUIRED)
 
 find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
 
@@ -384,6 +395,20 @@ if(PAGECORE_NODE_EXECUTABLE)
 endif()
 
 if(PAGECORE_ENABLE_RENDERING)
+    set(PAGECORE_SAVED_BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS}")
+    set(PAGECORE_SAVED_POLICY_VERSION_MINIMUM "${CMAKE_POLICY_VERSION_MINIMUM}")
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    FetchContent_Declare(
+        woff2
+        GIT_REPOSITORY https://github.com/google/woff2.git
+        GIT_TAG fb9c3379f2605b10f3e8f1d9636664ab5576775c
+        ${PAGECORE_FETCHCONTENT_EXCLUDE_FROM_ALL}
+    )
+    pagecore_fetchcontent_make_available_excluded(woff2)
+    set(BUILD_SHARED_LIBS "${PAGECORE_SAVED_BUILD_SHARED_LIBS}" CACHE BOOL "" FORCE)
+    set(CMAKE_POLICY_VERSION_MINIMUM "${PAGECORE_SAVED_POLICY_VERSION_MINIMUM}" CACHE STRING "" FORCE)
+
     set(LITEHTML_BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(LITEHTML_ENABLE_LINT OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
@@ -412,6 +437,7 @@ if(PAGECORE_ENABLE_RENDERING)
         src/cairo_raster.cpp
         src/image_decoder.cpp
         src/litehtml_layout.cpp
+        src/web_fonts.cpp
     )
 else()
     target_sources(pagecore PRIVATE src/rendering_disabled.cpp)
@@ -426,16 +452,22 @@ target_include_directories(pagecore
         ${PAGECORE_GENERATED_DIR}
 )
 
+if(PAGECORE_ENABLE_RENDERING)
+    target_include_directories(pagecore PRIVATE "${woff2_SOURCE_DIR}/include")
+endif()
+
 target_link_libraries(pagecore
     PRIVATE
         $<BUILD_INTERFACE:lexbor_static>
         $<BUILD_INTERFACE:qjs>
         $<BUILD_INTERFACE:CURL::libcurl>
+        $<BUILD_INTERFACE:ZLIB::ZLIB>
         $<BUILD_INTERFACE:pagecore_static_pkg_deps>
     INTERFACE
         $<INSTALL_INTERFACE:PageCore::lexbor_static>
         $<INSTALL_INTERFACE:PageCore::qjs>
         $<INSTALL_INTERFACE:CURL::libcurl>
+        $<INSTALL_INTERFACE:ZLIB::ZLIB>
         $<INSTALL_INTERFACE:PageCore::pagecore_static_pkg_deps>
 )
 
@@ -446,8 +478,12 @@ if(PAGECORE_ENABLE_RENDERING)
     target_link_libraries(pagecore
         PRIVATE
             $<BUILD_INTERFACE:litehtml>
+            $<BUILD_INTERFACE:woff2dec>
+            $<BUILD_INTERFACE:woff2common>
         INTERFACE
             $<INSTALL_INTERFACE:PageCore::litehtml>
+            $<INSTALL_INTERFACE:PageCore::woff2dec>
+            $<INSTALL_INTERFACE:PageCore::woff2common>
     )
 endif()
 
@@ -569,6 +605,8 @@ set(PAGECORE_LEXBOR_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}lexbor_static${CM
 set(PAGECORE_QJS_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}qjs${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(PAGECORE_LITEHTML_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}litehtml${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(PAGECORE_GUMBO_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}gumbo${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(PAGECORE_WOFF2COMMON_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}woff2common${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(PAGECORE_WOFF2DEC_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}woff2dec${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
 install(
     TARGETS pagecore pagecore_static_pkg_deps
@@ -584,6 +622,8 @@ install(FILES "$<TARGET_FILE:qjs>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" REN
 
 if(PAGECORE_ENABLE_RENDERING)
     install(FILES "$<TARGET_FILE:litehtml>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_LITEHTML_STATIC_FILE}")
+    install(FILES "$<TARGET_FILE:woff2common>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_WOFF2COMMON_STATIC_FILE}")
+    install(FILES "$<TARGET_FILE:woff2dec>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_WOFF2DEC_STATIC_FILE}")
     if(TARGET gumbo)
         install(FILES "$<TARGET_FILE:gumbo>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_GUMBO_STATIC_FILE}")
     endif()

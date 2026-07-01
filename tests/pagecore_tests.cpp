@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -238,6 +239,108 @@ std::string base64_encode(std::string_view bytes)
     }
 
     return out;
+}
+
+std::string base64_decode(std::string_view text)
+{
+    const auto value_of = [](char ch) -> int {
+        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+        if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+        if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+        if (ch == '+') return 62;
+        if (ch == '/') return 63;
+        return -1;
+    };
+
+    std::string out;
+    std::uint32_t buffer = 0;
+    int bits = 0;
+    for (char ch : text) {
+        if (std::isspace(static_cast<unsigned char>(ch))) {
+            continue;
+        }
+        if (ch == '=') {
+            break;
+        }
+        const int value = value_of(ch);
+        if (value < 0) {
+            throw std::runtime_error("invalid base64 fixture");
+        }
+        buffer = (buffer << 6) | static_cast<std::uint32_t>(value);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buffer >> bits) & 0xff));
+        }
+    }
+    return out;
+}
+
+int count_dark_pixels(
+    const pagecore::RenderedImage& image,
+    int x,
+    int y,
+    int width,
+    int height)
+{
+    int count = 0;
+    for (int row = std::max(0, y); row < std::min(image.height, y + height); ++row) {
+        for (int col = std::max(0, x); col < std::min(image.width, x + width); ++col) {
+            if (pixel_is_dark(image, col, row)) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+std::string pagecore_icon_font_body(std::string_view format)
+{
+    if (format == "ttf") {
+        return base64_decode(
+            "AAEAAAAKAIAAAwAgT1MvMkUBM38AAAEoAAAAYGNtYXC/8SCdAAABlAAAADxnbHlmKNwP5AAAAdgAAAAa"
+            "aGVhZC6lbSAAAACsAAAANmhoZWEFegJcAAAA5AAAACRobXR4BaoAAAAAAYgAAAAMbG9jYQAAAA0AAAHQ"
+            "AAAACG1heHAABQAGAAABCAAAACBuYW1lWe7ItwAAAfQAAAFocG9zdEytn5sAAANcAAAAMAABAAAAAQAA"
+            "iSYiuV8PPPUAAQPoAAAAAOZqlMIAAAAA5mqUwgAyAAACigK8AAAAAwACAAAAAAAAAAEAAAMg/zgAAAK8"
+            "AAAAZAJYAAEAAAAAAAAAAAAAAAAAAAADAAEAAAADAAQAAQAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAwHj"
+            "AZAABQAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABEAAAAAAAAAAAAAAAPz8/PwAAAC"
+            "DgAAMg/zgAAAMgAMgAAAAAAAAAAAAAAAAAAAAgAAAB9AAAAPoAAAK8AAAAAAACAAAAAwAAABQAAwAB"
+            "AAAAFAAEACgAAAAGAAQAAQACACDgAP//AAAAIOAA////4SACAAEAAAAAAAAAAAAAAAAADQABADIAAAKK"
+            "ArwAAwAAMyERITICWP2oArwAAAAAAAAMAJYAAQAAAAAAAQAMAAAAAQAAAAAAAgAHAAwAAQAAAAAAAwAU"
+            "ABMAAQAAAAAABAAUABMAAQAAAAAABQALACcAAQAAAAAABgAUADIAAwABBAkAAQAYAEYAAwABBAkAAgAO"
+            "AF4AAwABBAkAAwAoAGwAAwABBAkABAAoAGwAAwABBAkABQAWAJQAAwABBAkABgAoAKpQYWdlQ29yZUlj"
+            "b25SZWd1bGFyUGFnZUNvcmVJY29uIFJlZ3VsYXJWZXJzaW9uIDEuMFBhZ2VDb3JlSWNvbi1SZWd1bGFy"
+            "AFAAYQBnAGUAQwBvAHIAZQBJAGMAbwBuAFIAZQBnAHUAbABhAHIAUABhAGcAZQBDAG8AcgBlAEkAYwBv"
+            "AG4AIABSAGUAZwB1AGwAYQByAFYAZQByAHMAaQBvAG4AIAAxAC4AMABQAGEAZwBlAEMAbwByAGUASQBj"
+            "AG8AbgAtAFIAZQBnAHUAbABhAHIAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAwECB3Vu"
+            "aUUwMDA=");
+    }
+    if (format == "woff") {
+        return base64_decode(
+            "d09GRgABAAAAAALAAAoAAAAAA4wAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAABPUy8yAAABZAAAAC4AAABg"
+            "RQEzf2NtYXAAAAGgAAAAMQAAADy/8SCdZ2x5ZgAAAdwAAAAaAAAAGijcD+RoZWFkAAAA9AAAADYAAAA2"
+            "LqVtIGhoZWEAAAEsAAAAHwAAACQFegJcaG10eAAAAZQAAAAMAAAADAWqAABsb2NhAAAB1AAAAAgAAAAI"
+            "AAAADW1heHAAAAFMAAAAGAAAACAABQAGbmFtZQAAAfgAAACsAAABaFnuyLdwb3N0AAACpAAAABkAAAAw"
+            "TK2fmwABAAAAAQAAiSYiuV8PPPUAAQPoAAAAAOZqlMIAAAAA5mqUwgAyAAACigK8AAAAAwACAAAAAAAA"
+            "eJxjYGRgYFb4b8HAwLSHgYEhhSmCASiCApgBSkkC3AB4nGNgZGBgYGZgYQDRDAxMDGgAAAEtAAx4nGNg"
+            "ZnzMOIGBlYGFgTBgFEDi2AMBkFJ4wMCs8N+CAUgynEBTr8DAAAAFkwX0AAAB9AAAAPoAAAK8AAB4nGNg"
+            "YGBiYGBgBmIRIMkIplkYNIA0G5BmBMoqPGD4/x/IB9P/HyowgVUBAQCV+ghqAAAAAAAAAAAAAA0AAQAy"
+            "AAACigK8AAMAADMhESEyAlj9qAK8AAAAeJx1zc0KglAQhuHXn4wo2hTR0l1tlOoWgsCduHAZiBxEEIUj"
+            "3kl0EV1lE83CAs/mPPPNDAOseOLweY4Ytctcqq89tmzU/sgzlhzUgeQXmXT8hSR7bmqXNXe1x5FG7Y88"
+            "Y8dDHUj+SovKXDtrkrJrM1MNTWHHUahZbmxfS3mOT+N2pG1SCioMVzqs/AmlqCUTVwxyv2B6Kvyby6Wy"
+            "9NTaPRNzmtyOfrffwDc5lnicY2BiwA+YQZiRib00L9PVwMAAAAs4AjQAAAA=");
+    }
+    if (format == "woff2") {
+        return base64_decode(
+            "d09GMgABAAAAAAGkAAoAAAAAA4wAAAFbAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmAAPAocOAE2AiQD"
+            "DAsIAAQgBYJoBzAb8QIongPu7FRE3BkPi04Wyot1sf7yEZLMElTL1rO7d09M8hW8isLgEBpFVhQ2Cov+"
+            "wgiUQlhciOVTgmibpym9dEFDFsPaWFiX8YgwfPgx2IDTFCIIjGc5eSFx/nY+9xOO3nmUdql2UZdIGOBv"
+            "H51/wSey8+Es8QGNbOeLhl1OcUQNPkiCxcWVvVGOu1ilUB5ToNUzNK/l5n9ILgHSFBMy5loCc4oWakVI"
+            "mtf+D3n8/41EAgAZ1AgUVIACIMroZDXRXxdAIDhdTlebk74S8jM87g9Gt/qkswRZAmGOyZr2UgQAQI4X"
+            "8AX2v4GsCJAAADDmnABhDAGShjEBsjmzAhQHKqNWrmtz+rIow8KSNYJkwgZkLQdqgcqCQay1XJxZaOb6"
+            "fGY/VY0CL2wv1V1td0ssf0NOw6Qa49ThYbaLmn6vAZ0SqW/KfRZyrKet26HLMyJzeb80NQ736qV0AQAA");
+    }
+    throw std::runtime_error("unknown font fixture format");
 }
 
 #if defined(PAGECORE_ENABLE_RENDERING)
@@ -3794,7 +3897,7 @@ void test_render_prefetches_css_background_images()
     auto loader = std::make_shared<BatchRecordingLoader>();
     // External stylesheet referencing a background image relative to ITS OWN URL
     // (must resolve against /assets/, not the document) plus a @font-face the
-    // engine never downloads (Pango uses system fonts).
+    // web-font pipeline fetches separately.
     loader->add("https://example.test/assets/style.css",
                 ".ext { width: 12px; height: 12px; background-image: url(css-bg.png); }\n"
                 "@font-face { font-family: x; src: url(font.woff2); }",
@@ -3823,17 +3926,18 @@ void test_render_prefetches_css_background_images()
 
     // Wave 1 (DOM): the stylesheet, the <style> background, and the inline-style
     // background. Wave 2: the background referenced inside the external stylesheet,
-    // resolved against the stylesheet URL — and NOT the @font-face source.
-    require(loader->batch_sizes.size() == 2, "CSS backgrounds trigger a second prefetch wave");
+    // resolved against the stylesheet URL. Wave 3: the web-font source.
+    require(loader->batch_sizes.size() == 3, "CSS backgrounds and web fonts trigger follow-up prefetch waves");
     require(loader->batch_sizes[0] == 3, "wave 1 prefetches the stylesheet and DOM-level CSS backgrounds");
-    require(loader->batch_sizes[1] == 1, "wave 2 prefetches only the external stylesheet's image, skipping the font");
+    require(loader->batch_sizes[1] == 1, "wave 2 prefetches the external stylesheet's image");
+    require(loader->batch_sizes[2] == 1, "wave 3 prefetches the web-font source");
 
     require(loader->load_calls.empty(),
             "every CSS background image is served from the prefetch cache, including the external one");
     require(loader->was_requested("https://example.test/assets/css-bg.png"),
             "external-stylesheet background resolves against the stylesheet URL");
-    require(!loader->was_requested("https://example.test/assets/font.woff2"),
-            "@font-face sources are never fetched (text is rendered with system fonts)");
+    require(loader->was_requested("https://example.test/assets/font.woff2"),
+            "@font-face sources should be requested by the web-font pipeline");
 }
 
 void test_page_render_uses_cairo_raster_backend()
@@ -3860,6 +3964,60 @@ void test_page_render_uses_cairo_raster_backend()
     require(image.width == 100 && image.height == 80, "Page::render should return viewport-sized image");
     require(image_has_pixel(image, pagecore::Color{12, 34, 56, 255}), "Page::render should rasterize display-list fills");
     require(image_has_non_solid_text_pixel(image), "Page::render should rasterize real anti-aliased text");
+}
+
+void test_page_render_uses_web_font_formats()
+{
+    const auto fallback_image = [] {
+        pagecore::Page page;
+        page.load_html(R"HTML(
+<html><body style="margin:0;background:white">
+<div style="font-family:AliasIcon;font-size:48px;line-height:1;color:black">&#xe000;</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+        pagecore::RenderOptions options;
+        options.viewport = pagecore::Viewport{90, 70, 1.0f};
+        return page.render(options);
+    }();
+    const int fallback_dark = count_dark_pixels(fallback_image, 0, 0, 70, 60);
+
+    const std::vector<std::pair<std::string, std::string>> formats{
+        {"ttf", "font/ttf"},
+        {"woff", "font/woff"},
+        {"woff2", "font/woff2"},
+    };
+
+    for (const auto& [extension, mime] : formats) {
+        auto loader = std::make_shared<RecordingResourceLoader>();
+        const std::string font_url = "https://example.test/icon." + extension;
+        loader->add(font_url, pagecore_icon_font_body(extension), mime);
+
+        pagecore::Page page;
+        page.set_resource_loader(loader);
+        page.load_html(R"HTML(
+<html><head><style>
+@font-face {
+  font-family: AliasIcon;
+  src: url('/icon.)HTML" + extension + R"HTML(');
+}
+</style></head>
+<body style="margin:0;background:white">
+<div style="font-family:AliasIcon;font-size:48px;line-height:1;color:black">&#xe000;</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+        pagecore::RenderOptions options;
+        options.viewport = pagecore::Viewport{90, 70, 1.0f};
+        const auto image = page.render(options);
+        const int webfont_dark = count_dark_pixels(image, 0, 0, 70, 60);
+
+        require(has_request_kind(*loader, font_url, pagecore::ResourceKind::Font),
+                "web font should be requested as a Font resource for " + extension);
+        require(webfont_dark > fallback_dark * 2,
+                "web font should render the embedded filled glyph instead of fallback tofu for " + extension);
+        require(region_has_close_pixel(image, 8, 12, 28, 28, pagecore::Color{0, 0, 0, 255}, 8),
+                "web font glyph should paint a solid dark interior for " + extension);
+    }
 }
 
 void test_page_render_decodes_and_draws_png_images()
@@ -4839,6 +4997,7 @@ int main()
         test_render_resource_cache_persists_across_rebuilds();
         test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();
+        test_page_render_uses_web_font_formats();
         test_page_render_decodes_and_draws_png_images();
         test_page_render_decodes_and_draws_data_url_images();
         test_page_render_decodes_css_data_url_background_images();

@@ -2,6 +2,7 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(CURL)
+find_dependency(ZLIB)
 
 set(PAGECORE_ENABLE_RENDERING @PAGECORE_ENABLE_RENDERING@)
 
@@ -21,6 +22,11 @@ _pagecore_import_static_dependency(PageCore::qjs "@PAGECORE_QJS_STATIC_FILE@")
 
 if(PAGECORE_ENABLE_RENDERING)
     _pagecore_import_static_dependency(PageCore::litehtml "@PAGECORE_LITEHTML_STATIC_FILE@")
+    _pagecore_import_static_dependency(PageCore::woff2common "@PAGECORE_WOFF2COMMON_STATIC_FILE@")
+    _pagecore_import_static_dependency(PageCore::woff2dec "@PAGECORE_WOFF2DEC_STATIC_FILE@")
+    set_property(TARGET PageCore::woff2dec APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES PageCore::woff2common
+    )
     # gumbo is only bundled when litehtml provided it (the install is conditional);
     # import and link it only if the archive was actually installed, so consumers
     # never reference a non-existent libgumbo.a.

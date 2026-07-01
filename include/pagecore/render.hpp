@@ -12,6 +12,7 @@
 namespace pagecore {
 
 class ResourceLoader;
+struct FontEnvironment;
 
 struct Viewport {
     int width = 1280;
@@ -164,12 +165,14 @@ struct DisplayList {
     Viewport viewport;
     int content_width = 0;
     int content_height = 0;
+    std::shared_ptr<const FontEnvironment> font_environment;
     std::vector<DisplayCommand> commands;
 
     void clear()
     {
         content_width = 0;
         content_height = 0;
+        font_environment.reset();
         commands.clear();
     }
 };
@@ -187,6 +190,10 @@ class LayoutEngine {
 public:
     virtual ~LayoutEngine() = default;
     virtual void set_resource_loader(std::shared_ptr<ResourceLoader> loader) = 0;
+    virtual void set_font_environment(std::shared_ptr<const FontEnvironment> font_environment)
+    {
+        (void) font_environment;
+    }
     virtual void set_viewport(Viewport viewport) = 0;
     virtual void load_html(std::string_view html, std::string_view base_url) = 0;
     virtual void layout() = 0;

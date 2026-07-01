@@ -2,6 +2,7 @@
 
 #include "pagecore/image_decoder.hpp"
 #include "pagecore/resource_loader.hpp"
+#include "web_fonts.hpp"
 
 #include <cairo.h>
 #include <litehtml.h>
@@ -232,7 +233,7 @@ public:
 
         // Reused across text_width()/create_font() so measurement does not
         // allocate a fresh PangoLayout per call (the hot path during layout).
-        measure_layout_ = pango_cairo_create_layout(measure_cr_);
+        reset_measure_layout();
         if (measure_layout_ == nullptr) {
             cairo_destroy(measure_cr_);
             cairo_surface_destroy(measure_surface_);
@@ -257,6 +258,15 @@ public:
     void set_resource_loader(std::shared_ptr<ResourceLoader> loader)
     {
         loader_ = std::move(loader);
+    }
+
+    void set_font_environment(std::shared_ptr<const FontEnvironment> font_environment)
+    {
+        font_environment_ = std::move(font_environment);
+        reset_measure_layout();
+        if (measure_layout_ == nullptr) {
+            throw std::runtime_error("failed to create Pango measurement layout");
+        }
     }
 
     void set_display_list(DisplayList* display_list)
@@ -328,7 +338,10 @@ public:
             handle->font.italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
 
         if (metrics != nullptr) {
-            PangoLayout* layout = pango_cairo_create_layout(measure_cr_);
+            PangoLayout* layout = create_pango_layout_for_cairo(measure_cr_, font_environment_);
+            if (layout == nullptr) {
+                throw std::runtime_error("failed to create Pango measurement layout");
+            }
             PangoContext* context = pango_layout_get_context(layout);
             PangoFontMetrics* pango_metrics = pango_context_get_metrics(
                 context,
@@ -700,8 +713,17 @@ public:
     }
 
 private:
+    void reset_measure_layout()
+    {
+        if (measure_layout_ != nullptr) {
+            g_object_unref(measure_layout_);
+        }
+        measure_layout_ = create_pango_layout_for_cairo(measure_cr_, font_environment_);
+    }
+
     Viewport viewport_;
     std::shared_ptr<ResourceLoader> loader_;
+    std::shared_ptr<const FontEnvironment> font_environment_;
     DisplayList* display_list_ = nullptr;
     std::string document_base_url_;
     std::string base_url_;
@@ -718,6 +740,13 @@ public:
     {
         loader_ = std::move(loader);
         container_.set_resource_loader(loader_);
+    }
+
+    void set_font_environment(std::shared_ptr<const FontEnvironment> font_environment) override
+    {
+        font_environment_ = std::move(font_environment);
+        container_.set_font_environment(font_environment_);
+        display_list_.font_environment = font_environment_;
     }
 
     void set_viewport(Viewport viewport) override
@@ -743,6 +772,7 @@ public:
         styles_computed_ = true;
         display_list_.clear();
         display_list_.viewport = viewport_;
+        display_list_.font_environment = font_environment_;
         // Drop the old document's element::ptrs immediately rather than
         // waiting for the next find_tagged_element() call to overwrite them.
         tagged_elements_.clear();
@@ -757,6 +787,7 @@ public:
 
         display_list_.clear();
         display_list_.viewport = viewport_;
+        display_list_.font_environment = font_environment_;
         container_.set_viewport(viewport_);
         container_.set_display_list(&display_list_);
 
@@ -947,6 +978,7 @@ private:
 
     Viewport viewport_;
     std::shared_ptr<ResourceLoader> loader_;
+    std::shared_ptr<const FontEnvironment> font_environment_;
     LiteHtmlDisplayListContainer container_;
     std::string html_;
     std::string base_url_;

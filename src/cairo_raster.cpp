@@ -1,5 +1,7 @@
 #include "pagecore/render.hpp"
 
+#include "web_fonts.hpp"
+
 #include <cairo.h>
 #include <cairo-pdf.h>
 #include <pango/pangocairo.h>
@@ -13,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -348,8 +351,12 @@ int scaled_font_pango_size(const Font& font, float scale)
 struct TextRenderState {
     PangoLayout* layout = nullptr;
     std::unordered_map<std::string, PangoFontDescription*> descriptions;
+    std::shared_ptr<const FontEnvironment> font_environment;
 
-    TextRenderState() = default;
+    explicit TextRenderState(std::shared_ptr<const FontEnvironment> environment)
+        : font_environment(std::move(environment))
+    {
+    }
     TextRenderState(const TextRenderState&) = delete;
     TextRenderState& operator=(const TextRenderState&) = delete;
 
@@ -401,7 +408,7 @@ void draw_text(cairo_t* cr, const TextCommand& command, float scale, TextRenderS
     }
 
     if (text.layout == nullptr) {
-        text.layout = pango_cairo_create_layout(cr);
+        text.layout = create_pango_layout_for_cairo(cr, text.font_environment);
         if (text.layout == nullptr) {
             throw std::runtime_error("failed to create Pango layout");
         }
@@ -707,7 +714,7 @@ void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color backg
     set_source(cr, background);
     cairo_paint(cr);
 
-    TextRenderState text;
+    TextRenderState text(display_list.font_environment);
     int clip_depth = 0;
     for (const auto& command : display_list.commands) {
         std::visit(

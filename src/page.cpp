@@ -3,6 +3,9 @@
 #include "js_runtime.hpp"
 #include "pagecore/render.hpp"
 #include "pagecore/resource_loader.hpp"
+#if defined(PAGECORE_ENABLE_RENDERING)
+#include "web_fonts.hpp"
+#endif
 
 #include <memory>
 #include <algorithm>
@@ -95,6 +98,13 @@ struct CssUrlRef {
     ResourceKind kind = ResourceKind::Image;
 };
 
+#if defined(PAGECORE_ENABLE_RENDERING)
+struct PendingFontRequest {
+    WebFontSource source;
+    ResourceRequest request;
+};
+#endif
+
 struct GeometryCacheEntry {
     std::optional<ElementGeometry> geometry;
 };
@@ -102,8 +112,8 @@ struct GeometryCacheEntry {
 // Extracts url(...) targets from a CSS source so they can be prefetched. Handles
 // comments, quoted/unquoted targets, and multi-value declarations. `@import`
 // targets are returned as stylesheets; `src:` declarations (web fonts) are
-// skipped because the engine renders text with system fonts and never downloads
-// font files. Callers still resolve and filter the raw targets.
+// skipped here because they are fetched by the web-font pipeline, not the image
+// prefetch path. Callers still resolve and filter the raw targets.
 std::vector<CssUrlRef> extract_css_urls(std::string_view css)
 {
     std::vector<CssUrlRef> out;
@@ -503,6 +513,144 @@ struct Page::Impl {
         }
     }
 
+#if defined(PAGECORE_ENABLE_RENDERING)
+    void add_font_request(
+        std::vector<PendingFontRequest>& requests,
+        std::unordered_set<std::string>& seen,
+        const std::string& resolve_base,
+        const std::string& referrer,
+        const CssFontFace& face,
+        std::string_view raw)
+    {
+        if (raw.empty()) {
+            return;
+        }
+        const std::string url = resolve_url(resolve_base, raw);
+        if (url.empty() || url.front() == '#' || url.rfind("blob:", 0) == 0) {
+            return;
+        }
+
+        std::string key = face.family;
+        key += '\n';
+        key += std::to_string(face.weight);
+        key += face.italic ? "\ni\n" : "\nn\n";
+        key += url;
+        if (!seen.insert(key).second) {
+            return;
+        }
+
+        requests.push_back(PendingFontRequest{
+            WebFontSource{face.family, url, {}, face.weight, face.italic},
+            ResourceRequest{url, ResourceKind::Font, referrer, resolve_base},
+        });
+    }
+
+    void collect_font_requests_from_css(
+        std::string_view css,
+        const std::string& resolve_base,
+        const std::string& referrer,
+        std::vector<PendingFontRequest>& requests,
+        std::unordered_set<std::string>& seen)
+    {
+        for (const auto& face : extract_font_faces(css)) {
+            for (const auto& source : face.sources) {
+                add_font_request(requests, seen, resolve_base, referrer, face, source);
+            }
+        }
+    }
+
+    std::shared_ptr<const FontEnvironment> prepare_font_environment(
+        const RenderOptions& render_options,
+        const std::shared_ptr<ResourceLoader>& render_loader)
+    {
+        if (!render_options.load_external_resources || !render_loader) {
+            return nullptr;
+        }
+
+        const std::string effective_base = effective_base_url(render_options);
+        std::vector<PendingFontRequest> pending_fonts;
+        std::unordered_set<std::string> seen_fonts;
+        const NodeId root = document.document_node();
+
+        for (NodeId style : document.query_selector_all(root, "style")) {
+            collect_font_requests_from_css(
+                document.text_content(style),
+                effective_base,
+                effective_base,
+                pending_fonts,
+                seen_fonts);
+        }
+
+        std::vector<ResourceRequest> stylesheet_requests;
+        std::unordered_set<std::string> seen_stylesheets;
+        for (NodeId link : document.query_selector_all(root, "link[rel='stylesheet'][href]")) {
+            if (const auto href = document.get_attribute(link, "href")) {
+                add_subresource(
+                    stylesheet_requests,
+                    seen_stylesheets,
+                    effective_base,
+                    effective_base,
+                    *href,
+                    ResourceKind::Stylesheet);
+            }
+        }
+
+        if (!stylesheet_requests.empty()) {
+            try {
+                const auto sheets = render_loader->load_all(stylesheet_requests, BatchErrorMode::Lenient);
+                for (std::size_t i = 0; i < sheets.size() && i < stylesheet_requests.size(); ++i) {
+                    const auto& sheet = sheets[i];
+                    if (sheet.status < 200 || sheet.status >= 400 || sheet.body.empty()) {
+                        continue;
+                    }
+                    const std::string sheet_base = sheet.url.empty() ? stylesheet_requests[i].url : sheet.url;
+                    collect_font_requests_from_css(
+                        sheet.body,
+                        sheet_base,
+                        effective_base,
+                        pending_fonts,
+                        seen_fonts);
+                }
+            } catch (...) {
+            }
+        }
+
+        if (pending_fonts.empty()) {
+            return nullptr;
+        }
+
+        std::vector<ResourceRequest> font_requests;
+        font_requests.reserve(pending_fonts.size());
+        for (const auto& pending : pending_fonts) {
+            font_requests.push_back(pending.request);
+        }
+
+        std::vector<WebFontSource> loaded_fonts;
+        try {
+            const auto responses = render_loader->load_all(font_requests, BatchErrorMode::Lenient);
+            for (std::size_t i = 0; i < responses.size() && i < pending_fonts.size(); ++i) {
+                if (responses[i].status < 200 || responses[i].status >= 400 || responses[i].body.empty()) {
+                    continue;
+                }
+                WebFontSource source = std::move(pending_fonts[i].source);
+                source.body = responses[i].body;
+                loaded_fonts.push_back(std::move(source));
+            }
+        } catch (...) {
+            return nullptr;
+        }
+
+        return create_font_environment(loaded_fonts);
+    }
+#else
+    std::shared_ptr<const FontEnvironment> prepare_font_environment(
+        const RenderOptions&,
+        const std::shared_ptr<ResourceLoader>&)
+    {
+        return nullptr;
+    }
+#endif
+
     // Returns the loader litehtml should use for a render. When external loading
     // is enabled, the page's sub-resources are prefetched concurrently into a
     // cache so the layout's synchronous requests hit warm entries.
@@ -647,8 +795,11 @@ struct Page::Impl {
             throw std::runtime_error("layout engine factory returned null");
         }
 
+        auto render_loader = prepare_render_loader(render_options);
+        auto font_environment = prepare_font_environment(render_options, render_loader);
         layout->set_viewport(render_options.viewport);
-        layout->set_resource_loader(prepare_render_loader(render_options));
+        layout->set_resource_loader(std::move(render_loader));
+        layout->set_font_environment(std::move(font_environment));
         layout->load_html(serialized_html_for_render(), render_base_url(render_options));
         layout->layout();
         return layout;
@@ -675,8 +826,11 @@ struct Page::Impl {
             throw std::runtime_error("layout engine factory returned null");
         }
 
+        auto render_loader = prepare_render_loader(render_options);
+        auto font_environment = prepare_font_environment(render_options, render_loader);
         engine->set_viewport(render_options.viewport);
-        engine->set_resource_loader(prepare_render_loader(render_options));
+        engine->set_resource_loader(std::move(render_loader));
+        engine->set_font_environment(std::move(font_environment));
         {
             const auto t0 = std::chrono::steady_clock::now();
             engine->load_html(serialized_html_for_render(), render_base_url(render_options));
