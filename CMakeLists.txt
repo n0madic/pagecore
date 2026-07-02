@@ -167,7 +167,13 @@ function(pagecore_pkg_config_static_first target)
             target_link_directories(${target} INTERFACE "${CMAKE_MATCH_1}")
         endif()
     endforeach()
-    list(APPEND pkg_lib_dirs "/opt/homebrew/lib" "/usr/local/lib")
+    if(APPLE)
+        # Homebrew installs static libraries outside the pkg-config -L search
+        # paths; include the standard Homebrew prefixes so the static-first
+        # resolution below can find them. Guarded to Apple so these non-portable
+        # paths never pull a stray system .a into non-macOS builds.
+        list(APPEND pkg_lib_dirs "/opt/homebrew/lib" "/usr/local/lib")
+    endif()
 
     # Fontconfig has process-global state used by Cairo/Pango. When Cairo is
     # dynamic, mixing it with a static libfontconfig copy leaves two independent
@@ -301,7 +307,11 @@ FetchContent_Declare(
 pagecore_fetchcontent_make_available_excluded(lexbor)
 pagecore_fetchcontent_make_available_excluded(quickjs_ng)
 
-find_package(CURL 7.64.0 REQUIRED COMPONENTS libz)
+# zlib is required separately below and linked transitively through CURL::libcurl.
+# Requesting it here as a CURL "component" is fragile: in CONFIG mode
+# (CURLConfig.cmake) "libz" is a feature string that may not be exposed as a
+# component, causing a spurious hard configure failure.
+find_package(CURL 7.64.0 REQUIRED)
 find_package(ZLIB REQUIRED)
 
 find_program(PAGECORE_NODE_EXECUTABLE NAMES node)
@@ -567,6 +577,9 @@ if(PAGECORE_BUILD_TESTS)
     target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps)
     pagecore_strip_release_binary(pagecore_tests)
     add_test(NAME pagecore_tests COMMAND pagecore_tests)
+    # Cap the suite so a hung loopback-server test (blocking accept()) fails the
+    # run instead of stalling CI indefinitely.
+    set_tests_properties(pagecore_tests PROPERTIES TIMEOUT 300)
     if(PAGECORE_ENABLE_RENDERING AND PAGECORE_BUILD_TOOLS)
         add_test(
             NAME pagecore_cli_screenshot
@@ -656,12 +669,28 @@ if(PAGECORE_BUILD_TESTS)
             NAME pagecore_cli_rejects_missing_output
             COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --format pdf
         )
+        add_test(
+            NAME pagecore_cli_rejects_conflicting_sources
+            COMMAND $<TARGET_FILE:pagecore_cli> --html "<html></html>" --url "https://example.test/"
+        )
+        add_test(
+            NAME pagecore_cli_rejects_scaled_dimension_overflow
+            COMMAND
+                $<TARGET_FILE:pagecore_cli>
+                --html "<html></html>"
+                --format png
+                --output "${CMAKE_CURRENT_BINARY_DIR}/pagecore_cli_overflow.png"
+                --viewport 16000x16000
+                --scale 2
+        )
         set_tests_properties(
             pagecore_cli_rejects_viewport_overflow
             pagecore_cli_rejects_viewport_over_max
             pagecore_cli_rejects_bad_scale
             pagecore_cli_rejects_missing_value
             pagecore_cli_rejects_missing_output
+            pagecore_cli_rejects_conflicting_sources
+            pagecore_cli_rejects_scaled_dimension_overflow
             PROPERTIES WILL_FAIL TRUE
         )
     endif()

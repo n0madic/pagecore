@@ -13,11 +13,15 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -441,6 +445,85 @@ bool is_blocked_ipv6(const std::uint8_t* b)
     return false;
 }
 
+// Parses the "legacy" numeric IPv4 forms that the C resolver (inet_aton /
+// getaddrinfo) accepts but inet_pton rejects: 1-4 dotted parts, each decimal,
+// octal (0-prefixed) or hex (0x-prefixed) — e.g. 2130706433, 0x7f000001, 127.1,
+// 0177.0.0.1. Returns the host-order 32-bit address so it can be screened by
+// is_blocked_ipv4, closing an SSRF bypass (http://2130706433/ -> 127.0.0.1) that
+// the literal pre-flight would otherwise miss on every platform.
+std::optional<std::uint32_t> parse_numeric_ipv4(const std::string& host)
+{
+    if (host.empty()) {
+        return std::nullopt;
+    }
+    std::array<std::uint64_t, 4> parts{};
+    std::size_t part_count = 0;
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t dot = host.find('.', start);
+        const std::string part =
+            host.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+        if (part.empty() || part_count >= parts.size()) {
+            return std::nullopt;
+        }
+        int base = 10;
+        std::size_t idx = 0;
+        if (part.size() >= 2 && part[0] == '0' && (part[1] == 'x' || part[1] == 'X')) {
+            base = 16;
+            idx = 2;
+            if (idx >= part.size()) {
+                return std::nullopt;
+            }
+        } else if (part.size() >= 2 && part[0] == '0') {
+            base = 8;
+            idx = 1;
+        }
+        std::uint64_t value = 0;
+        for (; idx < part.size(); ++idx) {
+            const char ch = part[idx];
+            int digit;
+            if (ch >= '0' && ch <= '9') {
+                digit = ch - '0';
+            } else if (base == 16 && ch >= 'a' && ch <= 'f') {
+                digit = ch - 'a' + 10;
+            } else if (base == 16 && ch >= 'A' && ch <= 'F') {
+                digit = ch - 'A' + 10;
+            } else {
+                return std::nullopt;
+            }
+            if (digit >= base) {
+                return std::nullopt;
+            }
+            value = value * static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(digit);
+            if (value > 0xffffffffULL) {
+                return std::nullopt;
+            }
+        }
+        parts[part_count++] = value;
+        if (dot == std::string::npos) {
+            break;
+        }
+        start = dot + 1;
+    }
+
+    // inet_aton semantics: the final part fills the bytes the leading parts leave.
+    std::uint32_t address = 0;
+    for (std::size_t i = 0; i + 1 < part_count; ++i) {
+        if (parts[i] > 0xff) {
+            return std::nullopt;
+        }
+        address |= static_cast<std::uint32_t>(parts[i]) << (8 * (3 - i));
+    }
+    const std::size_t remaining_bytes = 4 - (part_count - 1);
+    const std::uint64_t max_tail =
+        remaining_bytes >= 4 ? 0xffffffffULL : ((1ULL << (8 * remaining_bytes)) - 1);
+    if (parts[part_count - 1] > max_tail) {
+        return std::nullopt;
+    }
+    address |= static_cast<std::uint32_t>(parts[part_count - 1]);
+    return address;
+}
+
 // Block literal-IP and well-known-local hosts before any DNS lookup. DNS names
 // that resolve to internal addresses are caught later by the socket callback.
 bool is_blocked_literal_host(const std::string& host, const ResourcePolicy& policy)
@@ -466,9 +549,8 @@ bool is_blocked_literal_host(const std::string& host, const ResourcePolicy& poli
         }
         return false;
     }
-    in_addr v4{};
-    if (inet_pton(AF_INET, host.c_str(), &v4) == 1) {
-        return is_blocked_ipv4(ntohl(v4.s_addr));
+    if (auto numeric = parse_numeric_ipv4(host)) {
+        return is_blocked_ipv4(*numeric);
     }
     return false;
 }
@@ -480,7 +562,6 @@ struct OpenSocketContext {
     bool blocked = false;
 };
 
-#if !defined(_WIN32)
 bool is_blocked_sockaddr(const sockaddr* sa)
 {
     if (sa == nullptr) {
@@ -508,7 +589,6 @@ curl_socket_t guarded_open_socket(void* clientp, curlsocktype purpose, curl_sock
     }
     return ::socket(address->family, address->socktype, address->protocol);
 }
-#endif
 
 #if LIBCURL_VERSION_NUM >= 0x075500
 std::string curl_request_protocols_string(const ResourcePolicy& policy)
@@ -597,6 +677,22 @@ std::string origin_of(std::string_view url)
         origin += ":" + port;
     }
     return origin;
+}
+
+// Sanitizes a referrer and, on a cross-origin request, downgrades it to the
+// origin only (browser default: strict-origin-when-cross-origin), so a full
+// path+query is never leaked to a different origin.
+std::string referrer_for_target(std::string_view referrer, std::string_view target_url)
+{
+    const std::string full = sanitize_http_referrer(referrer);
+    if (full.empty()) {
+        return full;
+    }
+    if (origin_of(full) != origin_of(target_url)) {
+        const std::string origin = origin_of(full);
+        return origin.empty() ? std::string{} : origin + "/";
+    }
+    return full;
 }
 
 void enforce_request_policy(const ResourceRequest& request, const ResourcePolicy& policy)
@@ -1064,6 +1160,14 @@ bool looks_like_host_reference(std::string_view candidate)
     return true;
 }
 
+bool header_field_has_control_chars(std::string_view value)
+{
+    return std::any_of(value.begin(), value.end(), [](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return byte < 0x20 || byte == 0x7f;
+    });
+}
+
 CurlHeaderList apply_request_metadata(CURL* curl, const ResourceRequest& request)
 {
     if (request.method == "HEAD") {
@@ -1081,12 +1185,30 @@ CurlHeaderList apply_request_metadata(CURL* curl, const ResourceRequest& request
     }
 
     curl_slist* raw_headers = nullptr;
+    std::string cookie_string;
     for (const auto& [name, value] : request.headers) {
         if (name.empty()) {
             continue;
         }
+        // Reject CR/LF/NUL and other control characters in the field name or value:
+        // libcurl emits CURLOPT_HTTPHEADER entries verbatim, so a control character
+        // here would allow header/request-line injection when a page-controlled
+        // header (e.g. XHR setRequestHeader) reaches this point.
+        if (header_field_has_control_chars(name) || header_field_has_control_chars(value)) {
+            continue;
+        }
+        if (header_name_equals(name, "cookie")) {
+            // Route cookies through libcurl's cookie engine instead of a raw header
+            // so they are stored scoped to the request host and are NOT replayed to a
+            // different origin when a redirect is followed (cross-origin cookie leak).
+            if (!cookie_string.empty()) {
+                cookie_string += "; ";
+            }
+            cookie_string += value;
+            continue;
+        }
         if (header_name_equals(name, "referer")) {
-            const std::string sanitized_referrer = sanitize_http_referrer(value);
+            const std::string sanitized_referrer = referrer_for_target(value, request.url);
             if (sanitized_referrer.empty()) {
                 continue;
             }
@@ -1096,6 +1218,14 @@ CurlHeaderList apply_request_metadata(CURL* curl, const ResourceRequest& request
             const std::string header = name + ": " + value;
             raw_headers = curl_slist_append(raw_headers, header.c_str());
         }
+    }
+    if (!cookie_string.empty()) {
+        // Enable the in-memory cookie engine ("" == no file, cookies stored in RAM)
+        // and hand the cookies to it. libcurl scopes them to the origin host and only
+        // replays them to hosts they match on subsequent redirect hops. libcurl copies
+        // both strings, so the local cookie_string need not outlive this call.
+        curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
+        curl_easy_setopt(curl, CURLOPT_COOKIE, cookie_string.c_str());
     }
     CurlHeaderList headers(raw_headers);
     if (headers) {
@@ -1147,14 +1277,13 @@ CurlHeaderList configure_network_handle(
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS, curl_redirect_protocols_mask(policy));
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, curl_redirect_protocols_mask(policy));
 #endif
-#if !defined(_WIN32)
+    // Connect-time SSRF guard (all platforms): reject sockets whose resolved
+    // address is private/loopback/link-local, catching DNS-rebinding and
+    // redirect-to-internal that the literal-host pre-flight cannot see.
     socket_context.policy = &policy;
     socket_context.blocked = false;
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, guarded_open_socket);
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &socket_context);
-#else
-    (void) socket_context;
-#endif
     curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
@@ -1163,7 +1292,7 @@ CurlHeaderList configure_network_handle(
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response_headers);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(policy.timeout.count()));
-    const std::string sanitized_referrer = sanitize_http_referrer(request.referrer);
+    const std::string sanitized_referrer = referrer_for_target(request.referrer, request.url);
     if (!sanitized_referrer.empty() && !has_request_header(request, "referer")) {
         curl_easy_setopt(curl, CURLOPT_REFERER, sanitized_referrer.c_str());
     }

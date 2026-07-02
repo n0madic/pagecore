@@ -1272,6 +1272,22 @@ std::optional<std::pair<int, int>> jpeg_dimensions_from_header(std::string_view 
     return std::nullopt;
 }
 
+std::optional<std::pair<std::uint32_t, std::uint32_t>> png_dimensions_from_header(std::string_view bytes)
+{
+    // PNG layout: 8-byte signature, then the first chunk which must be IHDR
+    // (4-byte length, "IHDR", 13-byte data starting with width/height as BE u32).
+    if (!is_png(bytes) || bytes.size() < 24 || std::memcmp(bytes.data() + 12, "IHDR", 4) != 0) {
+        return std::nullopt;
+    }
+    const auto read_be32 = [&](std::size_t at) {
+        return (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at])) << 24)
+            | (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 1])) << 16)
+            | (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 2])) << 8)
+            | static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 3]));
+    };
+    return std::pair<std::uint32_t, std::uint32_t>{read_be32(16), read_be32(20)};
+}
+
 std::uint8_t unpremultiply(std::uint8_t value, std::uint8_t alpha)
 {
     if (alpha == 0) {
@@ -1314,6 +1330,98 @@ void resize_rgba(DecodedImage& image, int width, int height, const char* operati
     image.height = height;
     image.rgba.resize(checked_rgba_size(width, height, operation));
 }
+
+// Rejects dimensions parsed straight from an image header (before any decoder
+// allocates), so a crafted header cannot force a huge allocation that the
+// post-decode checked_rgba_size guard would only catch after the fact.
+void enforce_decoded_pixel_budget(std::uint64_t width, std::uint64_t height, const char* operation)
+{
+    if (width == 0 || height == 0) {
+        throw std::runtime_error(std::string(operation) + ": invalid image dimensions");
+    }
+    if (width > static_cast<std::uint64_t>(kMaxDecodedImagePixels) / height
+        || width * height > static_cast<std::uint64_t>(kMaxDecodedImagePixels)) {
+        throw std::runtime_error(std::string(operation) + ": decoded image is too large");
+    }
+}
+
+#if !defined(PAGECORE_IMAGE_DECODER_STB)
+// Walks the GIF block structure (without decoding LZW) and enforces the pixel
+// budget on the logical screen, every frame descriptor, and their cumulative
+// pixel count, before DGifSlurp allocates any raster buffers. giflib imposes no
+// size limit of its own, so a tiny file declaring 65535x65535 (or a flood of
+// frames) would otherwise force a multi-GB allocation inside DGifSlurp.
+void enforce_gif_dimension_budget(std::string_view bytes, const char* operation)
+{
+    if (bytes.size() < 13) {
+        return; // Truncated header; giflib will reject it.
+    }
+    const auto u16 = [&](std::size_t at) {
+        return static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at]))
+            | (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + 1])) << 8);
+    };
+
+    enforce_decoded_pixel_budget(u16(6), u16(8), operation);
+
+    std::uint64_t total_pixels = 0;
+    std::size_t offset = 13;
+    const unsigned char screen_packed = static_cast<unsigned char>(bytes[10]);
+    if (screen_packed & 0x80u) {
+        offset += 3u * (1u << ((screen_packed & 0x07u) + 1));
+    }
+
+    while (offset < bytes.size()) {
+        const unsigned char block = static_cast<unsigned char>(bytes[offset++]);
+        if (block == 0x3Bu) { // Trailer.
+            break;
+        }
+        if (block == 0x21u) { // Extension: label byte + data sub-blocks.
+            if (offset >= bytes.size()) {
+                break;
+            }
+            ++offset; // label
+            while (offset < bytes.size()) {
+                const unsigned char sub = static_cast<unsigned char>(bytes[offset++]);
+                if (sub == 0) {
+                    break;
+                }
+                offset += sub;
+            }
+            continue;
+        }
+        if (block == 0x2Cu) { // Image descriptor.
+            if (offset + 9 > bytes.size()) {
+                break;
+            }
+            const std::uint32_t frame_width = u16(offset + 4);
+            const std::uint32_t frame_height = u16(offset + 6);
+            enforce_decoded_pixel_budget(frame_width, frame_height, operation);
+            total_pixels += static_cast<std::uint64_t>(frame_width) * frame_height;
+            if (total_pixels > static_cast<std::uint64_t>(kMaxDecodedImagePixels)) {
+                throw std::runtime_error(std::string(operation) + ": decoded image is too large");
+            }
+            const unsigned char frame_packed = static_cast<unsigned char>(bytes[offset + 8]);
+            offset += 9;
+            if (frame_packed & 0x80u) {
+                offset += 3u * (1u << ((frame_packed & 0x07u) + 1));
+            }
+            if (offset >= bytes.size()) {
+                break;
+            }
+            ++offset; // LZW minimum code size.
+            while (offset < bytes.size()) {
+                const unsigned char sub = static_cast<unsigned char>(bytes[offset++]);
+                if (sub == 0) {
+                    break;
+                }
+                offset += sub;
+            }
+            continue;
+        }
+        break; // Unknown block; leave the rest for giflib to reject.
+    }
+}
+#endif
 
 #if !defined(PAGECORE_IMAGE_DECODER_STB)
 int read_gif_stream(GifFileType* gif, GifByteType* data, int length)
@@ -1463,6 +1571,9 @@ std::shared_ptr<const DecodedImage> decode_png_rgba(std::string_view bytes)
     if (bytes.empty()) {
         throw std::runtime_error("decode PNG: empty input");
     }
+    if (auto dimensions = png_dimensions_from_header(bytes)) {
+        enforce_decoded_pixel_budget(dimensions->first, dimensions->second, "decode PNG");
+    }
 
     StreamReader reader{bytes};
     cairo_surface_t* raw_surface = cairo_image_surface_create_from_png_stream(read_png_stream, &reader);
@@ -1578,6 +1689,7 @@ std::shared_ptr<const DecodedImage> decode_gif_rgba(std::string_view bytes)
     if (bytes.empty()) {
         throw std::runtime_error("decode GIF: empty input");
     }
+    enforce_gif_dimension_budget(bytes, "decode GIF");
 
     GifMemoryReader reader{bytes};
     int open_error = 0;

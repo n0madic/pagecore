@@ -53,6 +53,7 @@ void usage(const char* argv0)
         << "options:\n"
         << "  --format FORMAT          output format: html, png, or pdf; default html\n"
         << "  --output PATH            output path; required for png/pdf, optional for html\n"
+        << "  --screenshot PATH        shorthand for --format png --output PATH\n"
         << "  --viewport WIDTHxHEIGHT  render viewport, default 1280x720\n"
         << "  --full-page              expand the viewport height to the full page content height before rendering\n"
         << "  --scale NUMBER           render scale factor, default 1\n"
@@ -71,10 +72,14 @@ void usage(const char* argv0)
         << "  --perf-trace PATH|-      write perf trace JSONL; '-' writes to stderr\n";
 }
 
-// Largest render dimension we accept; well above any real viewport but
-// small enough that width*height*4 cannot exhaust memory by accident.
+// Largest render dimension we accept per axis. Note this bounds each axis only;
+// the surface is created at viewport x device_scale, so the width*height*scale^2
+// product is bounded separately by validate_render_dimensions().
 constexpr int kMaxViewportDimension = 16384;
 constexpr float kMaxScale = 8.0f;
+// Upper bound on the rasterized pixel count (~256 MB as ARGB32), matching the
+// raster backend's own guard.
+constexpr double kMaxRenderPixels = 64.0 * 1024.0 * 1024.0;
 
 void validate_full_page_height(int content_height)
 {
@@ -83,6 +88,44 @@ void validate_full_page_height(int content_height)
             "--full-page content height (" + std::to_string(content_height)
             + ") exceeds max viewport dimension (" + std::to_string(kMaxViewportDimension) + ")");
     }
+}
+
+// The per-axis caps do not bound width x height x scale^2, so a request like
+// --viewport 16000x16000 --scale 2 (~4 GB) passes them yet exhausts memory.
+// Reject it up front with a clear message instead of attempting the allocation.
+void validate_render_dimensions(const pagecore::Viewport& viewport)
+{
+    const double scale = std::max(0.0f, viewport.device_scale_factor);
+    const double pixels =
+        static_cast<double>(viewport.width) * scale * static_cast<double>(viewport.height) * scale;
+    if (pixels > kMaxRenderPixels) {
+        throw std::runtime_error(
+            "viewport width x height x scale^2 exceeds the maximum render surface size ("
+            + std::to_string(static_cast<long long>(kMaxRenderPixels)) + " pixels)");
+    }
+}
+
+// Builds a file:// URL from a local path, percent-encoding characters that would
+// otherwise break URL parsing (spaces, '#', '?', '%', etc.) so relative
+// sub-resource resolution against the base URL works for paths with such chars.
+std::string to_file_url(const std::string& path)
+{
+    static const char* kHexDigits = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(path.size());
+    for (unsigned char ch : path) {
+        const bool unreserved = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+            || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~'
+            || ch == '/' || ch == ':';
+        if (unreserved) {
+            encoded.push_back(static_cast<char>(ch));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHexDigits[ch >> 4]);
+            encoded.push_back(kHexDigits[ch & 0x0f]);
+        }
+    }
+    return "file://" + encoded;
 }
 
 pagecore::RenderedImage render_display_list_traced(
@@ -420,11 +463,17 @@ int main(int argc, char** argv)
             render_options.perf_trace = std::move(perf_trace);
         }
 
+        const int source_count = (!url.empty() ? 1 : 0) + (!file.empty() ? 1 : 0)
+            + (!html.empty() ? 1 : 0) + (stdin_input ? 1 : 0);
+        if (source_count > 1) {
+            throw std::runtime_error("choose exactly one input source: --url, --file, --html, or --stdin");
+        }
+
         pagecore::Page page(load_options);
         if (!url.empty()) {
             page.load_url(url);
         } else if (!file.empty()) {
-            page.load_html(read_file(file), "file://" + file);
+            page.load_html(read_file(file), to_file_url(file));
         } else if (!html.empty()) {
             page.load_html(html);
         } else if (stdin_input) {
@@ -471,6 +520,8 @@ int main(int argc, char** argv)
             if (output == "-") {
                 throw std::runtime_error(std::string("--output - is not supported for ") + output_format_name(output_format) + " output");
             }
+
+            validate_render_dimensions(render_options.viewport);
 
             if (output_format == OutputFormat::Png) {
                 if (full_page) {

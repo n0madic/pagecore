@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -340,8 +341,11 @@ PangoWeight pango_weight(int weight)
 
 int scaled_font_pango_size(const Font& font, float scale)
 {
-    return static_cast<int>(
-        std::round(std::max(1.0, static_cast<double>(font.size_px) * scale) * PANGO_SCALE));
+    const double device_px = std::max(1.0, static_cast<double>(font.size_px) * scale);
+    // Clamp before multiplying by PANGO_SCALE so a pathological font-size cannot
+    // overflow the int Pango size (signed overflow is UB and yields garbage sizes).
+    const double max_device_px = static_cast<double>(std::numeric_limits<int>::max() / PANGO_SCALE);
+    return static_cast<int>(std::round(std::min(device_px, max_device_px) * PANGO_SCALE));
 }
 
 // Per-render-pass text resources. One Pango layout is created lazily and reused
@@ -419,8 +423,12 @@ void draw_text(cairo_t* cr, const TextCommand& command, float scale, TextRenderS
     // instance stays owned by TextRenderState.
     pango_layout_set_font_description(layout, text.description_for(command.font, scale));
     pango_layout_set_text(layout, command.text.c_str(), static_cast<int>(command.text.size()));
-    pango_layout_set_width(layout, rect.width * PANGO_SCALE);
-    pango_layout_set_height(layout, rect.height * PANGO_SCALE);
+    // litehtml owns line breaking and hands us one already-fragmented run per call,
+    // so disable Pango's own wrapping/ellipsization: constraining to the box width
+    // (with floor/ceil rounding) could wrap the last word onto a clipped second line.
+    // Using -1 also avoids a signed-overflow in rect.width * PANGO_SCALE for very
+    // wide boxes.
+    pango_layout_set_width(layout, -1);
 
     set_source(cr, command.color);
     cairo_move_to(cr, rect.x, rect.y);
@@ -743,6 +751,14 @@ public:
         const float scale = std::max(0.01f, display_list.viewport.device_scale_factor);
         const int width = std::max(1, to_pixel_ceil(static_cast<double>(display_list.viewport.width) * scale));
         const int height = std::max(1, to_pixel_ceil(static_cast<double>(display_list.viewport.height) * scale));
+
+        // Bound the ARGB32 buffer (viewport x device_scale can exceed any per-axis
+        // limit) so a huge canvas is rejected up front instead of attempting a
+        // multi-gigabyte allocation that surface_to_rgba would then try to copy.
+        constexpr long long kMaxCanvasPixels = 64ll * 1024 * 1024; // ~256 MB ARGB32
+        if (static_cast<long long>(width) * static_cast<long long>(height) > kMaxCanvasPixels) {
+            throw std::runtime_error("render surface exceeds the maximum canvas size");
+        }
 
         cairo_surface_t* raw_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
         check_status(cairo_surface_status(raw_surface), "create Cairo image surface");

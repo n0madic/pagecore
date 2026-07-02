@@ -1113,15 +1113,17 @@ struct Page::Impl {
         std::size_t inline_script_index = 0;
         std::size_t inline_module_index = 0;
         for (NodeId script : document.query_selector_all(root, "script")) {
-            if (document.has_attribute(script, "nomodule")) {
-                continue;
-            }
             const auto src = document.get_attribute(script, "src");
             const auto type = document.get_attribute(script, "type");
             if (!is_javascript_script_type(type)) {
                 continue;
             }
             const bool module = is_module_script_type(type);
+            // Per the HTML spec, `nomodule` suppresses only classic scripts; a
+            // module-capable engine must still run `<script type="module" nomodule>`.
+            if (!module && document.has_attribute(script, "nomodule")) {
+                continue;
+            }
 
             if (src && !src->empty()) {
                 const std::string base = current_url.empty() ? options.base_url : current_url;
@@ -1157,7 +1159,12 @@ struct Page::Impl {
                 &cookie_jar,
                 current_url.empty() ? options.base_url : current_url,
                 CookieCredentials::SameOrigin);
-            std::vector<ResourceResponse> responses = loader->load_all(external_requests);
+            // Lenient: a single failed external script (timeout, transport error,
+            // SSRF/policy block, oversize) must not abort the whole page load. A
+            // failed slot yields an empty body and is simply skipped at execution,
+            // matching how a browser continues past a broken <script src>.
+            std::vector<ResourceResponse> responses =
+                loader->load_all(external_requests, BatchErrorMode::Lenient);
             std::uint64_t loaded_bytes = 0;
             for (std::size_t i = 0; i < responses.size() && i < external_slots.size(); ++i) {
                 loaded_bytes += responses[i].body.size();

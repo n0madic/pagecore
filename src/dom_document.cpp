@@ -460,7 +460,22 @@ lxb_css_selector_list_t* DomDocument::Impl::compiled_selector(std::string_view s
         throw std::runtime_error("invalid CSS selector");
     }
 
-    selector_cache.emplace(std::move(key), list);
+    // Bound the cache with FIFO eviction, freeing each evicted list's memory pool.
+    constexpr std::size_t kMaxSelectorCacheEntries = 1024;
+    while (selector_cache.size() >= kMaxSelectorCacheEntries && !selector_cache_order.empty()) {
+        const std::string& oldest = selector_cache_order.front();
+        auto victim = selector_cache.find(oldest);
+        if (victim != selector_cache.end()) {
+            if (victim->second != nullptr) {
+                lxb_css_selector_list_destroy_memory(victim->second);
+            }
+            selector_cache.erase(victim);
+        }
+        selector_cache_order.pop_front();
+    }
+
+    selector_cache.emplace(key, list);
+    selector_cache_order.push_back(std::move(key));
     return list;
 }
 
@@ -859,8 +874,13 @@ void DomDocument::parse(std::string_view html)
         carried_stylesheet_generation = impl_->stylesheet_generation;
     }
 
+    // Construct the replacement first, then swap: if the Impl constructor throws
+    // (e.g. lxb_html_document_create() returns null under allocation pressure),
+    // impl_ must keep pointing at the still-valid old document rather than at freed
+    // memory (which the destructor would then double-free).
+    auto fresh = std::make_unique<Impl>();
     delete impl_;
-    impl_ = new Impl();
+    impl_ = fresh.release();
     impl_->next_id = carried_next_id;
     impl_->mutation_version = carried_mutation_version + 1;
     impl_->layout_mutation_version = carried_layout_mutation_version + 1;

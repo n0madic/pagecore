@@ -7,6 +7,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -194,6 +195,53 @@ bool is_ipv4_address(std::string_view host)
     return parts == 4;
 }
 
+// Whether `host` (already lowercased, not an IP/localhost) is a public suffix
+// under which independent registrants live. A bare single-label TLD ("com") is
+// always a public suffix; the curated set covers the common multi-label suffixes
+// that a full Public Suffix List would enumerate. This is intentionally a
+// heuristic subset — it is used to reject cookies scoped to a suffix (supercookie
+// defense) and to compute the registrable domain for SameSite, both of which fail
+// safe when the set is incomplete (a missing entry only narrows, never widens,
+// the set of hosts a cookie reaches).
+bool is_public_suffix(std::string_view host)
+{
+    if (host.empty()) {
+        return true;
+    }
+    if (host.find('.') == std::string_view::npos) {
+        return true; // Bare TLD, e.g. "com", "io", "localhost" handled by caller.
+    }
+    static const std::unordered_set<std::string_view> multi_label_suffixes = {
+        "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "ltd.uk", "plc.uk",
+        "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp", "ad.jp", "ed.jp", "gr.jp", "lg.jp",
+        "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
+        "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "geek.nz", "school.nz",
+        "com.br", "net.br", "org.br", "gov.br", "edu.br",
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+        "com.mx", "net.mx", "org.mx", "gob.mx", "edu.mx",
+        "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in", "gov.in",
+        "co.za", "net.za", "org.za", "gov.za", "web.za",
+        "com.tr", "net.tr", "org.tr", "gov.tr", "edu.tr",
+        "com.sg", "net.sg", "org.sg", "gov.sg", "edu.sg",
+        "com.hk", "net.hk", "org.hk", "gov.hk", "edu.hk",
+        "com.tw", "net.tw", "org.tw", "gov.tw", "edu.tw",
+        "co.kr", "ne.kr", "or.kr", "go.kr", "re.kr",
+        "com.ar", "net.ar", "org.ar", "gob.ar", "edu.ar",
+        "co.id", "net.id", "or.id", "web.id", "ac.id", "go.id",
+        "com.pl", "net.pl", "org.pl", "gov.pl", "edu.pl",
+        "com.ua", "net.ua", "org.ua", "gov.ua", "edu.ua",
+        "com.ru", "net.ru", "org.ru", "gov.ru", "edu.ru",
+        "co.il", "org.il", "net.il", "gov.il", "ac.il",
+        "co.th", "net.th", "or.th", "go.th", "ac.th",
+        "com.ph", "net.ph", "org.ph", "gov.ph", "edu.ph",
+        "com.my", "net.my", "org.my", "gov.my", "edu.my",
+        "com.vn", "net.vn", "org.vn", "gov.vn", "edu.vn",
+        "co.ke", "or.ke", "ne.ke", "go.ke", "ac.ke",
+        "github.io", "gitlab.io", "herokuapp.com", "appspot.com", "cloudfront.net",
+    };
+    return multi_label_suffixes.find(host) != multi_label_suffixes.end();
+}
+
 std::string registrable_domain_heuristic(std::string_view host)
 {
     const std::string lowered = lower_ascii(host);
@@ -204,12 +252,24 @@ std::string registrable_domain_heuristic(std::string_view host)
         return lowered;
     }
 
-    const std::size_t last_dot = lowered.rfind('.');
-    if (last_dot == std::string::npos) {
-        return lowered;
+    // Registrable domain = the longest public suffix plus one more label.
+    std::size_t label_start = 0;
+    while (label_start < lowered.size()) {
+        const std::string_view candidate(lowered.data() + label_start, lowered.size() - label_start);
+        if (is_public_suffix(candidate)) {
+            if (label_start == 0) {
+                return lowered; // Whole host is a public suffix; nothing narrower.
+            }
+            const std::size_t previous_dot = lowered.rfind('.', label_start - 2);
+            return previous_dot == std::string::npos ? lowered : lowered.substr(previous_dot + 1);
+        }
+        const std::size_t next_dot = lowered.find('.', label_start);
+        if (next_dot == std::string::npos) {
+            break;
+        }
+        label_start = next_dot + 1;
     }
-    const std::size_t previous_dot = lowered.rfind('.', last_dot - 1);
-    return previous_dot == std::string::npos ? lowered : lowered.substr(previous_dot + 1);
+    return lowered;
 }
 
 std::string site_of(std::string_view url)
@@ -458,6 +518,22 @@ std::string CookieJar::cookie_header_for_url(
     return out;
 }
 
+namespace {
+
+constexpr std::size_t kMaxCookieNameValueBytes = 4096;
+constexpr std::size_t kMaxCookiesPerDomain = 50;
+constexpr std::size_t kMaxCookiesTotal = 3000;
+
+bool contains_cookie_ctl(std::string_view value)
+{
+    return std::any_of(value.begin(), value.end(), [](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return byte < 0x20 || byte == 0x7f;
+    });
+}
+
+} // namespace
+
 void CookieJar::set_cookie_from_header(std::string_view request_url, std::string_view header, bool from_http)
 {
     const ParsedUrl parsed = parse_url(request_url);
@@ -484,6 +560,20 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
     cookie.host_only = true;
     bool reject_cookie = false;
 
+    // Reject control characters (and ';') in the name/value: they would otherwise
+    // be re-serialized verbatim into an outgoing "Cookie:" request header, enabling
+    // header injection — most importantly via document.cookie (from_http == false).
+    if (contains_cookie_ctl(cookie.name) || cookie.name.find(';') != std::string::npos
+        || contains_cookie_ctl(cookie.value) || cookie.value.find(';') != std::string::npos) {
+        return;
+    }
+    if (cookie.name.size() + cookie.value.size() > kMaxCookieNameValueBytes) {
+        return;
+    }
+
+    std::optional<std::chrono::system_clock::time_point> expires_attr;
+    std::optional<long long> max_age_attr;
+
     for (std::size_t i = 1; i < parts.size(); ++i) {
         const std::string attr = trim_ascii(parts[i]);
         if (attr.empty()) {
@@ -498,7 +588,16 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
             while (!domain.empty() && domain.front() == '.') {
                 domain.erase(domain.begin());
             }
-            if (!domain.empty() && domain_match(parsed.host, domain)) {
+            if (domain.empty()) {
+                reject_cookie = true;
+            } else if (is_public_suffix(domain)) {
+                // A cookie may only be scoped to a public suffix when that suffix is
+                // exactly the request host (staying host-only); otherwise it would be
+                // a supercookie shared across unrelated registrants (e.g. Domain=com).
+                if (domain != parsed.host) {
+                    reject_cookie = true;
+                }
+            } else if (domain_match(parsed.host, domain)) {
                 cookie.domain = std::move(domain);
                 cookie.host_only = false;
             } else {
@@ -515,11 +614,10 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
                 cookie.http_only = true;
             }
         } else if (name == "expires") {
-            cookie.expires = parse_cookie_time(value);
+            expires_attr = parse_cookie_time(value);
         } else if (name == "max-age") {
             try {
-                const long long seconds = std::stoll(value);
-                cookie.expires = std::chrono::system_clock::now() + std::chrono::seconds(seconds);
+                max_age_attr = std::stoll(value);
             } catch (...) {
             }
         } else if (name == "samesite") {
@@ -527,6 +625,22 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
                 cookie.same_site = *same_site;
             }
         }
+    }
+
+    // RFC 6265 §5.3: Max-Age takes precedence over Expires regardless of order.
+    if (max_age_attr) {
+        cookie.expires = std::chrono::system_clock::now() + std::chrono::seconds(*max_age_attr);
+    } else if (expires_attr) {
+        cookie.expires = expires_attr;
+    }
+
+    // Enforce the __Secure-/__Host- name prefixes servers rely on for integrity.
+    if (cookie.name.rfind("__Secure-", 0) == 0 && (!cookie.secure || !parsed.secure)) {
+        return;
+    }
+    if (cookie.name.rfind("__Host-", 0) == 0
+        && (!cookie.secure || !parsed.secure || !cookie.host_only || cookie.path != "/")) {
+        return;
     }
 
     if (reject_cookie || (cookie.secure && !parsed.secure) || (cookie.same_site == CookieSameSite::None && !cookie.secure)) {
@@ -547,6 +661,17 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
 
     if (!from_http && std::any_of(cookies_.begin(), cookies_.end(), [&](const Cookie& existing) {
             return existing.http_only && same_identity(existing);
+        })) {
+        return;
+    }
+
+    // RFC 6265bis §5.4: a cookie arriving over a non-secure transport must not
+    // overwrite or delete an existing Secure cookie of the same name that it
+    // domain-matches — otherwise an http:// attacker could evict an https:// session.
+    if (!parsed.secure && std::any_of(cookies_.begin(), cookies_.end(), [&](const Cookie& existing) {
+            return existing.secure
+                && existing.name == cookie.name
+                && domain_match(parsed.host, existing.domain);
         })) {
         return;
     }
@@ -573,7 +698,25 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
             return can_modify(existing) && same_identity(existing);
         }),
         cookies_.end());
+
+    const std::string cookie_domain = cookie.domain;
     cookies_.push_back(std::move(cookie));
+
+    // Bound growth: cookies_ is ordered oldest-first, so evict from the front to
+    // stay within per-domain and global caps (memory-exhaustion defense).
+    while (std::count_if(cookies_.begin(), cookies_.end(),
+               [&](const Cookie& existing) { return existing.domain == cookie_domain; })
+        > static_cast<std::ptrdiff_t>(kMaxCookiesPerDomain)) {
+        const auto oldest = std::find_if(cookies_.begin(), cookies_.end(),
+            [&](const Cookie& existing) { return existing.domain == cookie_domain; });
+        if (oldest == cookies_.end()) {
+            break;
+        }
+        cookies_.erase(oldest);
+    }
+    while (cookies_.size() > kMaxCookiesTotal) {
+        cookies_.erase(cookies_.begin());
+    }
 }
 
 } // namespace pagecore

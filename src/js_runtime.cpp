@@ -1122,7 +1122,12 @@ JSValue host_activity_mark_mutation(JSContext* ctx, JSValue, int argc, JSValue* 
             throw std::runtime_error("activityMarkMutation requires numeric mutation version");
         }
         int64_t clock = 0;
-        if (argc > 1 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &clock, argv[1]) == 0) {
+        if (argc > 1 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+            // Propagate (don't swallow) a failed conversion: leaving the pending JS
+            // exception set while returning normally violates the QuickJS contract.
+            if (JS_ToInt64(ctx, &clock, argv[1]) < 0) {
+                throw std::runtime_error("activityMarkMutation clock must be numeric");
+            }
             js.activity_tracker().set_clock(std::chrono::milliseconds{std::max<int64_t>(0, clock)});
         }
         if (version < 0) version = 0;
@@ -1135,8 +1140,10 @@ JSValue host_random_bytes(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
         int32_t count = 0;
-        if (argc > 0) {
-            JS_ToInt32(ctx, &count, argv[0]);
+        if (argc > 0 && JS_ToInt32(ctx, &count, argv[0]) < 0) {
+            // Propagate the pending exception instead of returning an array with an
+            // exception still set (QuickJS contract violation).
+            throw std::runtime_error("randomBytes length must be numeric");
         }
         if (count < 0) {
             count = 0;
@@ -1418,11 +1425,13 @@ std::string JsRuntime::evaluate(std::string_view script, std::string_view filena
         script.size(),
         filename_string.c_str(),
         JS_EVAL_TYPE_GLOBAL);
-    check_exception(value, filename_string);
 
-    // value holds a live reference; if draining a pending job throws, free it
-    // (and clear the deadline) before propagating so it does not leak.
+    // Guard both the exception check and job draining: on either throw path we must
+    // still clear the deadline and flush the perf events (matching execute()), and
+    // free the value if it is live. When check_exception throws, `value` is the
+    // JS_EXCEPTION sentinel and JS_FreeValue on it is a safe no-op.
     try {
+        check_exception(value, filename_string);
         run_microtask_checkpoint();
     } catch (...) {
         JS_FreeValue(context_, value);
@@ -1624,14 +1633,6 @@ JsRuntime::EventLoopSnapshot JsRuntime::event_loop_snapshot(std::chrono::millise
     }
     JS_FreeValue(context_, result);
     return snapshot;
-}
-
-void JsRuntime::sync_activity_state(std::chrono::milliseconds timer_horizon)
-{
-    const EventLoopSnapshot event_loop = event_loop_snapshot(timer_horizon);
-    activity_tracker_.set_clock(event_loop.now);
-    activity_tracker_.set_relevant_timers(event_loop.relevant_count);
-    activity_tracker_.sync_mutation_version(document_->mutation_version());
 }
 
 bool JsRuntime::readiness_satisfied(WaitUntil wait_until, std::chrono::milliseconds stable_window) const
@@ -2026,6 +2027,11 @@ void JsRuntime::check_exception(JSValue value, std::string_view source_name)
     if (exception_cstr != nullptr) JS_FreeCString(context_, exception_cstr);
     JS_FreeValue(context_, stack);
     JS_FreeValue(context_, exception);
+
+    // Stringifying a thrown object whose stack/toString itself throws leaves a new
+    // pending exception in the runtime; clear it so it can't surface spuriously on
+    // a later, unrelated call after we unwind.
+    JS_FreeValue(context_, JS_GetException(context_));
 
     clear_deadline();
     throw std::runtime_error(message);

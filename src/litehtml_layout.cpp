@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -228,6 +229,10 @@ public:
     {
         if (cairo_surface_status(measure_surface_) != CAIRO_STATUS_SUCCESS
             || cairo_status(measure_cr_) != CAIRO_STATUS_SUCCESS) {
+            // The constructor hasn't completed, so ~LiteHtmlDisplayListContainer will
+            // not run; free the members created in the initializer list here.
+            cairo_destroy(measure_cr_);
+            cairo_surface_destroy(measure_surface_);
             throw std::runtime_error("failed to create Cairo/Pango measurement context");
         }
 
@@ -262,6 +267,14 @@ public:
 
     void set_font_environment(std::shared_ptr<const FontEnvironment> font_environment)
     {
+        // Destroy the old measurement layout (which references the old font map via
+        // its PangoContext) BEFORE dropping our reference to the old FontEnvironment,
+        // so the old environment cannot be destroyed while the layout still points
+        // at it (use-after-free in fontconfig/pango).
+        if (measure_layout_ != nullptr) {
+            g_object_unref(measure_layout_);
+            measure_layout_ = nullptr;
+        }
         font_environment_ = std::move(font_environment);
         reset_measure_layout();
         if (measure_layout_ == nullptr) {
@@ -327,9 +340,14 @@ public:
         handle->font.italic = descr.style == litehtml::font_style_italic;
         handle->description = pango_font_description_new();
         pango_font_description_set_family(handle->description, handle->font.family.c_str());
+        // Clamp before multiplying by PANGO_SCALE so a pathological font-size cannot
+        // overflow the int Pango size (signed overflow is UB).
+        const double device_px = std::min(
+            static_cast<double>(handle->font.size_px),
+            static_cast<double>(std::numeric_limits<int>::max() / PANGO_SCALE));
         pango_font_description_set_absolute_size(
             handle->description,
-            static_cast<int>(std::round(handle->font.size_px * PANGO_SCALE)));
+            static_cast<int>(std::round(device_px * PANGO_SCALE)));
         pango_font_description_set_weight(
             handle->description,
             static_cast<PangoWeight>(std::clamp(handle->font.weight, 100, 1000)));
@@ -340,6 +358,10 @@ public:
         if (metrics != nullptr) {
             PangoLayout* layout = create_pango_layout_for_cairo(measure_cr_, font_environment_);
             if (layout == nullptr) {
+                // Free the partially-built handle (and its description, which
+                // delete_font would normally own) before unwinding.
+                pango_font_description_free(handle->description);
+                delete handle;
                 throw std::runtime_error("failed to create Pango measurement layout");
             }
             PangoContext* context = pango_layout_get_context(layout);

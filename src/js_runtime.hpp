@@ -127,7 +127,6 @@ private:
     int run_microtask_checkpoint_logged();
     int run_event_loop_step(std::chrono::milliseconds advance);
     EventLoopSnapshot event_loop_snapshot(std::chrono::milliseconds horizon);
-    void sync_activity_state(std::chrono::milliseconds timer_horizon);
     bool readiness_satisfied(WaitUntil wait_until, std::chrono::milliseconds stable_window) const;
     void check_exception(JSValue value, std::string_view source_name = {});
     void emit_script_perf(std::string_view name, std::chrono::steady_clock::time_point start, std::uint64_t count);

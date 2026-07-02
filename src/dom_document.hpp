@@ -7,6 +7,7 @@
 #include <lexbor/selectors/selectors.h>
 
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -62,6 +63,11 @@ struct DomDocument::Impl {
     // source text (each owns its own memory pool and is freed in the dtor).
     lxb_selectors_t* selectors = nullptr;
     std::unordered_map<std::string, lxb_css_selector_list_t*> selector_cache;
+    // Insertion order of selector_cache keys, used to bound the cache with FIFO
+    // eviction so adversarial JS generating unbounded distinct selectors (e.g.
+    // querySelectorAll('[data-i="'+i+'"]') in a loop) cannot grow memory without
+    // limit over a single document's lifetime.
+    std::deque<std::string> selector_cache_order;
 
     Impl();
     ~Impl();

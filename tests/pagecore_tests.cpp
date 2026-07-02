@@ -1,4 +1,5 @@
 #include "base64_codec.hpp"
+#include "page_activity_tracker.hpp"
 
 #include "pagecore/image_io.hpp"
 #include "pagecore/image_decoder.hpp"
@@ -40,6 +41,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -70,6 +72,13 @@ BoundTestServer bind_loopback_test_server(int backlog, std::string_view label)
 
         int reuse = 1;
         (void) ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // Bound accept(): if the client makes fewer connections than expected, the
+        // server thread's accept() would otherwise block forever and the test would
+        // hang. SO_RCVTIMEO makes accept() fail after the deadline so the thread ends.
+        timeval accept_timeout{};
+        accept_timeout.tv_sec = 15;
+        (void) ::setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &accept_timeout, sizeof(accept_timeout));
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -2602,6 +2611,228 @@ void test_cookie_attributes_path_domain_expires_secure_samesite()
             "cross-site subresource requests should only send SameSite=None cookies that satisfy Secure");
 }
 
+void test_base64_codec_roundtrip_and_edge_cases()
+{
+    using pagecore::Base64DecodeMode;
+
+    // RFC 4648 vectors and round-trip.
+    require(pagecore::base64_encode("") == "", "encode empty string");
+    require(pagecore::base64_encode("f") == "Zg==", "encode 'f'");
+    require(pagecore::base64_encode("fo") == "Zm8=", "encode 'fo'");
+    require(pagecore::base64_encode("foo") == "Zm9v", "encode 'foo'");
+    require(pagecore::base64_decode("Zm9vYg==") == "foob", "decode with padding");
+    const std::string data = std::string("Hello, PageCore!\x00\x01\xfe\xff", 20);
+    require(pagecore::base64_decode(pagecore::base64_encode(data)) == data, "base64 round-trip preserves bytes");
+
+    auto rejects = [](std::string_view input, Base64DecodeMode mode) {
+        try {
+            (void) pagecore::base64_decode(input, mode);
+            return false;
+        } catch (...) {
+            return true;
+        }
+    };
+
+    // Strict rejects non-alphabet chars, embedded whitespace and %4==1 lengths.
+    require(rejects("****", Base64DecodeMode::Strict), "strict rejects non-alphabet input");
+    require(rejects("Zm9v Yg==", Base64DecodeMode::Strict), "strict rejects embedded whitespace");
+    require(rejects("Zm9vY", Base64DecodeMode::Strict), "strict rejects length %% 4 == 1");
+
+    // Forgiving (WHATWG data-URL) strips whitespace and re-pads missing padding,
+    // but still rejects a %4==1 length and non-alphabet characters.
+    require(pagecore::base64_decode("Zm9v Yg==", Base64DecodeMode::Forgiving) == "foob",
+            "forgiving strips ASCII whitespace");
+    require(pagecore::base64_decode("Zm9vYg", Base64DecodeMode::Forgiving) == "foob",
+            "forgiving re-pads a missing '=='");
+    require(rejects("Zm9vY", Base64DecodeMode::Forgiving), "forgiving still rejects length %% 4 == 1");
+    require(rejects("****", Base64DecodeMode::Forgiving), "forgiving still rejects non-alphabet input");
+}
+
+void test_page_activity_tracker_counters_and_stability()
+{
+    pagecore::PageActivityTracker tracker;
+    tracker.reset(1);
+    require(tracker.network_idle(), "a freshly reset tracker is network-idle");
+    require(tracker.mutation_observers_drained(), "no mutation observers pending initially");
+    require(!tracker.snapshot().load_fired, "load has not fired initially");
+
+    tracker.begin(pagecore::PageActivityKind::XhrFetch);
+    tracker.begin(pagecore::PageActivityKind::XhrFetch);
+    require(tracker.snapshot().pending_xhr_fetch == 2, "two XHR/fetch activities pending");
+    require(!tracker.network_idle(), "pending XHR keeps the page non-idle");
+    tracker.end(pagecore::PageActivityKind::XhrFetch);
+    tracker.end(pagecore::PageActivityKind::XhrFetch);
+    require(tracker.network_idle(), "network-idle once all XHR activities end");
+
+    // Underflow guard: an unmatched end() must not wrap the unsigned counter.
+    tracker.end(pagecore::PageActivityKind::XhrFetch);
+    require(tracker.snapshot().pending_xhr_fetch == 0, "unmatched end() must not underflow the counter");
+    require(tracker.network_idle(), "still network-idle after a spurious end()");
+
+    // Relevant timers also gate network idleness.
+    tracker.set_relevant_timers(1);
+    require(!tracker.network_idle(), "a pending relevant timer keeps the page non-idle");
+    tracker.set_relevant_timers(0);
+    require(tracker.network_idle(), "network-idle once relevant timers drain");
+
+    // dom_stable requires the clock to advance past the last mutation by the window.
+    tracker.mark_mutation(2);
+    require(!tracker.dom_stable(std::chrono::milliseconds(100)), "not DOM-stable immediately after a mutation");
+    tracker.set_clock(std::chrono::milliseconds(200));
+    require(tracker.dom_stable(std::chrono::milliseconds(100)), "DOM-stable once the quiet window elapses");
+
+    // set_clock is monotonic (never moves backward), so a stale timestamp is ignored.
+    tracker.set_clock(std::chrono::milliseconds(50));
+    require(tracker.snapshot().clock == std::chrono::milliseconds(200), "set_clock must be monotonic (non-decreasing)");
+
+    tracker.mark_load_fired();
+    require(tracker.snapshot().load_fired, "load_fired reflected after mark_load_fired()");
+}
+
+void test_cookie_public_suffix_and_injection_rejected()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.cookie = 'super=1; Domain=example';
+    document.cookie = 'tld=1; Domain=com';
+    document.cookie = 'good=1';
+    document.cookie = 'inject=a\r\nSet-Cookie: evil=1';
+    document.cookie = '__Host-ok=1; Path=/; Secure';
+    document.cookie = '__Host-bad=1; Path=/app; Secure';
+    document.cookie = '__Secure-bad=1';
+    document.cookie = 'maxwins=1; Max-Age=0; Expires=Tue, 01 Jan 2030 00:00:00 GMT';
+    document.cookie = 'maxkeep=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=100000';
+    var c = document.cookie;
+    var mark = function(name, needle){ document.body.setAttribute('data-' + name, c.indexOf(needle) >= 0 ? '1' : '0'); };
+    mark('good', 'good=1');
+    mark('super', 'super=1');
+    mark('tld', 'tld=1');
+    mark('inject', 'inject=');
+    mark('evil', 'evil=1');
+    mark('hostok', '__Host-ok=1');
+    mark('hostbad', '__Host-bad=1');
+    mark('securebad', '__Secure-bad=1');
+    mark('maxwins', 'maxwins=1');
+    mark('maxkeep', 'maxkeep=1');
+  </script>
+</body></html>
+)HTML", "https://shop.example/start/index.html");
+
+    const auto marked = [&](const char* name, const char* value) {
+        return page.outer_html(std::string("body[data-") + name + "='" + value + "']").has_value();
+    };
+    require(marked("good", "1"), "host-only cookie should be accepted");
+    require(marked("super", "0"), "cookie scoped to a public suffix (Domain=example) must be rejected");
+    require(marked("tld", "0"), "cookie scoped to a bare TLD (Domain=com) must be rejected");
+    require(marked("inject", "0") && marked("evil", "0"),
+            "cookie name/value with CR/LF control characters must be rejected (header-injection defense)");
+    require(marked("hostok", "1"), "valid __Host- cookie should be accepted");
+    require(marked("hostbad", "0"), "__Host- cookie with a non-root path must be rejected");
+    require(marked("securebad", "0"), "__Secure- cookie without the Secure attribute must be rejected");
+    require(marked("maxwins", "0"), "Max-Age=0 must take precedence over a later future Expires");
+    require(marked("maxkeep", "1"), "Max-Age must take precedence over an earlier past Expires");
+}
+
+void test_cookie_secure_not_overwritten_by_insecure()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/secure-set", "s", "text/plain",
+        {{"Set-Cookie", "sess=secure; Path=/; Secure"}});
+    loader->add("http://example.test/attack", "a", "text/plain",
+        {{"Set-Cookie", "sess=hijack; Path=/"}});
+    loader->add("https://example.test/read", "r", "text/plain");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('https://example.test/secure-set', { credentials: 'include' })
+      .then(() => fetch('http://example.test/attack', { credentials: 'include' }))
+      .then(() => fetch('https://example.test/read', { credentials: 'include' }))
+      .then(() => document.body.setAttribute('data-done', 'ok'));
+  </script>
+</body></html>
+)HTML", "https://example.test/start/index.html");
+
+    require(page.outer_html("body[data-done='ok']").has_value(),
+            "secure-cookie overwrite chain should complete");
+    const auto* read = find_request(*loader, "https://example.test/read");
+    require(read != nullptr && header_contains(*read, "cookie", "sess=secure"),
+            "a Secure cookie set over HTTPS must survive an insecure overwrite attempt");
+    require(read != nullptr && !header_contains(*read, "cookie", "sess=hijack"),
+            "an insecure origin must not overwrite a Secure cookie of the same name");
+}
+
+void test_cookie_jar_growth_is_bounded()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    for (var i = 0; i < 80; i++) { document.cookie = 'k' + i + '=1'; }
+    var parts = document.cookie ? document.cookie.split('; ') : [];
+    var kcount = parts.filter(function(p){ return p.indexOf('k') === 0; }).length;
+    document.body.setAttribute('data-kcount', String(kcount));
+  </script>
+</body></html>
+)HTML", "https://cap.example/index.html");
+
+    require(page.outer_html("body[data-kcount='50']").has_value(),
+            "per-domain cookie count must be bounded to the cap (50) via oldest-first eviction");
+}
+
+void test_failed_external_script_does_not_abort_page()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    // https://dead.example/missing.js is intentionally NOT registered, so the
+    // loader reports a transport failure (NotFound) for that external script.
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script src="https://dead.example/missing.js"></script>
+  <script>document.body.setAttribute('data-inline', 'ran');</script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-inline='ran']").has_value(),
+            "a failed external <script src> must not abort the page load or skip later inline scripts");
+}
+
+void test_nomodule_suppresses_only_classic_scripts()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script nomodule>document.body.setAttribute('data-classic', 'ran');</script>
+  <script type="module" nomodule>document.body.setAttribute('data-module', 'ran');</script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(!page.outer_html("body[data-classic='ran']").has_value(),
+            "nomodule must suppress a classic script");
+    require(page.outer_html("body[data-module='ran']").has_value(),
+            "nomodule must NOT suppress a module script (per the HTML spec)");
+}
+
+void test_scripts_inside_template_do_not_execute()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <template><script>document.body.setAttribute('data-template-script', 'ran');</script></template>
+  <script>document.body.setAttribute('data-top', 'ran');</script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-top='ran']").has_value(), "top-level script should run");
+    require(!page.outer_html("body[data-template-script='ran']").has_value(),
+            "a script inside inert <template> content must not execute");
+}
+
 void test_page_readiness_wait_until_load_skips_timers()
 {
     pagecore::LoadOptions options;
@@ -3362,6 +3593,12 @@ void test_resource_policy_blocks_private_hosts()
         "http://10.0.0.1/x",
         "http://192.168.1.1/x",
         "http://172.16.0.1/x",
+        // Legacy numeric IPv4 encodings that resolve to 127.0.0.1 and must be
+        // rejected by the literal pre-flight (SSRF bypass, portable to Windows).
+        "http://2130706433/",     // decimal 127.0.0.1
+        "http://0x7f000001/",     // hex 127.0.0.1
+        "http://0177.0.0.1/",     // octal-leading 127.0.0.1
+        "http://127.1/",          // short form 127.0.0.1
     };
     for (const char* url : blocked_urls) {
         require_resource_error(
@@ -3596,6 +3833,79 @@ void test_curl_loader_preserves_set_cookie_headers_across_redirects()
     require(accepted == 2, "redirect cookie fixture should serve redirect and final requests");
 }
 
+void test_curl_loader_sends_request_cookie_across_same_host_redirect()
+{
+    // Regression for the cross-origin cookie leak fix: an attached Cookie header is
+    // routed through libcurl's cookie engine (host-scoped), so it must still reach
+    // the same host on a redirect hop. The engine also prevents the cookie from
+    // being replayed to a *different* host, but that path cannot be exercised over
+    // loopback (both hops share host 127.0.0.1), so it is covered by the engine's
+    // documented host-scoping rather than asserted here.
+    const BoundTestServer bound = bind_loopback_test_server(2, "request cookie redirect");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
+
+    std::vector<std::string> captured;
+    std::mutex captured_mutex;
+    std::thread server([server_fd, port, &captured, &captured_mutex] {
+        for (int i = 0; i < 2; ++i) {
+            const int client = ::accept(server_fd, nullptr, nullptr);
+            if (client < 0) {
+                continue;
+            }
+            char buffer[2048];
+            const long received = ::recv(client, buffer, sizeof(buffer) - 1, 0);
+            {
+                std::lock_guard<std::mutex> lock(captured_mutex);
+                captured.emplace_back(buffer, received > 0 ? static_cast<std::size_t>(received) : 0);
+            }
+            std::string response;
+            if (i == 0) {
+                response =
+                    "HTTP/1.1 302 Found\r\n"
+                    "Location: http://127.0.0.1:" + std::to_string(port) + "/final\r\n"
+                    "Content-Length: 0\r\n"
+                    "Connection: close\r\n\r\n";
+            } else {
+                response =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: 2\r\n"
+                    "Connection: close\r\n\r\nok";
+            }
+            (void) ::send(client, response.data(), response.size(), 0);
+            ::close(client);
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        pagecore::CurlResourceLoader loader("pagecore-test", policy);
+        pagecore::ResourceRequest request{
+            "http://127.0.0.1:" + std::to_string(port) + "/start",
+            pagecore::ResourceKind::Document};
+        request.headers.emplace_back("Cookie", "sid=secret");
+        const auto response = loader.load(request);
+        require(response.status == 200 && response.body == "ok", "same-host redirect should complete");
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        throw;
+    }
+    if (server.joinable()) {
+        server.join();
+    }
+
+    require(captured.size() == 2, "server should receive both the initial and redirected request");
+    require(captured[0].find("Cookie: sid=secret") != std::string::npos,
+            "the attached cookie should be sent on the initial request");
+    require(captured[1].find("Cookie: sid=secret") != std::string::npos,
+            "the attached cookie should still be sent to the same host on the redirect hop");
+}
+
 void test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths()
 {
     const BoundTestServer bound = bind_loopback_test_server(6, "header capture");
@@ -3750,20 +4060,20 @@ void test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths()
         const std::string target = request_target(request);
         const std::string referer = raw_header(request, "Referer");
         if (target == "/single") {
-            require(referer == "https://origin.test/page.html?x=1",
-                    "HTTP Referer should strip userinfo and fragment");
+            require(referer == "https://origin.test/",
+                    "cross-origin HTTP Referer should be downgraded to origin-only (strip userinfo/path/query/fragment)");
         } else if (target == "/batch-a") {
             require(referer.empty(), "file:// referrers should not be sent to network resources");
         } else if (target == "/batch-b") {
-            require(referer == "http://origin.test/asset.html",
-                    "HTTP Referer should strip fragments from batch requests");
+            require(referer == "http://origin.test/",
+                    "cross-origin HTTP Referer should be downgraded to origin-only in batch requests");
         } else if (target == "/batch-c") {
             require(referer.empty(), "control characters should suppress HTTP Referer emission");
         } else if (target == "/batch-d") {
             require(referer.empty(), "explicit file:// Referer headers should not be emitted");
         } else if (target == "/batch-e") {
-            require(referer == "https://explicit.test/page.html",
-                    "explicit Referer headers should strip userinfo and fragments");
+            require(referer == "https://explicit.test/",
+                    "explicit cross-origin Referer headers should be downgraded to origin-only");
         } else {
             require(false, "header capture fixture should only receive known paths");
         }
@@ -4209,6 +4519,63 @@ void test_jpeg_decoder_rejects_huge_dimensions()
         },
         "too large",
         "JPEG decoder should reject huge decoded dimensions before allocation");
+}
+
+void test_png_decoder_rejects_huge_dimensions()
+{
+    // Patch the IHDR width/height (BE u32 at offsets 16/20) of a valid PNG to a
+    // multi-gigapixel canvas. The decoder must reject it from the header before
+    // Cairo/libpng allocates the surface (CRC is intentionally left stale).
+    std::string body = png_body(pagecore::Color{31, 63, 127, 255}, 2, 2);
+    require(body.size() >= 24, "encoded PNG should contain an IHDR chunk");
+    const auto write_be32 = [&](std::size_t at, std::uint32_t value) {
+        body[at] = static_cast<char>((value >> 24) & 0xff);
+        body[at + 1] = static_cast<char>((value >> 16) & 0xff);
+        body[at + 2] = static_cast<char>((value >> 8) & 0xff);
+        body[at + 3] = static_cast<char>(value & 0xff);
+    };
+    write_be32(16, 60000);
+    write_be32(20, 60000);
+
+    require_runtime_error_contains(
+        [&] {
+            (void) pagecore::decode_png_rgba(body);
+        },
+        "too large",
+        "PNG decoder should reject huge IHDR dimensions before allocation");
+}
+
+void test_gif_decoder_rejects_huge_dimensions()
+{
+    const auto patch_u16 = [](std::string& body, std::size_t at, std::uint16_t value) {
+        body[at] = static_cast<char>(value & 0xff);
+        body[at + 1] = static_cast<char>((value >> 8) & 0xff);
+    };
+
+    // Logical-screen bomb: bytes 6-9 declare a 65535x65535 canvas.
+    std::string screen_bomb = gif_body();
+    patch_u16(screen_bomb, 6, 0xffff);
+    patch_u16(screen_bomb, 8, 0xffff);
+    require_runtime_error_contains(
+        [&] {
+            (void) pagecore::decode_gif_rgba(screen_bomb);
+        },
+        "too large",
+        "GIF decoder should reject a huge logical screen before DGifSlurp");
+
+    // Frame-descriptor bomb: the image descriptor (at offset 19) declares a
+    // 65535x65535 frame even though the logical screen stays 1x1.
+    std::string frame_bomb = gif_body();
+    require(frame_bomb.size() >= 28 && static_cast<unsigned char>(frame_bomb[19]) == 0x2c,
+            "test GIF should contain an image descriptor at offset 19");
+    patch_u16(frame_bomb, 24, 0xffff);
+    patch_u16(frame_bomb, 26, 0xffff);
+    require_runtime_error_contains(
+        [&] {
+            (void) pagecore::decode_gif_rgba(frame_bomb);
+        },
+        "too large",
+        "GIF decoder should reject a huge frame descriptor before DGifSlurp");
 }
 
 #if PAGECORE_ENABLE_WEBP
@@ -7791,6 +8158,14 @@ int main()
         test_shared_cookie_jar_document_scripts_fetch_and_xhr();
         test_fetch_xhr_credentials_control_cookie_injection();
         test_cookie_attributes_path_domain_expires_secure_samesite();
+        test_base64_codec_roundtrip_and_edge_cases();
+        test_page_activity_tracker_counters_and_stability();
+        test_cookie_public_suffix_and_injection_rejected();
+        test_cookie_secure_not_overwritten_by_insecure();
+        test_cookie_jar_growth_is_bounded();
+        test_failed_external_script_does_not_abort_page();
+        test_nomodule_suppresses_only_classic_scripts();
+        test_scripts_inside_template_do_not_execute();
         test_page_readiness_wait_until_load_skips_timers();
         test_page_readiness_ready_waits_for_timer_fetch_and_dom_stable();
         test_page_readiness_dom_stable_runs_pending_page_tasks();
@@ -7814,6 +8189,7 @@ int main()
         test_resource_blocks_file_from_network_origin();
 #if !defined(_WIN32)
         test_curl_loader_preserves_set_cookie_headers_across_redirects();
+        test_curl_loader_sends_request_cookie_across_same_host_redirect();
         test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths();
 #endif
         test_caching_loader_bounds_and_skips_errors();
@@ -7838,6 +8214,8 @@ int main()
         test_webp_decoder_rgba();
 #endif
         test_jpeg_decoder_rejects_huge_dimensions();
+        test_png_decoder_rejects_huge_dimensions();
+        test_gif_decoder_rejects_huge_dimensions();
 #if PAGECORE_ENABLE_WEBP
         test_webp_decoder_rejects_huge_dimensions();
 #endif
