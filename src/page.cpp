@@ -1711,6 +1711,13 @@ struct Page::Impl {
         last_known_geometry.clear();
     }
 
+    // The border-box width an absolute %-width element WOULD get if litehtml
+    // resolved the percentage against its positioned containing block's used width.
+    // Kept proportional to litehtml's OWN (sometimes under-measured) ancestor
+    // widths, so a JS grid library that divides its container width by an item's
+    // width computes the same column count litehtml's boxes imply — which, for
+    // Bootstrap/Isotope grids, is the browser's column count even when litehtml's
+    // absolute box-model differs. Used only for synchronous reads, never the paint.
     std::optional<float> absolute_percentage_border_box_width(LayoutEngine& engine, NodeId node)
     {
         const std::string node_key = std::to_string(node);

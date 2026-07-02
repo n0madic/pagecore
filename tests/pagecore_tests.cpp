@@ -6496,7 +6496,12 @@ void test_layout_serialization_skips_stale_cached_absolute_width_after_parent_re
         "render-time width materialization must ignore stale cached geometry after parent layout changes");
 }
 
-void test_geometry_absolute_percentage_width_uses_positioned_parent()
+// A synchronous read of an absolute %-width element resolves the percentage against
+// its positioned parent's used width, kept proportional to litehtml's own ancestor
+// measurements so a JS grid library (Isotope/Masonry) that divides its container by
+// an item's width computes the same column count litehtml's boxes imply — the
+// browser's column count for these Bootstrap grids.
+void test_geometry_absolute_percentage_width_resolves_against_positioned_parent()
 {
     pagecore::Page page;
     page.load_html(R"HTML(
@@ -7904,7 +7909,7 @@ int main()
         test_layout_serialization_materializes_absolute_percentage_width_without_js_measure();
         test_layout_serialization_skips_stale_cached_width_after_history_rollover();
         test_layout_serialization_skips_stale_cached_absolute_width_after_parent_resize();
-        test_geometry_absolute_percentage_width_uses_positioned_parent();
+        test_geometry_absolute_percentage_width_resolves_against_positioned_parent();
         test_geometry_reads_load_stylesheets_but_skip_images_until_render();
         test_geometry_offset_top_left_relative_to_offset_parent();
         test_geometry_offset_parent_finds_nearest_positioned_ancestor();
