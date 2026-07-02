@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -27,12 +28,23 @@
 namespace pagecore {
 namespace {
 
+// Enables heterogeneous lookup on the width cache: find(std::string_view) hashes
+// the run directly instead of first materializing a temporary std::string (a heap
+// allocation for long runs) on every text_width() call.
+struct TransparentStringHash {
+    using is_transparent = void;
+    std::size_t operator()(std::string_view value) const
+    {
+        return std::hash<std::string_view>{}(value);
+    }
+};
+
 struct FontHandle {
     Font font;
     PangoFontDescription* description = nullptr;
     // Pango text shaping is deterministic for a given (font, string), so widths
     // are memoized per font. The cache lives and dies with the font handle.
-    std::unordered_map<std::string, int> width_cache;
+    std::unordered_map<std::string, int, TransparentStringHash, std::equal_to<>> width_cache;
 };
 
 float px(litehtml::pixel_t value)
@@ -356,15 +368,12 @@ public:
             handle->font.italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
 
         if (metrics != nullptr) {
-            PangoLayout* layout = create_pango_layout_for_cairo(measure_cr_, font_environment_);
-            if (layout == nullptr) {
-                // Free the partially-built handle (and its description, which
-                // delete_font would normally own) before unwinding.
-                pango_font_description_free(handle->description);
-                delete handle;
-                throw std::runtime_error("failed to create Pango measurement layout");
-            }
-            PangoContext* context = pango_layout_get_context(layout);
+            // Reuse the shared measurement layout instead of allocating a fresh
+            // PangoLayout+context per create_font. This is safe: create_font is
+            // not interleaved with text_width mid-call, and text_width always
+            // re-sets the font description and text before measuring, so the
+            // "x"/"0" left behind here never leaks into a width lookup.
+            PangoContext* context = pango_layout_get_context(measure_layout_);
             PangoFontMetrics* pango_metrics = pango_context_get_metrics(
                 context,
                 handle->description,
@@ -384,19 +393,18 @@ public:
             metrics->sub_shift = std::ceil(handle->font.size_px * 0.2f);
             metrics->super_shift = std::ceil(handle->font.size_px * 0.35f);
 
-            pango_layout_set_font_description(layout, handle->description);
+            pango_layout_set_font_description(measure_layout_, handle->description);
             PangoRectangle ink_rect;
             PangoRectangle logical_rect;
-            pango_layout_set_text(layout, "x", 1);
-            pango_layout_get_pixel_extents(layout, &ink_rect, &logical_rect);
+            pango_layout_set_text(measure_layout_, "x", 1);
+            pango_layout_get_pixel_extents(measure_layout_, &ink_rect, &logical_rect);
             metrics->x_height = ink_rect.height > 0 ? ink_rect.height : std::ceil(handle->font.size_px * 0.5f);
 
-            pango_layout_set_text(layout, "0", 1);
-            pango_layout_get_pixel_extents(layout, &ink_rect, &logical_rect);
+            pango_layout_set_text(measure_layout_, "0", 1);
+            pango_layout_get_pixel_extents(measure_layout_, &ink_rect, &logical_rect);
             metrics->ch_width = logical_rect.width > 0 ? logical_rect.width : std::ceil(handle->font.size_px * 0.55f);
 
             pango_font_metrics_unref(pango_metrics);
-            g_object_unref(layout);
         }
 
         return reinterpret_cast<litehtml::uint_ptr>(handle);
@@ -419,7 +427,7 @@ public:
         }
 
         if (handle != nullptr) {
-            auto cached = handle->width_cache.find(text);
+            auto cached = handle->width_cache.find(std::string_view(text));
             if (cached != handle->width_cache.end()) {
                 return cached->second;
             }
@@ -889,7 +897,56 @@ public:
         return ElementGeometry{rect_from(border_box), rect_from(padding_box)};
     }
 
+    std::vector<AbsolutePercentWidthOverride> collect_absolute_percent_width_overrides() override
+    {
+        std::vector<AbsolutePercentWidthOverride> overrides;
+        if (document_) {
+            collect_absolute_percent_width_overrides(document_->root(), overrides);
+        }
+        return overrides;
+    }
+
 private:
+    // Single typed tree walk mirroring the string-based page.cpp path exactly: for
+    // every position:absolute; box-sizing:border-box; width:% element that litehtml
+    // laid out, pin its OWN computed border-box width (placement + paddings +
+    // borders, same as element_geometry) so its percentage-width children don't
+    // collapse. No string formatting, no Lexbor query; empty when there are none.
+    void collect_absolute_percent_width_overrides(
+        const litehtml::element::ptr& element,
+        std::vector<AbsolutePercentWidthOverride>& overrides)
+    {
+        if (!element) {
+            return;
+        }
+
+        const litehtml::css_properties& css = element->css();
+        if (css.get_position() == litehtml::element_position_absolute
+            && css.get_box_sizing() == litehtml::box_sizing_border_box
+            && !css.get_width().is_predefined()
+            && css.get_width().units() == litehtml::css_units_percentage) {
+            if (auto render_item = element->get_render_item()) {
+                litehtml::position border_box = render_item->get_placement();
+                border_box += render_item->get_paddings();
+                border_box += render_item->get_borders();
+                const float width = px(border_box.width);
+                const char* sid = element->get_attr("data-pc-sid");
+                // width >= 1 mirrors the string path's border_box.width < 1 skip
+                // (not laid out, e.g. display:none). round-to-nearest, min 1.
+                if (width >= 1.0f && sid != nullptr && *sid != '\0') {
+                    overrides.push_back(AbsolutePercentWidthOverride{
+                        sid,
+                        std::max(1, static_cast<int>(width + 0.5f)),
+                    });
+                }
+            }
+        }
+
+        for (const auto& child : element->children()) {
+            collect_absolute_percent_width_overrides(child, overrides);
+        }
+    }
+
     // O(1) data-pc-sid -> element lookup, built once per document (lazily,
     // on first lookup) and reused across every computed_style()/
     // element_geometry() call. Without this, find_tagged_element() used

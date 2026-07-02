@@ -11,6 +11,7 @@
 #include <memory>
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <chrono>
@@ -1851,25 +1852,6 @@ struct Page::Impl {
         }
     }
 
-    // A connected element whose width litehtml leaves indefinite in a way that
-    // collapses percentage-width children: computed position:absolute, box-sizing
-    // border-box, and a percentage width. (border-box is required so that pinning
-    // `width:Npx` sets the border box to exactly N.)
-    bool is_absolute_percent_width_border_box(LayoutEngine& engine, NodeId node)
-    {
-        const std::string key = std::to_string(node);
-        const auto position = engine.computed_style_property(key, "position");
-        if (!position || ascii_lower(trim_ascii(*position)) != "absolute") {
-            return false;
-        }
-        const auto box_sizing = engine.computed_style_property(key, "box-sizing");
-        if (!box_sizing || ascii_lower(trim_ascii(*box_sizing)) != "border-box") {
-            return false;
-        }
-        const auto width = engine.computed_style_property(key, "width");
-        return width && parse_css_percentage(*width).has_value();
-    }
-
     // Render-local correction, derived entirely from one pass and universal (no
     // per-site heuristic, no containing-block guessing).
     //
@@ -1881,25 +1863,32 @@ struct Page::Impl {
     // correctly-sized element is untouched (the second pass is a no-op for it) and
     // only its collapsing children are repaired. Fixing litehtml's own sizing of
     // such elements, if it is ever wrong, belongs in litehtml, not here.
+    //
+    // The engine collects these with typed getters in a single tree walk, so the
+    // common case (no such elements) returns empty with no string lookups or Lexbor
+    // query. We only parse the injected data-pc-sid back into a NodeId and re-check
+    // connectivity before turning each into a layout override.
     std::vector<DomDocument::LayoutStyleOverride> compute_render_local_absolute_percent_overrides(LayoutEngine& engine)
     {
         std::vector<DomDocument::LayoutStyleOverride> overrides;
-        const NodeId root = document.document_node();
-        if (root == kInvalidNodeId) {
-            return overrides;
-        }
-        for (NodeId node : document.query_selector_all(root, "*")) {
-            if (!document.is_connected(node) || !is_absolute_percent_width_border_box(engine, node)) {
+        const auto engine_overrides = engine.collect_absolute_percent_width_overrides();
+        overrides.reserve(engine_overrides.size());
+        for (const auto& engine_override : engine_overrides) {
+            // node_key is std::to_string(NodeId), injected as data-pc-sid during
+            // serialization; parse it back exactly (whole string, non-zero id).
+            NodeId node = kInvalidNodeId;
+            const char* begin = engine_override.node_key.data();
+            const char* end = begin + engine_override.node_key.size();
+            const auto parsed = std::from_chars(begin, end, node);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || node == kInvalidNodeId) {
                 continue;
             }
-            const auto native = engine.element_geometry(std::to_string(node));
-            if (!native || native->border_box.width < 1.0f) {
-                continue;  // not laid out (e.g. display:none) — nothing to pin
+            if (!document.is_connected(node)) {
+                continue;
             }
-            const int width_px = std::max(1, static_cast<int>(native->border_box.width + 0.5f));
             overrides.push_back(DomDocument::LayoutStyleOverride{
                 node,
-                "width:" + std::to_string(width_px) + "px;",
+                "width:" + std::to_string(engine_override.border_box_width_px) + "px;",
             });
         }
         return overrides;

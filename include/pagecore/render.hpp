@@ -244,6 +244,22 @@ public:
         (void) node_key;
         return std::nullopt;
     }
+
+    // A render-local correction the engine wants applied on a second layout pass:
+    // pin `position:absolute; box-sizing:border-box; width:%` element `node_key`
+    // to `border_box_width_px` so its percentage-width children don't collapse.
+    struct AbsolutePercentWidthOverride {
+        std::string node_key;
+        int border_box_width_px = 0;
+    };
+
+    // Collects the above corrections from the last layout() pass using typed
+    // style/geometry getters, so the common case (no such elements) short-circuits
+    // with no string formatting or DOM query. Engines without read-back return {}.
+    virtual std::vector<AbsolutePercentWidthOverride> collect_absolute_percent_width_overrides()
+    {
+        return {};
+    }
 };
 
 class LayoutEngineFactory {

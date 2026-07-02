@@ -400,6 +400,41 @@ struct TextRenderState {
     }
 };
 
+// A premultiplied ARGB32 surface built once from a decoded image. The Cairo
+// surface borrows `data` (created via cairo_image_surface_create_for_data), so
+// the buffer must outlive the surface; keeping both together guarantees that.
+struct CachedImageSurface {
+    std::vector<unsigned char> data;
+    cairo_surface_t* surface = nullptr;
+};
+
+// Per-render-pass resources shared across draw commands. Text resources reuse a
+// single Pango layout; image surfaces are cached by the DecodedImage pointer so
+// repeated commands referencing the same decoded bitmap (tiled backgrounds,
+// sprites, multiple elements with one src) convert RGBA->premultiplied ARGB only
+// once. The destructor releases every cached surface (exception-safe).
+struct RenderState {
+    TextRenderState text;
+    std::unordered_map<const DecodedImage*, CachedImageSurface> images;
+
+    explicit RenderState(std::shared_ptr<const FontEnvironment> environment)
+        : text(std::move(environment))
+    {
+    }
+    RenderState(const RenderState&) = delete;
+    RenderState& operator=(const RenderState&) = delete;
+
+    ~RenderState()
+    {
+        for (auto& [key, entry] : images) {
+            (void) key;
+            if (entry.surface != nullptr) {
+                cairo_surface_destroy(entry.surface);
+            }
+        }
+    }
+};
+
 void draw_text(cairo_t* cr, const TextCommand& command, float scale, TextRenderState& text)
 {
     if (command.text.empty() || command.color.a == 0) {
@@ -472,9 +507,19 @@ RenderedImage surface_to_rgba(cairo_surface_t* surface)
             const auto blue = static_cast<std::uint8_t>(native_argb & 0xff);
 
             auto* pixel = &image.rgba[(static_cast<std::size_t>(y) * image.width + x) * 4];
-            pixel[0] = unpremultiply(red, alpha);
-            pixel[1] = unpremultiply(green, alpha);
-            pixel[2] = unpremultiply(blue, alpha);
+            // Opaque pixels dominate a rendered frame (the background is painted
+            // opaque). For alpha == 255 unpremultiply is the identity, so copy
+            // straight through and skip three integer divisions per pixel; the
+            // result is bit-identical to the general path.
+            if (alpha == 255) {
+                pixel[0] = red;
+                pixel[1] = green;
+                pixel[2] = blue;
+            } else {
+                pixel[0] = unpremultiply(red, alpha);
+                pixel[1] = unpremultiply(green, alpha);
+                pixel[2] = unpremultiply(blue, alpha);
+            }
             pixel[3] = alpha;
         }
     }
@@ -482,38 +527,41 @@ RenderedImage surface_to_rgba(cairo_surface_t* surface)
     return image;
 }
 
-void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale)
+// Grey placeholder drawn when a decoded image is missing or malformed. Kept
+// separate so every early-return path shares one implementation.
+void draw_image_placeholder(cairo_t* cr, const ImageCommand& command, float scale)
 {
-    if (!command.image || command.image->width <= 0 || command.image->height <= 0) {
-        cairo_save(cr);
-        clip_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, scale);
-        fill_rect(cr, scale_rect(command.tile, scale), Color{220, 220, 220, 255});
-        cairo_restore(cr);
-        return;
+    cairo_save(cr);
+    clip_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, scale);
+    fill_rect(cr, scale_rect(command.tile, scale), Color{220, 220, 220, 255});
+    cairo_restore(cr);
+}
+
+// Returns a premultiplied ARGB32 surface for `image`, building it once and
+// caching it by pointer for the rest of the render pass. Returns nullptr when
+// the image can't be represented (bad rgba size or stride); the caller draws the
+// placeholder in that case. Malformed images are cheap and rare, so they are not
+// cached (each retry re-runs the checks).
+const CachedImageSurface* image_surface_for(RenderState& state, const DecodedImage& image)
+{
+    if (auto it = state.images.find(&image); it != state.images.end()) {
+        return it->second.surface != nullptr ? &it->second : nullptr;
     }
 
-    const auto& image = *command.image;
     const std::size_t expected = static_cast<std::size_t>(image.width) * image.height * 4;
     if (image.rgba.size() != expected) {
-        cairo_save(cr);
-        clip_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, scale);
-        fill_rect(cr, scale_rect(command.tile, scale), Color{220, 220, 220, 255});
-        cairo_restore(cr);
-        return;
+        return nullptr;
     }
 
     const int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, image.width);
     if (stride <= 0) {
-        cairo_save(cr);
-        clip_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, scale);
-        fill_rect(cr, scale_rect(command.tile, scale), Color{220, 220, 220, 255});
-        cairo_restore(cr);
-        return;
+        return nullptr;
     }
 
-    std::vector<unsigned char> argb(static_cast<std::size_t>(stride) * image.height);
+    CachedImageSurface entry;
+    entry.data.resize(static_cast<std::size_t>(stride) * image.height);
     for (int y = 0; y < image.height; ++y) {
-        auto* row = argb.data() + static_cast<std::ptrdiff_t>(y) * stride;
+        auto* row = entry.data.data() + static_cast<std::ptrdiff_t>(y) * stride;
         for (int x = 0; x < image.width; ++x) {
             const auto* src = &image.rgba[(static_cast<std::size_t>(y) * image.width + x) * 4];
             const auto alpha = src[3];
@@ -529,13 +577,40 @@ void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale)
     }
 
     cairo_surface_t* raw_surface = cairo_image_surface_create_for_data(
-        argb.data(),
+        entry.data.data(),
         CAIRO_FORMAT_ARGB32,
         image.width,
         image.height,
         stride);
-    check_status(cairo_surface_status(raw_surface), "create Cairo image surface for decoded image");
-    std::unique_ptr<cairo_surface_t, decltype(&cairo_surface_destroy)> surface(raw_surface, cairo_surface_destroy);
+    const cairo_status_t status = cairo_surface_status(raw_surface);
+    if (status != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(raw_surface);
+        check_status(status, "create Cairo image surface for decoded image");
+    }
+    entry.surface = raw_surface;
+
+    // std::vector move transfers the heap buffer without reallocating, so the
+    // surface's borrowed pointer stays valid after the entry is moved into the
+    // node-based map (nodes are never relocated on rehash).
+    auto [pos, inserted] = state.images.emplace(&image, std::move(entry));
+    (void) inserted;
+    return &pos->second;
+}
+
+void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale, RenderState& state)
+{
+    if (!command.image || command.image->width <= 0 || command.image->height <= 0) {
+        draw_image_placeholder(cr, command, scale);
+        return;
+    }
+
+    const auto& image = *command.image;
+    const CachedImageSurface* cached = image_surface_for(state, image);
+    if (cached == nullptr) {
+        draw_image_placeholder(cr, command, scale);
+        return;
+    }
+    cairo_surface_t* surface = cached->surface;
 
     const IntRect tile = scale_rect(command.tile, scale);
     if (empty(tile)) {
@@ -612,7 +687,7 @@ void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale)
             cr,
             static_cast<double>(tile.width) / static_cast<double>(image.width),
             static_cast<double>(tile.height) / static_cast<double>(image.height));
-        cairo_set_source_surface(cr, surface.get(), 0, 0);
+        cairo_set_source_surface(cr, surface, 0, 0);
         cairo_rectangle(cr, 0, 0, image.width, image.height);
         cairo_fill(cr);
         cairo_restore(cr);
@@ -679,32 +754,32 @@ void draw_linear_gradient(cairo_t* cr, const LinearGradientCommand& command, flo
 
 void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color background, float scale);
 
-void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&, TextRenderState&)
+void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&, RenderState&)
 {
     fill_rounded_rect(cr, scale_rect(command.rect, scale), command.radii, command.color, scale);
 }
 
-void draw_command(cairo_t* cr, const BorderCommand& command, float scale, int&, TextRenderState&)
+void draw_command(cairo_t* cr, const BorderCommand& command, float scale, int&, RenderState&)
 {
     draw_border(cr, command, scale);
 }
 
-void draw_command(cairo_t* cr, const TextCommand& command, float scale, int&, TextRenderState& text)
+void draw_command(cairo_t* cr, const TextCommand& command, float scale, int&, RenderState& state)
 {
-    draw_text(cr, command, scale, text);
+    draw_text(cr, command, scale, state.text);
 }
 
-void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&, TextRenderState&)
+void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&, RenderState& state)
 {
-    draw_decoded_image(cr, command, scale);
+    draw_decoded_image(cr, command, scale, state);
 }
 
-void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&, TextRenderState&)
+void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&, RenderState&)
 {
     draw_linear_gradient(cr, command, scale);
 }
 
-void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth, TextRenderState&)
+void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth, RenderState&)
 {
     if (command.push) {
         cairo_save(cr);
@@ -722,12 +797,12 @@ void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color backg
     set_source(cr, background);
     cairo_paint(cr);
 
-    TextRenderState text(display_list.font_environment);
+    RenderState state(display_list.font_environment);
     int clip_depth = 0;
     for (const auto& command : display_list.commands) {
         std::visit(
             [&](const auto& typed) {
-                draw_command(cr, typed, scale, clip_depth, text);
+                draw_command(cr, typed, scale, clip_depth, state);
             },
             command);
         check_status(cairo_status(cr), "draw display command");

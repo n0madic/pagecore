@@ -4725,6 +4725,142 @@ void test_background_tiling_is_bounded()
             "bounded tiling should still fill the visible area");
 }
 
+void test_cairo_raster_shares_decoded_image_surface()
+{
+    // The same DecodedImage is referenced by two ImageCommands (a tiled
+    // background plus a foreground <img>). The render pass converts it to a
+    // premultiplied surface once and reuses it; both draws must be correct and
+    // the shared cached surface must stay valid for the second command.
+    auto shared = std::make_shared<pagecore::DecodedImage>();
+    shared->width = 2;
+    shared->height = 2;
+    shared->rgba = {
+        10, 20, 30, 255, 40, 50, 60, 255,
+        70, 80, 90, 255, 100, 110, 120, 255};
+
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{64, 64, 1.0f};
+
+    pagecore::ImageCommand background;
+    background.rect = pagecore::Rect{0, 0, 32.0f, 32.0f};
+    background.tile = pagecore::Rect{0, 0, 2.0f, 2.0f};
+    background.repeat = pagecore::ImageRepeat::Repeat;
+    background.image = shared;
+    display_list.commands.emplace_back(background);
+
+    pagecore::ImageCommand foreground;
+    foreground.rect = pagecore::Rect{40, 40, 2.0f, 2.0f};
+    foreground.tile = pagecore::Rect{40, 40, 2.0f, 2.0f};
+    foreground.repeat = pagecore::ImageRepeat::NoRepeat;
+    foreground.image = shared; // same pointer -> exercises the surface cache
+    display_list.commands.emplace_back(foreground);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list); // must not crash / corrupt
+
+    require(image.width == 64 && image.height == 64, "shared-image render must keep the viewport size");
+    // Top-left pixel of both the tiled background and the standalone image maps
+    // to the image's top-left texel.
+    require(pixel_matches(image, 0, 0, pagecore::Color{10, 20, 30, 255}),
+            "tiled background must draw the shared decoded image");
+    require(pixel_matches(image, 40, 40, pagecore::Color{10, 20, 30, 255}),
+            "foreground image reusing the cached surface must draw identically");
+    require(pixel_matches(image, 41, 41, pagecore::Color{100, 110, 120, 255}),
+            "cached surface must preserve all texels for the reusing command");
+}
+
+void test_cairo_raster_opaque_image_roundtrip()
+{
+    // An opaque colored image drawn 1:1 must survive the RGBA->premultiplied
+    // ARGB conversion and the surface_to_rgba read-back exactly (alpha == 255 is
+    // the identity path for both premultiply and unpremultiply).
+    const pagecore::Color opaque{37, 149, 214, 255};
+    auto solid = std::make_shared<pagecore::DecodedImage>();
+    solid->width = 4;
+    solid->height = 4;
+    solid->rgba.reserve(static_cast<std::size_t>(4 * 4 * 4));
+    for (int i = 0; i < 16; ++i) {
+        solid->rgba.push_back(opaque.r);
+        solid->rgba.push_back(opaque.g);
+        solid->rgba.push_back(opaque.b);
+        solid->rgba.push_back(opaque.a);
+    }
+
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{4, 4, 1.0f};
+    pagecore::ImageCommand command;
+    command.rect = pagecore::Rect{0, 0, 4.0f, 4.0f};
+    command.tile = pagecore::Rect{0, 0, 4.0f, 4.0f};
+    command.repeat = pagecore::ImageRepeat::NoRepeat;
+    command.image = solid;
+    display_list.commands.emplace_back(command);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list);
+
+    require(image.width == 4 && image.height == 4, "opaque image render must match the viewport");
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            require(pixel_matches(image, x, y, opaque),
+                    "opaque image pixels must round-trip exactly through premultiply/unpremultiply");
+        }
+    }
+}
+
+void test_litehtml_text_width_is_deterministic()
+{
+    // Exercises the width cache heterogeneous lookup and the create_font metrics
+    // path that now reuses the shared measurement layout: identical text must
+    // measure to one identical width, repeated renders must reproduce it, and
+    // real glyphs must still rasterize (metrics not degraded).
+    const char* html = R"HTML(
+<html><head><style>
+  body { margin: 0; font-family: sans-serif; font-size: 20px; }
+  p { margin: 0; }
+</style></head><body>
+  <p>Deterministic</p>
+  <p>Deterministic</p>
+  <p>Deterministic</p>
+</body></html>
+)HTML";
+
+    const auto widths_for = [&]() {
+        pagecore::Page page;
+        page.load_html(html, "https://example.test/index.html");
+        pagecore::RenderOptions options;
+        options.viewport = pagecore::Viewport{320, 240, 1.0f};
+        const auto& dl = page.display_list(options);
+        std::vector<float> widths;
+        for (const auto& command : dl.commands) {
+            if (const auto* text = std::get_if<pagecore::TextCommand>(&command)) {
+                if (text->text.find("Deterministic") != std::string::npos) {
+                    widths.push_back(text->rect.width);
+                }
+            }
+        }
+        return widths;
+    };
+
+    const auto first = widths_for();
+    require(first.size() >= 3, "each identical paragraph should emit its own text run");
+    for (const float w : first) {
+        require(w > 0.0f, "measured text width must be positive");
+        require(w == first.front(),
+                "identical text must measure to an identical width (width-cache determinism)");
+    }
+
+    const auto second = widths_for();
+    require(second == first, "a fresh render of the same page must reproduce identical text widths");
+
+    pagecore::Page page;
+    page.load_html(html, "https://example.test/index.html");
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+    const auto image = page.render(options);
+    require(image_has_non_solid_text_pixel(image),
+            "text must render as anti-aliased glyphs after measurement-layout reuse");
+}
+
 void test_image_decoder_rejects_malformed_input()
 {
     const auto expect_throws = [](std::string_view bytes, const char* what) {
@@ -8040,6 +8176,89 @@ void test_render_absolute_percent_correction_pins_native_width_not_narrower()
         "the abs-% correction must pin litehtml's own cell width so the width:100% child stays full-width, never narrow it with a re-derived formula");
 }
 
+// Regression (Phase 3): the absolute-% correction is now collected by the engine
+// with typed getters, but must still trigger the corrective second layout pass and
+// produce a deterministic (byte-identical) display list.
+void test_render_absolute_percent_correction_runs_second_pass()
+{
+    const char* html = R"HTML(
+<html><head><style>
+  body { margin:0; }
+  .wrap { position:relative; width:400px; height:100px; }
+  .cell { position:absolute; left:0; top:0; width:50%; box-sizing:border-box; }
+  .card { width:100%; height:40px; background:#fff; }
+</style></head><body>
+  <div class="wrap"><div class="cell" id="cell"><div class="card" id="card"></div></div></div>
+</body></html>
+)HTML";
+
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::Page page;
+    page.load_html(html, "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{800, 200, 1.0f};
+    options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    const std::string json_first = pagecore::display_list_to_json(page.display_list(options));
+
+    const auto corrected_pass = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::SerializeHtml
+            && e.property.find("absolute_percent_corrected:1") != std::string::npos;
+    });
+    require(corrected_pass,
+            "an absolute-% border-box page must run the second, corrected layout pass");
+
+    const auto first_pass = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::SerializeHtml
+            && e.property.find("absolute_percent_corrected:0") != std::string::npos;
+    });
+    require(first_pass, "the uncorrected first pass must still run");
+
+    // An independent render of the same page must reproduce the corrected display
+    // list exactly: the typed override collection is deterministic.
+    pagecore::Page page2;
+    page2.load_html(html, "https://example.test/index.html");
+    const std::string json_second = pagecore::display_list_to_json(page2.display_list(options));
+    require(json_first == json_second,
+            "the corrected absolute-% display list must be deterministic (byte-identical)");
+}
+
+// Regression (Phase 3): a page with no position:absolute; box-sizing:border-box;
+// width:% elements must short-circuit — the engine reports no overrides and the
+// corrective second layout pass never runs.
+void test_render_without_absolute_elements_skips_second_pass()
+{
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; }
+  .box { width:120px; height:40px; background:#fff; }
+</style></head><body>
+  <div class="box"></div>
+  <p>No absolutely-positioned percentage-width elements here.</p>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 200, 1.0f};
+    options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    (void) page.display_list(options);
+
+    const auto ran_second_pass = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::SerializeHtml
+            && e.property.find("absolute_percent_corrected:1") != std::string::npos;
+    });
+    require(!ran_second_pass,
+            "a page with no absolute-% elements must not run the corrective second layout pass");
+}
+
 // Regression (ii): the final paint is a pure function of the settled DOM and the
 // render viewport, independent of any prior scripting reads.
 void test_render_reflects_settled_dom_regardless_of_read_history()
@@ -8227,6 +8446,9 @@ int main()
 #endif
         test_cairo_raster_handles_nonfinite_coordinates();
         test_background_tiling_is_bounded();
+        test_cairo_raster_shares_decoded_image_surface();
+        test_cairo_raster_opaque_image_roundtrip();
+        test_litehtml_text_width_is_deterministic();
         test_image_decoder_rejects_malformed_input();
         test_cairo_raster_and_io_error_paths();
 #endif
@@ -8313,6 +8535,8 @@ int main()
         test_computed_style_property_reuses_digest_across_unrelated_mutation();
         test_render_never_injects_cross_viewport_measured_width();
         test_render_absolute_percent_correction_pins_native_width_not_narrower();
+        test_render_absolute_percent_correction_runs_second_pass();
+        test_render_without_absolute_elements_skips_second_pass();
         test_render_reflects_settled_dom_regardless_of_read_history();
         test_computed_style_reacts_to_class_driven_width_change();
 #endif
