@@ -5,16 +5,9 @@
 #include <cstddef>
 #include <cstdlib>
 
-namespace pagecore {
+#include "util.hpp"
 
-std::string ascii_lower(std::string_view value)
-{
-    std::string out(value);
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return out;
-}
+namespace pagecore {
 
 std::string_view trim_ascii(std::string_view value)
 {

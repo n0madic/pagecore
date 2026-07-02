@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "util.hpp"
 #include "pagecore/resource_loader.hpp"
 
 namespace pagecore {
@@ -27,8 +28,8 @@ struct CssAttributeSelectorUsage {
     bool wildcard = false;
 };
 
-// ASCII-only lowercasing and whitespace trimming used across the CSS scanner.
-std::string ascii_lower(std::string_view value);
+// ASCII-only whitespace trimming used across the CSS scanner. (ASCII lowercasing
+// is provided by util.hpp's ascii_lower, included above.)
 std::string_view trim_ascii(std::string_view value);
 
 // Returns the value of `property` from an inline `style="..."` declaration list,

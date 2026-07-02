@@ -1,5 +1,7 @@
 #include "dom_document.hpp"
 
+#include "util.hpp"
+
 #include <lexbor/dom/interfaces/attr.h>
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/comment.h>
@@ -61,16 +63,6 @@ std::string character_data(lxb_dom_node_t* node)
 
     auto* data = lxb_dom_interface_character_data(node);
     return to_string(data->data.data, data->data.length);
-}
-
-std::string ascii_lower(std::string_view value)
-{
-    std::string out;
-    out.reserve(value.size());
-    for (unsigned char ch : value) {
-        out.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return out;
 }
 
 bool starts_with(std::string_view value, std::string_view prefix)

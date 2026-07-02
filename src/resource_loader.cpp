@@ -1,5 +1,6 @@
 #include "pagecore/resource_loader.hpp"
 
+#include "util.hpp"
 #include "base64_codec.hpp"
 
 #include <curl/curl.h>
@@ -276,15 +277,6 @@ bool has_url_scheme(std::string_view value)
     return true;
 }
 
-std::string to_lower(std::string_view value)
-{
-    std::string out(value);
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return out;
-}
-
 std::string scheme_of(std::string_view url)
 {
     const auto colon = url.find(':');
@@ -297,7 +289,7 @@ std::string scheme_of(std::string_view url)
         return "file";
     }
 
-    return to_lower(url.substr(0, colon));
+    return ascii_lower(url.substr(0, colon));
 }
 
 bool is_network_scheme(std::string_view scheme)
@@ -386,15 +378,15 @@ std::string host_of(std::string_view url)
     if (!authority.empty() && authority.front() == '[') {
         const auto close = authority.find(']');
         if (close != std::string_view::npos) {
-            return to_lower(authority.substr(1, close - 1));
+            return ascii_lower(authority.substr(1, close - 1));
         }
-        return to_lower(authority.substr(1));
+        return ascii_lower(authority.substr(1));
     }
     const auto colon = authority.find(':');
     if (colon != std::string_view::npos) {
         authority = authority.substr(0, colon);
     }
-    return to_lower(authority);
+    return ascii_lower(authority);
 }
 
 // IPv4 host order. Loopback, private, link-local (incl. 169.254.169.254 cloud
@@ -532,7 +524,7 @@ bool is_blocked_literal_host(const std::string& host, const ResourcePolicy& poli
         return false;
     }
     for (const auto& blocked : policy.blocked_hosts) {
-        if (to_lower(blocked) == host) {
+        if (ascii_lower(blocked) == host) {
             return true;
         }
     }
@@ -642,7 +634,7 @@ std::string origin_of(std::string_view url)
     if (scheme_pos == std::string_view::npos) {
         return {};
     }
-    const std::string scheme = to_lower(url.substr(0, scheme_pos));
+    const std::string scheme = ascii_lower(url.substr(0, scheme_pos));
     const std::string host = host_of(url);
 
     // Authority between "://" and the first path/query/fragment separator.
@@ -850,7 +842,7 @@ ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePol
     if (mime_type.empty()) {
         mime_type = "text/plain";
     } else {
-        mime_type = to_lower(mime_type);
+        mime_type = ascii_lower(mime_type);
     }
 
     bool base64 = false;
@@ -862,7 +854,7 @@ ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePol
         const std::string_view parameter = metadata.substr(
             parameter_start,
             parameter_end == std::string_view::npos ? std::string_view::npos : parameter_end - parameter_start);
-        if (to_lower(parameter) == "base64") {
+        if (ascii_lower(parameter) == "base64") {
             base64 = true;
         }
         if (parameter_end == std::string_view::npos) {
@@ -896,7 +888,7 @@ std::string extension_of(std::string_view url)
     if (dot == std::string_view::npos) {
         return {};
     }
-    return to_lower(clean.substr(dot + 1));
+    return ascii_lower(clean.substr(dot + 1));
 }
 
 std::string infer_mime_type(std::string_view url, ResourceKind kind)

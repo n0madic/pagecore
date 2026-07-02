@@ -1,5 +1,7 @@
 #include "cookie_jar.hpp"
 
+#include "util.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <ctime>
@@ -26,16 +28,6 @@ struct ParsedUrl {
     bool secure = false;
 };
 
-std::string lower_ascii(std::string_view value)
-{
-    std::string out;
-    out.reserve(value.size());
-    for (char ch : value) {
-        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    }
-    return out;
-}
-
 std::string trim_ascii(std::string_view value)
 {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
@@ -49,7 +41,7 @@ std::string trim_ascii(std::string_view value)
 
 bool iequals(std::string_view left, std::string_view right)
 {
-    return lower_ascii(left) == lower_ascii(right);
+    return ascii_lower(left) == ascii_lower(right);
 }
 
 ParsedUrl parse_url(std::string_view url)
@@ -60,7 +52,7 @@ ParsedUrl parse_url(std::string_view url)
         return parsed;
     }
 
-    parsed.scheme = lower_ascii(url.substr(0, colon));
+    parsed.scheme = ascii_lower(url.substr(0, colon));
     parsed.secure = parsed.scheme == "https";
     std::size_t cursor = colon + 1;
     if (url.substr(cursor, 2) == "//") {
@@ -74,13 +66,13 @@ ParsedUrl parse_url(std::string_view url)
         }
         if (!authority.empty() && authority.front() == '[') {
             const std::size_t close = authority.find(']');
-            parsed.host = lower_ascii(close == std::string_view::npos ? authority : authority.substr(0, close + 1));
+            parsed.host = ascii_lower(close == std::string_view::npos ? authority : authority.substr(0, close + 1));
             if (close != std::string_view::npos && close + 1 < authority.size() && authority[close + 1] == ':') {
                 parsed.port = std::string(authority.substr(close + 2));
             }
         } else {
             const std::size_t port = authority.rfind(':');
-            parsed.host = lower_ascii(port == std::string_view::npos ? authority : authority.substr(0, port));
+            parsed.host = ascii_lower(port == std::string_view::npos ? authority : authority.substr(0, port));
             if (port != std::string_view::npos) {
                 parsed.port = std::string(authority.substr(port + 1));
             }
@@ -128,8 +120,8 @@ bool domain_match(std::string_view host, std::string_view domain)
     if (host.empty() || domain.empty()) {
         return false;
     }
-    const std::string host_l = lower_ascii(host);
-    const std::string domain_l = lower_ascii(domain);
+    const std::string host_l = ascii_lower(host);
+    const std::string domain_l = ascii_lower(domain);
     if (host_l == domain_l) {
         return true;
     }
@@ -244,7 +236,7 @@ bool is_public_suffix(std::string_view host)
 
 std::string registrable_domain_heuristic(std::string_view host)
 {
-    const std::string lowered = lower_ascii(host);
+    const std::string lowered = ascii_lower(host);
     if (lowered.empty()
         || lowered == "localhost"
         || lowered.front() == '['
@@ -290,13 +282,13 @@ bool same_site_url(std::string_view left, std::string_view right)
 
 bool is_safe_method(std::string_view method)
 {
-    const std::string lowered = lower_ascii(method.empty() ? std::string_view("GET") : method);
+    const std::string lowered = ascii_lower(method.empty() ? std::string_view("GET") : method);
     return lowered == "get" || lowered == "head" || lowered == "options" || lowered == "trace";
 }
 
 std::optional<CookieSameSite> parse_same_site(std::string_view value)
 {
-    const std::string lowered = lower_ascii(trim_ascii(value));
+    const std::string lowered = ascii_lower(trim_ascii(value));
     if (lowered == "strict") {
         return CookieSameSite::Strict;
     }
@@ -580,11 +572,11 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
             continue;
         }
         const std::size_t attr_equals = attr.find('=');
-        const std::string name = lower_ascii(attr_equals == std::string::npos ? attr : attr.substr(0, attr_equals));
+        const std::string name = ascii_lower(attr_equals == std::string::npos ? attr : attr.substr(0, attr_equals));
         const std::string value = attr_equals == std::string::npos ? std::string{} : trim_ascii(attr.substr(attr_equals + 1));
 
         if (name == "domain") {
-            std::string domain = lower_ascii(value);
+            std::string domain = ascii_lower(value);
             while (!domain.empty() && domain.front() == '.') {
                 domain.erase(domain.begin());
             }

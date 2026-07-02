@@ -451,6 +451,7 @@ endif()
 
 add_library(pagecore
     "${PAGECORE_DOM_SHIM_HEADER}"
+    src/util.cpp
     src/base64_codec.cpp
     src/cookie_jar.cpp
     src/css_scan.cpp
