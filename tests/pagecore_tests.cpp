@@ -4513,11 +4513,8 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
         doc.layout_mutation_version() == initial_layout_version + 1,
         "data-* writes must invalidate layout/style cache when an attribute selector depends on them");
     require(
-        doc.last_layout_mutation_reason() == "set_attribute:data-state",
-        "layout mutation reason should describe the attribute mutation");
-    require(
-        doc.last_layout_mutation_node() == node,
-        "layout mutation node should identify the element that changed");
+        doc.self_dirty_layout_version(node) == doc.layout_mutation_version(),
+        "a selector-relevant attribute mutation should self-dirty the changed node");
 
     const auto selected_layout_version = doc.layout_mutation_version();
     doc.set_attribute(node, "aria-label", "Still service metadata");
@@ -4529,7 +4526,9 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
     require(
         doc.layout_mutation_version() == selected_layout_version + 1,
         "class writes must invalidate layout/style cache");
-    require(doc.last_layout_mutation_node() == node, "class mutation should record the changed node");
+    require(
+        doc.self_dirty_layout_version(node) == doc.layout_mutation_version(),
+        "a class mutation should self-dirty the changed node");
 
     const auto class_layout_version = doc.layout_mutation_version();
     doc.set_text_content(node, "changed");
@@ -4543,8 +4542,9 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
     require(
         doc.layout_mutation_version() == text_layout_version + 1,
         "append_child must invalidate layout/style cache");
-    require(doc.last_layout_mutation_reason() == "append_child", "append_child should record its mutation reason");
-    require(doc.last_layout_mutation_node() == appended, "append_child should record the appended node");
+    require(
+        doc.self_dirty_layout_version(appended) == doc.layout_mutation_version(),
+        "append_child should self-dirty the appended node");
 
     doc.parse("<html><body><script id='s'>var a = 1;</script><div id='x'>layout</div></body></html>");
     const pagecore::NodeId script = doc.get_element_by_id("s");
@@ -4553,6 +4553,97 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
     require(
         doc.layout_mutation_version() == script_layout_version,
         "script text mutations must not invalidate layout/style cache");
+}
+
+void test_layout_input_digest_superset_invariants()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<html><head></head><body>"
+        "<div id='a' class='x'><span id='s1'>t</span><span id='s2'></span></div>"
+        "<div id='b'></div>"
+        "</body></html>");
+
+    const pagecore::NodeId a = doc.get_element_by_id("a");
+    const pagecore::NodeId s1 = doc.get_element_by_id("s1");
+    const pagecore::NodeId s2 = doc.get_element_by_id("s2");
+    require(a != pagecore::kInvalidNodeId && s1 != pagecore::kInvalidNodeId && s2 != pagecore::kInvalidNodeId,
+            "digest fixture nodes must resolve");
+
+    auto digest = [&](pagecore::NodeId node, int vw = 1280, int vh = 720, float scale = 1.0f) {
+        return doc.layout_input_digest(node, vw, vh, scale);
+    };
+
+    require(digest(s2) == digest(s2), "digest must be stable for identical DOM and viewport");
+    require(digest(s2) != digest(s2, 640), "digest must differ on viewport width");
+    require(digest(s2) != digest(s2, 1280, 480), "digest must differ on viewport height");
+    require(digest(s2) != digest(s2, 1280, 720, 2.0f), "digest must differ on device scale factor");
+
+    const auto before_service = digest(s2);
+    doc.set_attribute(s2, "data-test", "value");
+    require(digest(s2) == before_service, "non-selector service attribute change must NOT change the digest");
+
+    const auto before_class = digest(s2);
+    doc.set_attribute(s2, "class", "y");
+    require(digest(s2) != before_class, "class change must change the digest");
+
+    const auto before_style = digest(s2);
+    doc.set_attribute(s2, "style", "color:red");
+    require(digest(s2) != before_style, "inline style change must change the digest");
+
+    const auto before_sibling_class = digest(s2);
+    doc.set_attribute(s1, "class", "sibling");
+    require(digest(s2) != before_sibling_class, "a sibling's class change must change the digest (sibling combinators)");
+
+    const auto before_insert = digest(s2);
+    const pagecore::NodeId inserted = doc.create_element("span");
+    doc.insert_before(a, inserted, s2);
+    require(digest(s2) != before_insert, "inserting a preceding sibling must change the digest (:nth-child/index)");
+
+    const auto before_child = digest(s2);
+    const pagecore::NodeId child = doc.create_element("em");
+    doc.append_child(s2, child);
+    require(digest(s2) != before_child, "adding a first child must change the digest (:empty)");
+
+    const auto before_stylesheet = digest(s2);
+    const pagecore::NodeId style = doc.create_element("style");
+    doc.append_child(doc.head(), style);
+    doc.set_text_content(style, ".y { width: 5px; }");
+    require(digest(s2) != before_stylesheet, "inserting a stylesheet must change every node's digest");
+}
+
+void test_subtree_dirty_epoch_tracks_descendant_mutations()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<html><body>"
+        "<div id='parent'><div id='mid'><div id='leaf'></div></div></div>"
+        "<div id='other'></div>"
+        "</body></html>");
+
+    const pagecore::NodeId parent = doc.get_element_by_id("parent");
+    const pagecore::NodeId mid = doc.get_element_by_id("mid");
+    const pagecore::NodeId leaf = doc.get_element_by_id("leaf");
+    const pagecore::NodeId other = doc.get_element_by_id("other");
+    require(parent && mid && leaf && other, "dirty-epoch fixture nodes must resolve");
+
+    const auto v0 = doc.layout_mutation_version();
+    doc.set_attribute(leaf, "class", "z");
+    const auto v1 = doc.layout_mutation_version();
+    require(v1 > v0, "a class mutation must bump the layout version");
+
+    require(doc.self_dirty_layout_version(leaf) == v1, "the mutated node must be self-dirty at the new version");
+    require(doc.subtree_dirty_layout_version(leaf) == v1, "the mutated node must be subtree-dirty at the new version");
+    require(doc.subtree_dirty_layout_version(mid) == v1, "an ancestor's subtree must be dirtied by a descendant mutation");
+    require(doc.subtree_dirty_layout_version(parent) == v1, "every ancestor's subtree must be dirtied");
+    require(doc.self_dirty_layout_version(mid) < v1, "an ancestor's own box must NOT be self-dirtied by a descendant mutation");
+    require(doc.self_dirty_layout_version(parent) < v1, "an ancestor's own box must NOT be self-dirtied by a descendant mutation");
+    require(doc.subtree_dirty_layout_version(other) < v1, "an unrelated subtree must not be dirtied");
+
+    doc.set_attribute(parent, "class", "p");
+    const auto v2 = doc.layout_mutation_version();
+    require(doc.self_dirty_layout_version(parent) == v2, "an own-attribute mutation must self-dirty the node");
+    require(doc.subtree_dirty_layout_version(leaf) == v1, "a descendant's subtree must be unchanged by an ancestor's own mutation");
 }
 
 void test_query_selector_cache_returns_all_and_first()
@@ -6246,154 +6337,6 @@ void test_layout_serialization_materializes_cached_absolute_width()
         "transient layout width overrides must not mutate user-visible serialized HTML");
 }
 
-void test_layout_serialization_keeps_cached_absolute_width_after_unrelated_ancestor_mutation()
-{
-    pagecore::Page page;
-    page.load_html(R"HTML(
-<html><head><style>
-  body { margin:0; background:#eee; }
-  .wrap { position:relative; width:944px; height:300px; }
-  .cell {
-    width:25%;
-    padding-left:9px;
-    padding-right:9px;
-    box-sizing:border-box;
-  }
-  .card {
-    width:100%;
-    height:100px;
-    background:#fff;
-    border:1px solid #000;
-    box-sizing:border-box;
-  }
-</style></head><body>
-  <div class="wrap" id="wrap"><div class="cell" id="cell"><div class="card" id="card">card</div></div></div>
-  <script>
-    const cell = document.getElementById('cell');
-    const measuredWidth = cell.offsetWidth;
-    document.body.setAttribute('data-cell-width-ok', measuredWidth > 200 ? 'true' : 'false');
-    cell.style.position = 'absolute';
-    cell.style.left = '0px';
-    cell.style.top = '0px';
-    document.body.setAttribute('data-positioned-width-ok', cell.offsetWidth > 200 ? 'true' : 'false');
-    for (let i = 0; i < 20; ++i) {
-      const marker = document.createElement('div');
-      marker.setAttribute('data-marker', String(i));
-      document.body.appendChild(marker);
-    }
-  </script>
-</body></html>
-)HTML", "https://example.test/index.html");
-
-    require(
-        page.outer_html("body[data-cell-width-ok='true']").has_value(),
-        "test fixture should cache the absolute element's browser-facing geometry before the late mutation");
-    require(
-        page.outer_html("body[data-positioned-width-ok='true']").has_value(),
-        "test fixture should cache the positioned absolute element's browser-facing geometry before history overflow");
-
-    pagecore::RenderOptions options;
-    options.viewport = pagecore::Viewport{1280, 720, 1.0f};
-    const auto& display = page.display_list(options);
-
-    const bool saw_wide_card_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
-        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
-        return fill
-            && fill->color.r == 255
-            && fill->color.g == 255
-            && fill->color.b == 255
-            && fill->rect.x >= 0.0f
-            && fill->rect.x < 20.0f
-            && fill->rect.y >= 0.0f
-            && fill->rect.y < 20.0f
-            && fill->rect.width > 200.0f
-            && fill->rect.height >= 90.0f;
-    });
-    require(
-        saw_wide_card_fill,
-        "render serialization should keep cached used width after unrelated ancestor DOM mutations with complete history");
-
-    const auto cell_html = page.outer_html("#cell");
-    require(cell_html.has_value(), "test fixture should keep the positioned cell in the DOM");
-    require(
-        cell_html->find("width:") == std::string::npos,
-        "transient layout width overrides must not leak into user-visible serialized HTML");
-}
-
-void test_layout_serialization_keeps_cached_absolute_width_after_unrelated_history_rollover()
-{
-    pagecore::Page page;
-    page.load_html(R"HTML(
-<html><head><style>
-  body { margin:0; background:#eee; }
-  .wrap { position:relative; width:944px; height:300px; }
-  .cell {
-    width:25%;
-    padding-left:9px;
-    padding-right:9px;
-    box-sizing:border-box;
-  }
-  .card {
-    width:100%;
-    height:100px;
-    background:#fff;
-    border:1px solid #000;
-    box-sizing:border-box;
-  }
-</style></head><body>
-  <div class="wrap" id="wrap"><div class="cell" id="cell"><div class="card" id="card">card</div></div></div>
-  <script>
-    const cell = document.getElementById('cell');
-    const measuredWidth = cell.offsetWidth;
-    document.body.setAttribute('data-cell-width-ok', measuredWidth > 200 ? 'true' : 'false');
-    cell.style.position = 'absolute';
-    cell.style.left = '0px';
-    cell.style.top = '0px';
-    document.body.setAttribute('data-positioned-width-ok', cell.offsetWidth > 200 ? 'true' : 'false');
-    for (let i = 0; i < 160; ++i) {
-      const marker = document.createElement('div');
-      marker.setAttribute('data-marker', String(i));
-      document.body.appendChild(marker);
-    }
-  </script>
-</body></html>
-)HTML", "https://example.test/index.html");
-
-    require(
-        page.outer_html("body[data-cell-width-ok='true']").has_value(),
-        "test fixture should cache the absolute element's browser-facing geometry before the late mutation");
-    require(
-        page.outer_html("body[data-positioned-width-ok='true']").has_value(),
-        "test fixture should cache the positioned absolute element's browser-facing geometry before history overflow");
-
-    pagecore::RenderOptions options;
-    options.viewport = pagecore::Viewport{1280, 720, 1.0f};
-    const auto& display = page.display_list(options);
-
-    const bool saw_wide_card_fill = std::any_of(display.commands.begin(), display.commands.end(), [](const auto& command) {
-        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
-        return fill
-            && fill->color.r == 255
-            && fill->color.g == 255
-            && fill->color.b == 255
-            && fill->rect.x >= 0.0f
-            && fill->rect.x < 20.0f
-            && fill->rect.y >= 0.0f
-            && fill->rect.y < 20.0f
-            && fill->rect.width > 200.0f
-            && fill->rect.height >= 90.0f;
-    });
-    require(
-        saw_wide_card_fill,
-        "render serialization should keep cached used width after unrelated DOM churn rolls over history");
-
-    const auto cell_html = page.outer_html("#cell");
-    require(cell_html.has_value(), "test fixture should keep the positioned cell in the DOM");
-    require(
-        cell_html->find("width:") == std::string::npos,
-        "transient layout width overrides must not leak into user-visible serialized HTML");
-}
-
 void test_layout_serialization_materializes_absolute_percentage_width_without_js_measure()
 {
     pagecore::Page page;
@@ -7070,6 +7013,70 @@ public:
     std::shared_ptr<int> layout_calls;
 };
 
+// A single layout() slow enough (> kExpensiveStyledDocumentUs = 250ms) to flag the
+// styled document "expensive" on the very first pass.
+class ExpensiveGeometryEngine final : public pagecore::LayoutEngine {
+public:
+    explicit ExpensiveGeometryEngine(std::shared_ptr<int> layout_calls)
+        : layout_calls_(std::move(layout_calls))
+    {
+    }
+
+    void set_resource_loader(std::shared_ptr<pagecore::ResourceLoader>) override { }
+    void set_viewport(pagecore::Viewport viewport) override
+    {
+        viewport_ = viewport;
+        display_list_.viewport = viewport_;
+    }
+    void load_html(std::string_view, std::string_view) override
+    {
+        laid_out_ = false;
+        display_list_.clear();
+        display_list_.viewport = viewport_;
+    }
+    void layout() override
+    {
+        ++(*layout_calls_);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        laid_out_ = true;
+        display_list_.viewport = viewport_;
+        display_list_.content_width = viewport_.width;
+        display_list_.content_height = viewport_.height;
+    }
+    const pagecore::DisplayList& display_list() const override { return display_list_; }
+    std::optional<pagecore::ElementGeometry> element_geometry(std::string_view) override
+    {
+        if (!laid_out_) {
+            return std::nullopt;
+        }
+        return pagecore::ElementGeometry{
+            pagecore::Rect{0.0f, 0.0f, 10.0f, 10.0f},
+            pagecore::Rect{0.0f, 0.0f, 10.0f, 10.0f},
+        };
+    }
+
+private:
+    std::shared_ptr<int> layout_calls_;
+    pagecore::Viewport viewport_;
+    pagecore::DisplayList display_list_;
+    bool laid_out_ = false;
+};
+
+class ExpensiveGeometryFactory final : public pagecore::LayoutEngineFactory {
+public:
+    ExpensiveGeometryFactory()
+        : layout_calls(std::make_shared<int>(0))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        return std::make_unique<ExpensiveGeometryEngine>(layout_calls);
+    }
+
+    std::shared_ptr<int> layout_calls;
+};
+
 class SlowComputedStyleEngine final : public pagecore::LayoutEngine {
 public:
     explicit SlowComputedStyleEngine(std::shared_ptr<int> compute_calls)
@@ -7165,7 +7172,16 @@ void test_element_geometry_reuses_cached_layout()
         "a DOM mutation must invalidate the cache and force a fresh layout() on next access");
 }
 
-void test_element_geometry_bounded_mode_rejects_cached_geometry_after_sizing_change()
+// New bounded-geometry contract: geometry is exact whenever a current layout
+// exists or the budget allows; otherwise the last exact measurement is returned
+// as-is (no analytic patching), or nullopt when the node's own subtree changed.
+// These caches never influence the final render.
+// New bounded contract (approximate-nonzero): once bounded, a geometry read
+// returns the last exact measurement AS-IS (never null when a value is known and
+// never analytically patched), because JS grid libraries treat null/zero geometry
+// as a real measurement and permanently collapse their layout. These caches never
+// influence the final render.
+void test_element_geometry_bounded_mode_reuses_last_known_after_own_sizing_change()
 {
     auto factory = std::make_shared<SlowGeometryFactory>();
 
@@ -7187,11 +7203,12 @@ void test_element_geometry_bounded_mode_rejects_cached_geometry_after_sizing_cha
 
     page.document().set_attribute(box, "style", "width:30px");
     auto third = page.element_geometry(box);
-    require(third && third->border_box.width == 30.0f, "inline width changes should use bounded inline-size geometry");
-    require(*factory->layout_calls == 2, "bounded inline-size geometry must not force another full layout");
+    require(third && third->border_box.width == 20.0f,
+            "bounded mode returns the last exact measurement as approximate (never null) so JS grid libraries do not collapse");
+    require(*factory->layout_calls == 2, "bounded mode must not force another full layout");
 }
 
-void test_element_geometry_bounded_mode_invalidates_cached_descendant_after_ancestor_mutation()
+void test_element_geometry_bounded_mode_reuses_descendant_as_approximate_after_ancestor_mutation()
 {
     auto factory = std::make_shared<SlowGeometryFactory>();
 
@@ -7213,11 +7230,13 @@ void test_element_geometry_bounded_mode_invalidates_cached_descendant_after_ance
 
     page.document().set_attribute(parent, "style", "width:40px");
     auto third = page.element_geometry(box);
-    require(!third, "ancestor layout mutations must not reuse stale descendant geometry");
-    require(*factory->layout_calls == 2, "bounded ancestor-invalidated geometry should not force unbounded full layouts");
+    require(
+        third && third->border_box.width == 20.0f,
+        "an ancestor-only mutation leaves the descendant's own subtree unchanged, so bounded mode reuses its last exact geometry as approximate (isolated from the paint)");
+    require(*factory->layout_calls == 2, "ancestor mutation must not force another full layout in bounded mode");
 }
 
-void test_element_geometry_bounded_mode_adjusts_cached_position_style()
+void test_element_geometry_bounded_mode_does_not_analytically_patch_own_position_change()
 {
     auto factory = std::make_shared<SlowGeometryFactory>();
 
@@ -7237,12 +7256,12 @@ void test_element_geometry_bounded_mode_adjusts_cached_position_style()
 
     page.document().set_attribute(box, "style", "position:absolute;left:25px;top:7px");
     auto third = page.element_geometry(box);
-    require(third && third->border_box.x == 25.0f && third->border_box.y == 7.0f,
-            "bounded mode should adjust cached geometry for own inline left/top positioning");
+    require(third && third->border_box.width == 20.0f && third->border_box.x == 0.0f && third->border_box.y == 0.0f,
+            "bounded mode returns the last exact geometry as-is; it never analytically patches inline left/top into position");
     require(*factory->layout_calls == 2, "own position-only style changes should not force another layout in bounded mode");
 }
 
-void test_element_geometry_bounded_mode_rejects_relative_position_cache()
+void test_element_geometry_bounded_mode_reuses_last_known_after_own_relative_position_change()
 {
     auto factory = std::make_shared<SlowGeometryFactory>();
 
@@ -7262,12 +7281,12 @@ void test_element_geometry_bounded_mode_rejects_relative_position_cache()
 
     page.document().set_attribute(box, "style", "position:relative;left:20px;top:4px");
     auto third = page.element_geometry(box);
-    require(third && third->border_box.width == 30.0f,
-            "relative positioning should force exact geometry instead of double-applying offsets");
-    require(*factory->layout_calls == 3, "relative position changes must not use stale cached geometry");
+    require(third && third->border_box.width == 20.0f && third->border_box.x == 0.0f,
+            "relative positioning: bounded mode reuses the last exact geometry as-is, never double-offset");
+    require(*factory->layout_calls == 2, "bounded mode must not force another layout for an own-subtree change");
 }
 
-void test_element_geometry_bounded_mode_snapshots_sibling_geometry_after_expensive_layout()
+void test_element_geometry_bounded_mode_reuses_snapshot_for_unmutated_sibling()
 {
     auto factory = std::make_shared<SlowGeometryFactory>();
 
@@ -7287,12 +7306,44 @@ void test_element_geometry_bounded_mode_snapshots_sibling_geometry_after_expensi
     require(second && second->border_box.width == 20.0f, "second geometry read should be exact and snapshot siblings");
     require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
 
-    page.document().set_attribute(b, "style", "position:absolute;left:11px;top:3px");
+    // Mutate 'a' again (not 'b'); 'b's own subtree is untouched, so a bounded read
+    // of 'b' reuses the expensive-layout snapshot without another layout.
+    page.document().set_attribute(a, "style", "color:red");
     auto third = page.element_geometry(b);
     require(
-        third && third->border_box.width == 20.0f && third->border_box.x == 11.0f && third->border_box.y == 3.0f,
-        "bounded mode should reuse the expensive-layout geometry snapshot for sibling position-only reads");
+        third && third->border_box.width == 20.0f,
+        "bounded mode should reuse the expensive-layout snapshot for a sibling whose own subtree did not change");
     require(*factory->layout_calls == 2, "snapshot-backed sibling geometry must not force another full layout");
+}
+
+// Regression: an expensive styled document must not skip straight to bounded-null
+// geometry before anything is measured. The first read stays exact and snapshots
+// every element, so a JS grid library (Isotope/Masonry) that reads each item's
+// geometry during load gets real values instead of nulls that collapse the grid.
+void test_element_geometry_expensive_document_seeds_snapshot_before_bounded()
+{
+    auto factory = std::make_shared<ExpensiveGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='a'></div><div id='b'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId a = page.document().query_selector(root, "#a");
+    const pagecore::NodeId b = page.document().query_selector(root, "#b");
+    require(a != pagecore::kInvalidNodeId && b != pagecore::kInvalidNodeId, "expected sibling fixture");
+
+    auto ga = page.element_geometry(a);
+    require(ga && ga->border_box.width == 10.0f,
+            "the first geometry read on an expensive document must be exact, not immediately bounded-null");
+    require(*factory->layout_calls == 1, "the first read forces exactly one layout");
+
+    // 'b' was never read exactly, but the expensive-layout snapshot must have cached
+    // it so a bounded read returns a real (non-null) value.
+    auto gb = page.element_geometry(b);
+    require(gb.has_value() && gb->border_box.width == 10.0f,
+            "a sibling never read exactly must still get non-null geometry from the expensive-layout snapshot");
+    require(*factory->layout_calls == 1, "the snapshot must answer the sibling without another layout");
 }
 
 void test_element_geometry_bounded_mode_caps_uncached_exact_layouts()
@@ -7456,7 +7507,10 @@ void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
     require(saw_bounded_event, "perf trace should identify bounded computed-style property reads");
 }
 
-void test_computed_style_property_preflights_first_append_child_on_heavy_document()
+// The first computed-style read after appending a node is now exact (no
+// preflight-to-default guessing on the common path): it builds the cascade once
+// and returns the real value.
+void test_computed_style_property_after_append_runs_first_exact()
 {
     std::vector<pagecore::PerfEvent> events;
     auto factory = std::make_shared<SlowComputedStyleFactory>();
@@ -7476,13 +7530,8 @@ void test_computed_style_property_preflights_first_append_child_on_heavy_documen
     page.document().append_child(body, box);
 
     auto width = page.computed_style_property(box, "width");
-    require(width && *width == "auto", "preflight append-child width should use the bounded CSS default");
-    require(*factory->compute_calls == 0, "preflight append-child read must not build a styled document");
-
-    page.document().set_attribute(box, "style", "width:30px");
-    auto inline_width = page.computed_style_property(box, "width");
-    require(inline_width && *inline_width == "30px", "bounded mode should still return inline values after preflight");
-    require(*factory->compute_calls == 0, "post-preflight bounded mode must not force a rebuild");
+    require(width && *width == "10px", "first computed style read after append should be exact, not a preflight default");
+    require(*factory->compute_calls == 1, "first read after append should build the cascade exactly once");
 
     const bool saw_preflight_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
         return event.phase == pagecore::PerfPhase::ComputedStyle
@@ -7490,7 +7539,195 @@ void test_computed_style_property_preflights_first_append_child_on_heavy_documen
             && event.property == "width"
             && event.styled_document_cache_reason == "preflight_append_child:empty";
     });
-    require(saw_preflight_event, "perf trace should identify append-child preflight computed-style reads");
+    require(!saw_preflight_event, "computed style reads must not preflight appended nodes to a default value");
+}
+
+// Sound digest reuse: a layout-version-bumping mutation to a cousin that does NOT
+// change node N's cascade inputs must be answered from N's cached value without a
+// rebuild.
+void test_computed_style_property_reuses_digest_across_unrelated_mutation()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto factory = std::make_shared<SlowComputedStyleFactory>();
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(factory);
+    page.load_html(
+        "<html><body><div id='x'></div><div id='container'><div id='y'></div></div></body></html>",
+        "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId x = page.document().query_selector(root, "#x");
+    const pagecore::NodeId y = page.document().query_selector(root, "#y");
+    require(x != pagecore::kInvalidNodeId && y != pagecore::kInvalidNodeId, "expected cousin fixture");
+
+    auto first = page.computed_style_property(x, "width");
+    require(first && *first == "10px", "first read should be exact");
+    require(*factory->compute_calls == 1, "first read should build the cascade once");
+
+    // A class change on a cousin bumps the layout version but does not touch x's
+    // cascade inputs (x's sibling context only sees #container's own identity, not
+    // its descendants), so x's digest is unchanged and reuse must avoid a rebuild.
+    page.document().set_attribute(y, "class", "z");
+    auto second = page.computed_style_property(x, "width");
+    require(second && *second == "10px", "digest reuse should return the unchanged value");
+    require(*factory->compute_calls == 1, "an unrelated cousin mutation must not force a computed-style rebuild");
+
+    const bool saw_reuse = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ComputedStyle
+            && event.name == "computed_style_property"
+            && event.property == "width"
+            && event.styled_document_cache_reason.rfind("digest_reuse:", 0) == 0;
+    });
+    require(saw_reuse, "perf trace should identify sound digest-reuse reads");
+}
+
+namespace {
+
+// Widest white (#fff) fill in a display list, used by the render regressions to
+// read back an absolute element's rendered width.
+float widest_white_fill(const pagecore::DisplayList& display)
+{
+    float widest = 0.0f;
+    for (const auto& command : display.commands) {
+        const auto* fill = std::get_if<pagecore::SolidFillCommand>(&command);
+        if (fill && fill->color.r == 255 && fill->color.g == 255 && fill->color.b == 255) {
+            widest = std::max(widest, fill->rect.width);
+        }
+    }
+    return widest;
+}
+
+} // namespace
+
+// Regression (i): a width measured at one viewport must never be injected into a
+// render at a different viewport. The absolute-% correction is recomputed within
+// each render, so the 640 paint reflects 640, not a value measured at 1280.
+void test_render_never_injects_cross_viewport_measured_width()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; }
+  .wrap { position:relative; width:100%; height:120px; }
+  .cell { position:absolute; left:0; top:0; width:25%; box-sizing:border-box; }
+  .card { width:100%; height:80px; background:#fff; }
+</style></head><body>
+  <div class="wrap"><div class="cell" id="cell"><div class="card" id="card"></div></div></div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const pagecore::NodeId cell = page.document().query_selector(page.document().document_node(), "#cell");
+    require(cell != pagecore::kInvalidNodeId, "expected #cell");
+
+    // Prime read-time caches by measuring at the wide viewport.
+    pagecore::RenderOptions wide;
+    wide.viewport = pagecore::Viewport{1280, 720, 1.0f};
+    const float wide_card = widest_white_fill(page.display_list(wide));
+    (void) page.element_geometry(cell);
+    require(wide_card > 280.0f, "at 1280 the 25% absolute cell's card should be ~320px");
+
+    // Render at a narrower viewport: the card must reflect 640, never 1280.
+    pagecore::RenderOptions narrow;
+    narrow.viewport = pagecore::Viewport{640, 480, 1.0f};
+    const float narrow_card = widest_white_fill(page.display_list(narrow));
+    require(
+        narrow_card > 130.0f && narrow_card < 200.0f,
+        "the 640 render must use the 640-derived absolute-% width, never a width measured at 1280");
+}
+
+// Regression: the render-local absolute-%-width correction must pin litehtml's OWN
+// laid-out width, never a re-derived (containing-block) formula that can be narrower
+// and shrink a correctly-sized grid cell. Here litehtml lays the padded 50% cell out
+// at ~240px, so its width:100% card should render at ~200px; a formula that pinned
+// 50%*400 = 200px on the cell would shrink the card to ~160px.
+void test_render_absolute_percent_correction_pins_native_width_not_narrower()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  body { margin:0; }
+  .wrap { position:relative; width:400px; height:100px; }
+  .cell { position:absolute; left:0; top:0; width:50%; padding:0 20px; box-sizing:border-box; }
+  .card { width:100%; height:40px; background:#fff; }
+</style></head><body>
+  <div class="wrap"><div class="cell" id="cell"><div class="card" id="card"></div></div></div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{800, 200, 1.0f};
+    const float card = widest_white_fill(page.display_list(options));
+    require(
+        card > 190.0f,
+        "the abs-% correction must pin litehtml's own cell width so the width:100% child stays full-width, never narrow it with a re-derived formula");
+}
+
+// Regression (ii): the final paint is a pure function of the settled DOM and the
+// render viewport, independent of any prior scripting reads.
+void test_render_reflects_settled_dom_regardless_of_read_history()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="a" style="width:50px;height:20px;background:#fff"></div>
+  <script>
+    const a = document.getElementById('a');
+    a.offsetWidth;              // read at the initial width
+    a.style.width = '120px';    // mutate
+    a.offsetWidth;              // read again, mid-script
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 200, 1.0f};
+    const float rendered = widest_white_fill(page.display_list(options));
+
+    // Independent exact layout of the settled serialized DOM, JS disabled.
+    pagecore::LoadOptions independent_options;
+    independent_options.enable_js = false;
+    pagecore::Page independent(independent_options);
+    independent.load_html(page.serialize_html(), "https://example.test/index.html");
+    const float independent_rendered = widest_white_fill(independent.display_list(options));
+
+    require(rendered > 110.0f, "the settled width (120px) must be what gets painted, not a mid-script read");
+    require(
+        std::abs(rendered - independent_rendered) < 1.0f,
+        "the paint must equal an independent exact layout of the settled DOM, regardless of read history");
+}
+
+// Regression (iii): a class-driven width change must invalidate the digest and
+// recompute — the "loses style transformations" bug.
+void test_computed_style_reacts_to_class_driven_width_change()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  .narrow { width: 40px; }
+  .wide { width: 200px; }
+</style></head><body>
+  <div id="x" class="narrow"></div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    const pagecore::NodeId x = page.document().query_selector(page.document().document_node(), "#x");
+    require(x != pagecore::kInvalidNodeId, "expected #x");
+
+    auto narrow = page.computed_style_property(x, "width");
+    require(narrow && narrow->find("40") != std::string::npos,
+            "class-driven width should resolve from the stylesheet");
+
+    page.document().set_attribute(x, "class", "wide");
+    auto wide = page.computed_style_property(x, "width");
+    require(wide && wide->find("200") != std::string::npos,
+            "a class change must invalidate the digest and recompute the width");
+    require(narrow != wide, "the computed width must change with the class");
 }
 #endif
 
@@ -7613,6 +7850,8 @@ int main()
         test_deep_dom_traversal_is_iterative();
         test_deep_clone_assigns_fresh_subtree_ids();
         test_dom_layout_mutation_version_ignores_service_attributes();
+        test_layout_input_digest_superset_invariants();
+        test_subtree_dirty_epoch_tracks_descendant_mutations();
         test_query_selector_cache_returns_all_and_first();
         test_described_traversal_wraps_children_correctly();
         test_child_node_list_cache_reflects_mutations();
@@ -7662,8 +7901,6 @@ int main()
         test_visual_fixture_regression();
         test_geometry_box_model_apis_reflect_real_layout();
         test_layout_serialization_materializes_cached_absolute_width();
-        test_layout_serialization_keeps_cached_absolute_width_after_unrelated_ancestor_mutation();
-        test_layout_serialization_keeps_cached_absolute_width_after_unrelated_history_rollover();
         test_layout_serialization_materializes_absolute_percentage_width_without_js_measure();
         test_layout_serialization_skips_stale_cached_width_after_history_rollover();
         test_layout_serialization_skips_stale_cached_absolute_width_after_parent_resize();
@@ -7678,17 +7915,23 @@ int main()
         test_perf_trace_records_document_and_initial_script_resources();
         test_computed_style_property_uses_layout_mutation_version_cache();
         test_element_geometry_reuses_cached_layout();
-        test_element_geometry_bounded_mode_rejects_cached_geometry_after_sizing_change();
-        test_element_geometry_bounded_mode_invalidates_cached_descendant_after_ancestor_mutation();
-        test_element_geometry_bounded_mode_adjusts_cached_position_style();
-        test_element_geometry_bounded_mode_rejects_relative_position_cache();
-        test_element_geometry_bounded_mode_snapshots_sibling_geometry_after_expensive_layout();
+        test_element_geometry_bounded_mode_reuses_last_known_after_own_sizing_change();
+        test_element_geometry_bounded_mode_reuses_descendant_as_approximate_after_ancestor_mutation();
+        test_element_geometry_bounded_mode_does_not_analytically_patch_own_position_change();
+        test_element_geometry_bounded_mode_reuses_last_known_after_own_relative_position_change();
+        test_element_geometry_bounded_mode_reuses_snapshot_for_unmutated_sibling();
+        test_element_geometry_expensive_document_seeds_snapshot_before_bounded();
         test_element_geometry_bounded_mode_caps_uncached_exact_layouts();
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();
         test_element_geometry_after_heavy_append_child_runs_first_exact_layout();
         test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
-        test_computed_style_property_preflights_first_append_child_on_heavy_document();
+        test_computed_style_property_after_append_runs_first_exact();
+        test_computed_style_property_reuses_digest_across_unrelated_mutation();
+        test_render_never_injects_cross_viewport_measured_width();
+        test_render_absolute_percent_correction_pins_native_width_not_narrower();
+        test_render_reflects_settled_dom_regardless_of_read_history();
+        test_computed_style_reacts_to_class_driven_width_change();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";

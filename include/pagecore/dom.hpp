@@ -26,12 +26,6 @@ public:
         std::string extra_style;
     };
 
-    struct LayoutMutationRecord {
-        std::uint64_t version = 0;
-        std::string reason;
-        NodeId node = kInvalidNodeId;
-    };
-
     DomDocument();
     ~DomDocument();
 
@@ -64,11 +58,38 @@ public:
     bool is_connected(NodeId id) const;
     std::uint64_t mutation_version() const;
     std::uint64_t layout_mutation_version() const;
-    std::string last_layout_mutation_reason() const;
-    NodeId last_layout_mutation_node() const;
-    std::vector<LayoutMutationRecord> layout_mutations_since(std::uint64_t version) const;
-    std::uint64_t cached_width_self_blocking_layout_mutation_version(NodeId id) const;
-    std::uint64_t cached_width_ancestor_blocking_layout_mutation_version(NodeId id) const;
+
+    // Monotonic counter bumped whenever a mutation changes the set of CSS rules
+    // the cascade sees (a <style>/<link>/<base> subtree change). Folded into
+    // layout_input_digest() so any stylesheet change invalidates every cached
+    // computed style. Conservative over-bumping is acceptable (perf only).
+    std::uint64_t stylesheet_generation() const;
+
+    // A cheap, allocation-free rolling hash (FNV-1a) over a conservative SUPERSET
+    // of every DOM-derived input to node `id`'s CSS cascade, computed directly
+    // from Lexbor without any serialize/parse/cascade. For `id` and each ancestor
+    // it folds tag/id/class/inline-style and layout-relevant presentational and
+    // selector-referenced attributes; at every level the full ordered sibling
+    // context (each sibling's tag/id/class/selector attributes and this level's
+    // index/count) plus child-presence; the global stylesheet_generation(); and
+    // the viewport. Property: identical digest => identical cascade result for
+    // `id` => identical computed style. A digest *collision* would be a
+    // correctness bug and is avoided by folding a superset with length-prefixed
+    // fields; a digest *miss* only costs one extra exact rebuild.
+    std::uint64_t layout_input_digest(
+        NodeId id,
+        int viewport_width,
+        int viewport_height,
+        float device_scale_factor) const;
+
+    // Per-node layout dirty epochs, keyed by layout_mutation_version. `self`
+    // records the version of the most recent mutation to the node itself;
+    // `subtree` records the most recent mutation anywhere in the node's subtree
+    // (including the node itself). Used as an approximate, image-isolated gate
+    // for cross-version geometry read-back (never for the final render).
+    std::uint64_t self_dirty_layout_version(NodeId id) const;
+    std::uint64_t subtree_dirty_layout_version(NodeId id) const;
+
     void set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard = false);
     // Monotonic counter bumped only when a node id is invalidated (forgotten via
     // innerHTML replacement) or the document is reparsed. Wrapper layers use it
