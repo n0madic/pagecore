@@ -16,7 +16,7 @@
     deps: ['core', 'events', 'dom', 'web', 'forms', 'streams', 'compat'],
     install(ctx, api) {
       const { global, host, bridge } = ctx;
-      const { defineValue, setDocumentReadyState, activityBegin, activityEnd } = api.core;
+      const { defineValue, setDocumentReadyState, activityBegin, activityEnd, formatErrorForLog } = api.core;
       const {
         DOMException,
         Window,
@@ -440,15 +440,7 @@
         };
 
         function consoleArgument(value) {
-          if (value && typeof value === 'object') {
-            try {
-              if (typeof value.stack === 'string' && value.stack) return value.stack;
-              if (typeof value.name === 'string' && typeof value.message === 'string') return `${value.name}: ${value.message}`;
-            } catch (_error) {
-              return value;
-            }
-          }
-          return value;
+          return formatErrorForLog(value);
         }
 
         global.console = {
@@ -469,6 +461,39 @@
         global.requestIdleCallback = requestIdleCallbackShim;
         global.cancelIdleCallback = clearTask;
         global.getComputedStyle = (element) => computedStyleFor(element);
+
+        // Many libraries (jQuery/Sizzle, Modernizr) feature-detect a "real" browser
+        // by stringifying selector/matching methods and testing for "[native code]"
+        // (Sizzle: support.qsa = /^[^{]+\{\s*\[native \w/.test(qsa)). Our page-facing
+        // DOM methods are plain ES class methods whose toString() returns JS source,
+        // so that probe fails and Sizzle disables its native qSA path, forcing every
+        // selector through its legacy engine (which throws on modern selectors).
+        // Give the probed methods a native-looking toString so feature detection
+        // routes selectors back through our querySelectorAll. Anti-spoof checks via
+        // Function.prototype.toString.call(fn) still see the truth — acceptable.
+        function markNative(fn, name) {
+          if (typeof fn !== 'function') return;
+          const rendered = `function ${name || fn.name || ''}() {\n    [native code]\n}`;
+          try { defineValue(fn, 'toString', function toString() { return rendered; }); } catch (_error) {}
+        }
+        function markNativeMethods(proto, names) {
+          if (!proto) return;
+          for (const name of names) if (typeof proto[name] === 'function') markNative(proto[name], name);
+        }
+
+        markNativeMethods(Element.prototype, ['querySelector', 'querySelectorAll', 'matches', 'closest', 'getElementsByTagName', 'getElementsByClassName']);
+        markNativeMethods(Document.prototype, ['querySelector', 'querySelectorAll', 'getElementById', 'getElementsByTagName', 'getElementsByClassName', 'getElementsByName']);
+        markNativeMethods(Node.prototype, ['contains']);
+        markNativeMethods(EventTarget.prototype, ['addEventListener', 'removeEventListener']);
+        markNative(global.getComputedStyle, 'getComputedStyle');
+
+        // Vendor matches aliases many libs feature-detect (same fn object → already native).
+        if (typeof Element.prototype.matches === 'function') {
+          for (const alias of ['webkitMatchesSelector', 'msMatchesSelector', 'mozMatchesSelector']) {
+            if (!Element.prototype[alias]) defineValue(Element.prototype, alias, Element.prototype.matches);
+          }
+        }
+
         global.matchMedia = makeMediaQueryList;
         global.performance = {
           now: performanceNow,

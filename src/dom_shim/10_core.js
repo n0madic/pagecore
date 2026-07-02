@@ -217,6 +217,18 @@
         return absoluteURL(referrer);
       }
 
+      function formatErrorForLog(value) {
+        if (!value || typeof value !== 'object') return value;
+        try {
+          const stack = typeof value.stack === 'string' && value.stack ? value.stack : '';
+          const header = (typeof value.name === 'string' && typeof value.message === 'string')
+            ? `${value.name}: ${value.message}` : '';
+          if (stack) return header && stack.indexOf(header) !== 0 ? `${header}\n${stack}` : stack;
+          if (header) return header;
+        } catch (_error) {}
+        return value;
+      }
+
       function loadHostResource(url, kind = 'other', init = {}) {
         if (!ctx.host || typeof ctx.host.loadResource !== 'function') {
           throw new Error('resource loading is not available');
@@ -250,6 +262,7 @@
         activityEnd,
         activityMarkMutation,
         absoluteURL,
+        formatErrorForLog,
         loadHostResource
       };
     }

@@ -5251,6 +5251,83 @@ void test_eval_api()
     require(result == "x", "Page::eval should return stringified JS values");
 }
 
+void test_dom_methods_report_as_native()
+{
+    pagecore::Page page;
+    page.load_html("<html><body><div id='a'></div></body></html>");
+    const auto native_probe = page.eval(R"JS((() => {
+      const rnative = /^[^{]+\{\s*\[native \w/;
+      return JSON.stringify([
+        rnative.test(document.querySelectorAll),
+        rnative.test(Element.prototype.matches),
+        rnative.test(document.getElementsByTagName),
+        rnative.test(getComputedStyle)
+      ]);
+    })())JS");
+    require(native_probe == "[true,true,true,true]",
+            "selector/matching/getComputedStyle methods must stringify as native for jQuery/Sizzle feature detection");
+
+    const auto qsa_source = page.eval("document.querySelectorAll.toString()");
+    require(qsa_source.find("[native code]") != std::string::npos,
+            "querySelectorAll.toString() should contain [native code]");
+}
+
+void test_scope_selector_support()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(<html><body>
+      <div id="root">
+        <div id="a"></div>
+        <div id="b"></div>
+        <span><div id="c"></div></span>
+      </div>
+    </body></html>)HTML");
+
+    const auto direct_children = page.eval(R"JS((() => {
+      const root = document.getElementById('root');
+      return JSON.stringify([...root.querySelectorAll(':scope > div')].map((e) => e.id));
+    })())JS");
+    require(direct_children == R"(["a","b"])",
+            ":scope > div should match only the query root's direct div children");
+
+    const auto self = page.eval(R"JS((() => {
+      const root = document.getElementById('root');
+      return JSON.stringify([...root.querySelectorAll(':scope')].map((e) => e.id));
+    })())JS");
+    require(self == R"(["root"])", ":scope should match the query root itself");
+
+    const auto descendants = page.eval(R"JS((() => {
+      const root = document.getElementById('root');
+      return JSON.stringify([...root.querySelectorAll(':scope div')].map((e) => e.id).sort());
+    })())JS");
+    require(descendants == R"(["a","b","c"])",
+            ":scope div should match every descendant div of the query root");
+
+    const auto matches_scope = page.eval("document.getElementById('root').matches(':scope')");
+    require(matches_scope == "true", "element.matches(':scope') should be true");
+}
+
+void test_console_error_includes_error_header()
+{
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(<html><body>
+      <script>console.error(new Error('boom'));</script>
+    </body></html>)HTML");
+
+    require(console_logs.size() == 1, "console.error should be routed to the log callback once");
+    require(console_logs[0].first == "error", "console.error severity should be error");
+    require(console_logs[0].second.rfind("Error: boom", 0) == 0,
+            "console.error(Error) should start with the 'Name: message' header");
+    require(console_logs[0].second.find("    at") != std::string::npos,
+            "console.error(Error) should still include the stack frames");
+}
+
 void test_event_capture_bubble_phases()
 {
     pagecore::Page page;
@@ -8461,6 +8538,9 @@ int main()
         test_described_traversal_wraps_children_correctly();
         test_child_node_list_cache_reflects_mutations();
         test_eval_api();
+        test_dom_methods_report_as_native();
+        test_scope_selector_support();
+        test_console_error_includes_error_header();
         test_event_capture_bubble_phases();
         test_mutation_observer_old_value();
         test_js_runtime_robust_exception_paths();

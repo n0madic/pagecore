@@ -16,7 +16,7 @@
     deps: ['core', 'events', 'dom'],
     install(ctx, api) {
       const { global, host } = ctx;
-      const { defineValue, assertNode, absoluteURL, activityBegin, activityEnd } = api.core;
+      const { defineValue, assertNode, absoluteURL, activityBegin, activityEnd, formatErrorForLog } = api.core;
       const {
         DOMException,
         EventTarget,
@@ -986,7 +986,7 @@
             if (global.console && typeof global.console.error === 'function') {
               global.console.error(error);
             } else if (host && typeof host.log === 'function') {
-              host.log('error', error && error.stack ? error.stack : String(error));
+              host.log('error', formatErrorForLog(error));
             }
           } catch (_reportError) {
           }

@@ -376,6 +376,20 @@ test('core loadHostResource reports unavailable host loader', () => {
     /resource loading is not available/);
 });
 
+test('core formatErrorForLog prepends error header before stack', () => {
+  const { core } = installCore();
+  const error = new Error('boom');
+  const formatted = core.formatErrorForLog(error);
+  assert.strictEqual(typeof formatted, 'string');
+  assert.ok(formatted.startsWith('Error: boom\n'), `expected header prefix, got: ${formatted}`);
+  assert.ok(formatted.includes(error.stack), 'formatted value should retain the original stack');
+
+  assert.strictEqual(core.formatErrorForLog('plain'), 'plain');
+  assert.strictEqual(core.formatErrorForLog(42), 42);
+  const plainObject = { a: 1 };
+  assert.strictEqual(core.formatErrorForLog(plainObject), plainObject);
+});
+
 test('events dispatches EventTarget listeners and honors once option', () => {
   const { events } = installEvents();
   const target = new events.EventTarget();

@@ -30,6 +30,7 @@
         toArray,
         activityBegin,
         activityEnd,
+        formatErrorForLog,
         loadHostResource
       } = api.core;
       const {
@@ -128,8 +129,10 @@
       }
 
       function scriptErrorMessage(error) {
-        if (error && typeof error.stack === 'string' && error.stack) return error.stack;
-        if (error && typeof error.message === 'string' && error.message) return error.message;
+        if (error && typeof error === 'object') {
+          const formatted = formatErrorForLog(error);
+          if (typeof formatted === 'string' && formatted) return formatted;
+        }
         try {
           return String(error);
         } catch (_stringifyError) {
@@ -2107,13 +2110,21 @@
           return true;
         }
 
-        function selectorMatchesElementFast(element, selectorOrTokens) {
+        function selectorMatchesElementFast(element, selectorOrTokens, scope) {
           const tokens = Array.isArray(selectorOrTokens) ? selectorOrTokens : selectorTokens(selectorOrTokens);
           if (tokens.length === 0) return false;
 
+          // When a scope element is supplied, the `:scope` pseudo-class matches
+          // only the query root (the element qSA was invoked on). Without a scope
+          // it stays unmatched, preserving prior behavior for plain matching.
+          const compoundMatches = (candidate, compound) =>
+            (scope && compound === ':scope')
+              ? !!candidate && candidate.__id === scope.__id
+              : matchesCompoundSelector(candidate, compound);
+
           function matchFrom(index, candidate) {
             if (!(candidate instanceof Element)) return false;
-            if (!matchesCompoundSelector(candidate, tokens[index].selector)) return false;
+            if (!compoundMatches(candidate, tokens[index].selector)) return false;
             if (index === 0) return true;
 
             const relation = tokens[index].combinator;
@@ -2421,8 +2432,38 @@
           return out;
         }
 
+        // Lexbor rejects `:scope` at parse time, so we resolve scoped selectors in
+        // JS: brute-force every descendant of the query root (plus the root itself)
+        // and match each against the selector list with `:scope` bound to the root.
+        // Covers descendant/child combinators (`:scope`, `:scope > x`, `:scope x`);
+        // sibling combinators and stateful pseudo-classes inside a `:scope` selector
+        // are not supported (rare for qSA) and simply won't match.
+        function querySelectorAllScoped(root, selector) {
+          const scope = root.nodeType === 1 ? root : (root.documentElement || root);
+          if (!(scope instanceof Element)) return [];
+          const parts = splitSelectorList(String(selector));
+          const universe = [scope];
+          try {
+            for (const node of toArray(bridge.querySelectorAll(scope._liveId(), '*'))) universe.push(node);
+          } catch (_error) {}
+          const seen = new Set();
+          const out = [];
+          for (const candidate of universe) {
+            if (!(candidate instanceof Element) || seen.has(candidate.__id)) continue;
+            for (const part of parts) {
+              if (selectorMatchesElementFast(candidate, selectorTokens(part), scope)) {
+                seen.add(candidate.__id);
+                out.push(candidate);
+                break;
+              }
+            }
+          }
+          return out;
+        }
+
         function querySelectorAllCompat(root, selector) {
           const text = String(selector);
+          if (/:scope\b/i.test(text)) return querySelectorAllScoped(root, text);
           try {
             return toArray(bridge.querySelectorAll(root._liveId(), text));
           } catch (error) {
@@ -2435,6 +2476,7 @@
 
         function querySelectorCompat(root, selector) {
           const text = String(selector);
+          if (/:scope\b/i.test(text)) return querySelectorAllScoped(root, text)[0] || null;
           try {
             return wrapNode(bridge.querySelector(root._liveId(), text));
           } catch (error) {
@@ -2585,7 +2627,7 @@
               return splitSelectorList(text).some((part) => {
                 const tokens = selectorTokens(part);
                 if (!selectorFilterMayMatch(this, selectorRightmostFilter(tokens))) return false;
-                return selectorMatchesElementFast(this, tokens);
+                return selectorMatchesElementFast(this, tokens, this);
               });
             } catch (_error) {
               const parent = this.parentNode || document;
