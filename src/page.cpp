@@ -2192,23 +2192,46 @@ struct Page::Impl {
         return second_pass.display_list();
     }
 
+    // Shared cache-state prologue for the computed-style read APIs
+    // (computed_style / computed_style_property), which apply an identical
+    // cache-key and soundness rule. Keeping it in one place stops the two paths
+    // from silently drifting apart. element_geometry deliberately does NOT use
+    // this: it keys on layout validity (has_current_layout), not styled-document
+    // validity, so its hit predicate is genuinely different.
+    struct StyleCacheState {
+        StyledDocumentCacheKey key;
+        StyledDocumentCacheKey full_key;
+        bool full_cache_hit = false;
+        bool stylesheets_cache_hit = false;
+        std::string cache_reason;
+
+        bool cache_hit() const { return cache_reason == "valid"; }
+    };
+
+    StyleCacheState styled_document_style_cache_state() const
+    {
+        StyleCacheState state;
+        state.key = styled_document_cache_key(
+            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::StylesheetsOnly);
+        state.full_key = styled_document_cache_key(
+            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::Full);
+        state.full_cache_hit = styled_document_valid && styled_document_key == state.full_key;
+        state.stylesheets_cache_hit = styled_document_valid && styled_document_key == state.key;
+        state.cache_reason = (state.full_cache_hit || state.stylesheets_cache_hit)
+            ? "valid"
+            : styled_document_cache_reason(state.key);
+        return state;
+    }
+
     std::optional<ComputedStyle> computed_style(NodeId node)
     {
-        const StyledDocumentCacheKey key = styled_document_cache_key(
-            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::StylesheetsOnly);
-        const StyledDocumentCacheKey full_key = styled_document_cache_key(
-            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::Full);
-        const bool full_cache_hit = styled_document_valid && styled_document_key == full_key;
-        const bool stylesheets_cache_hit = styled_document_valid && styled_document_key == key;
-        const std::string cache_reason = (full_cache_hit || stylesheets_cache_hit)
-            ? "valid"
-            : styled_document_cache_reason(key);
+        const StyleCacheState cache = styled_document_style_cache_state();
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style", 1);
         trace.event().node_id = node;
         trace.event().mutation_version = document.mutation_version();
         trace.event().layout_mutation_version = document.layout_mutation_version();
-        trace.event().styled_document_cache_hit = cache_reason == "valid";
-        trace.event().styled_document_cache_reason = cache_reason;
+        trace.event().styled_document_cache_hit = cache.cache_hit();
+        trace.event().styled_document_cache_reason = cache.cache_reason;
 
         if (!document.is_connected(node)) {
             computed_style_cache.erase(node);
@@ -2216,8 +2239,8 @@ struct Page::Impl {
         }
 
         // Current-version styled document is valid -> exact cascade.
-        if (full_cache_hit || stylesheets_cache_hit) {
-            auto& engine = full_cache_hit
+        if (cache.full_cache_hit || cache.stylesheets_cache_hit) {
+            auto& engine = cache.full_cache_hit
                 ? *styled_document
                 : ensure_styled_document(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
             engine.compute_styles_only();
@@ -2232,7 +2255,7 @@ struct Page::Impl {
         if (const auto found = computed_style_cache.find(node);
             found != computed_style_cache.end() && found->second.digest == digest && found->second.full) {
             trace.event().styled_document_cache_hit = true;
-            trace.event().styled_document_cache_reason = "digest_reuse:" + cache_reason;
+            trace.event().styled_document_cache_reason = "digest_reuse:" + cache.cache_reason;
             trace.set_count(found->second.full->properties.size());
             return found->second.full;
         }
@@ -2248,22 +2271,14 @@ struct Page::Impl {
 
     std::optional<std::string> computed_style_property(NodeId node, std::string_view property)
     {
-        const StyledDocumentCacheKey key = styled_document_cache_key(
-            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::StylesheetsOnly);
-        const StyledDocumentCacheKey full_key = styled_document_cache_key(
-            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::Full);
-        const bool full_cache_hit = styled_document_valid && styled_document_key == full_key;
-        const bool stylesheets_cache_hit = styled_document_valid && styled_document_key == key;
-        const std::string cache_reason = (full_cache_hit || stylesheets_cache_hit)
-            ? "valid"
-            : styled_document_cache_reason(key);
-        const bool cache_hit = cache_reason == "valid";
+        const StyleCacheState cache = styled_document_style_cache_state();
+        const bool cache_hit = cache.cache_hit();
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::ComputedStyle, "computed_style_property", 1);
         trace.event().node_id = node;
         trace.event().mutation_version = document.mutation_version();
         trace.event().layout_mutation_version = document.layout_mutation_version();
         trace.event().styled_document_cache_hit = cache_hit;
-        trace.event().styled_document_cache_reason = cache_reason;
+        trace.event().styled_document_cache_reason = cache.cache_reason;
         trace.event().property = std::string(property);
 
         if (!document.is_connected(node)) {
@@ -2273,7 +2288,7 @@ struct Page::Impl {
 
         // Current-version styled document is valid -> exact cascade.
         if (cache_hit) {
-            auto& engine = full_cache_hit
+            auto& engine = cache.full_cache_hit
                 ? *styled_document
                 : ensure_styled_document(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
             engine.compute_styles_only();
@@ -2289,7 +2304,7 @@ struct Page::Impl {
         std::optional<std::string> reused;
         if (try_reuse_computed_style_property(node, digest, property, reused)) {
             trace.event().styled_document_cache_hit = true;
-            trace.event().styled_document_cache_reason = "digest_reuse:" + cache_reason;
+            trace.event().styled_document_cache_reason = "digest_reuse:" + cache.cache_reason;
             trace.set_count(reused ? 1 : 0);
             return reused;
         }
@@ -2310,7 +2325,7 @@ struct Page::Impl {
 
         // Deadline backstop -> approximate (inline / last-known / CSS defaults).
         computed_style_property_bounded_mode = true;
-        trace.event().styled_document_cache_reason = "bounded_mode:" + cache_reason;
+        trace.event().styled_document_cache_reason = "bounded_mode:" + cache.cache_reason;
         auto value = bounded_computed_style_property(node, property);
         trace.set_count(value && !value->empty() ? 1 : 0);
         return value;
