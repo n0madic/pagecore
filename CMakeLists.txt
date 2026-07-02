@@ -453,13 +453,17 @@ add_library(pagecore
     "${PAGECORE_DOM_SHIM_HEADER}"
     src/base64_codec.cpp
     src/cookie_jar.cpp
+    src/css_scan.cpp
     src/display_list_dump.cpp
     src/dom_document.cpp
     src/image_io.cpp
     src/js_runtime.cpp
     src/page.cpp
     src/page_activity_tracker.cpp
+    src/render_resource_loaders.cpp
     src/resource_loader.cpp
+    src/script_type.cpp
+    src/subresource_scanner.cpp
 )
 add_dependencies(pagecore pagecore_dom_shim)
 add_library(PageCore::pagecore ALIAS pagecore)

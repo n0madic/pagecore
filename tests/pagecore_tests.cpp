@@ -1,5 +1,7 @@
 #include "base64_codec.hpp"
+#include "css_scan.hpp"
 #include "page_activity_tracker.hpp"
+#include "script_type.hpp"
 
 #include "pagecore/image_io.hpp"
 #include "pagecore/image_decoder.hpp"
@@ -2646,6 +2648,234 @@ void test_base64_codec_roundtrip_and_edge_cases()
             "forgiving re-pads a missing '=='");
     require(rejects("Zm9vY", Base64DecodeMode::Forgiving), "forgiving still rejects length %% 4 == 1");
     require(rejects("****", Base64DecodeMode::Forgiving), "forgiving still rejects non-alphabet input");
+}
+
+void test_script_type_classification()
+{
+    using pagecore::is_javascript_script_type;
+    using pagecore::is_module_script_type;
+
+    // A missing or empty type attribute is a classic JavaScript script.
+    require(is_javascript_script_type(std::nullopt), "missing type is JavaScript");
+    require(is_javascript_script_type(std::optional<std::string>("")), "empty type is JavaScript");
+    require(is_javascript_script_type(std::optional<std::string>("   ")), "whitespace-only type is JavaScript");
+
+    // Every whitelisted MIME type counts as JavaScript, case-insensitively.
+    for (const char* type : {"text/javascript", "application/javascript", "application/ecmascript",
+                             "text/ecmascript", "application/x-javascript", "text/jscript"}) {
+        require(is_javascript_script_type(std::optional<std::string>(type)),
+                std::string("standard type is JavaScript: ") + type);
+    }
+    require(is_javascript_script_type(std::optional<std::string>("TEXT/JavaScript")),
+            "type matching is case-insensitive");
+
+    // Parameters after ';' (e.g. a charset) are stripped before matching, and
+    // surrounding whitespace is trimmed first.
+    require(is_javascript_script_type(std::optional<std::string>("text/javascript;charset=utf-8")),
+            "charset parameter is ignored");
+    require(is_javascript_script_type(std::optional<std::string>("  text/javascript;charset=utf-8  ")),
+            "outer whitespace and charset are ignored");
+    // Only the leading/trailing whitespace of the whole value is trimmed; a space
+    // left in front of the ';' is not, so this does not match the whitelist.
+    require(!is_javascript_script_type(std::optional<std::string>("text/javascript ; charset=utf-8")),
+            "whitespace before ';' is not trimmed away");
+
+    // Modules are JavaScript, and are the only type reported as a module.
+    require(is_javascript_script_type(std::optional<std::string>("module")), "module is JavaScript");
+    require(is_module_script_type(std::optional<std::string>("module")), "module type is a module");
+    require(is_module_script_type(std::optional<std::string>("  MODULE  ")),
+            "module detection trims and lowercases");
+    require(!is_module_script_type(std::nullopt), "missing type is not a module");
+    require(!is_module_script_type(std::optional<std::string>("text/javascript")),
+            "classic JavaScript is not a module");
+
+    // Unknown/non-JavaScript types are neither executable classic scripts nor modules.
+    require(!is_javascript_script_type(std::optional<std::string>("text/plain")),
+            "text/plain is not JavaScript");
+    require(!is_javascript_script_type(std::optional<std::string>("application/json")),
+            "application/json is not JavaScript");
+    require(!is_module_script_type(std::optional<std::string>("text/plain")),
+            "text/plain is not a module");
+}
+
+void test_css_scan_url_target()
+{
+    using pagecore::parse_css_url_target;
+
+    // The primitive is called with `pos` just after the '(' and returns the
+    // unescaped target, advancing `pos` past the closing ')'.
+    auto parse = [](std::string_view after_paren) {
+        std::size_t pos = 0;
+        std::string target = parse_css_url_target(after_paren, pos);
+        return std::pair<std::string, std::size_t>{target, pos};
+    };
+
+    // Unquoted target, consumed up to and past ')'.
+    {
+        auto [target, pos] = parse("foo.png)");
+        require(target == "foo.png", "unquoted target");
+        require(pos == 8, "pos advances past ')'");
+    }
+    // Quoted targets (both quote styles) preserve inner spaces.
+    require(parse("\"a b.png\")").first == "a b.png", "double-quoted target keeps spaces");
+    require(parse("'c.png')").first == "c.png", "single-quoted target");
+    // Leading and trailing whitespace around an unquoted target is stripped.
+    require(parse("   d.png  )").first == "d.png", "unquoted target is trimmed");
+    // Backslash escapes are unescaped inside quoted targets.
+    require(parse("\"a\\)b\\\"c\")").first == "a)b\"c", "quoted escapes are unescaped");
+    // Empty targets (bare and quoted) return an empty string but still advance pos.
+    {
+        auto [target, pos] = parse(")");
+        require(target.empty(), "bare empty target");
+        require(pos == 1, "pos advances past ')' even for empty target");
+    }
+    require(parse("\"\")").first.empty(), "quoted empty target");
+}
+
+void test_css_scan_extract_urls()
+{
+    using pagecore::extract_css_urls;
+    using pagecore::CssUrlRef;
+    using pagecore::ResourceKind;
+
+    // Plain property url() targets are extracted as images.
+    {
+        const auto urls = extract_css_urls("div { background: url(img.png); }");
+        require(urls.size() == 1, "one url extracted");
+        require(urls[0].url == "img.png", "image url target");
+        require(urls[0].kind == ResourceKind::Image, "background url is an image");
+    }
+
+    // @import url() targets are classified as stylesheets.
+    {
+        const auto urls = extract_css_urls("@import url(\"theme.css\");");
+        require(urls.size() == 1, "one @import url");
+        require(urls[0].url == "theme.css", "@import target");
+        require(urls[0].kind == ResourceKind::Stylesheet, "@import url is a stylesheet");
+    }
+
+    // src: declarations (web fonts) are skipped by the image prefetch scanner.
+    {
+        const auto urls = extract_css_urls("@font-face { src: url(font.woff2); }");
+        require(urls.empty(), "src: url is skipped");
+    }
+
+    // A url() inside a comment is ignored; only the live declaration is kept.
+    {
+        const auto urls = extract_css_urls("/* url(ignored.png) */ a { background: url(real.png); }");
+        require(urls.size() == 1, "commented url ignored");
+        require(urls[0].url == "real.png", "live url kept");
+    }
+
+    // Quoted targets honour backslash escapes.
+    {
+        const auto urls = extract_css_urls("a { background: url(\"a\\)b.png\"); }");
+        require(urls.size() == 1, "one escaped url");
+        require(urls[0].url == "a)b.png", "backslash escape unescaped in quoted target");
+    }
+
+    // Protocol-relative targets are extracted verbatim (resolution is the caller's job).
+    {
+        const auto urls = extract_css_urls("a { background: url(//cdn.test/a.png); }");
+        require(urls.size() == 1, "one protocol-relative url");
+        require(urls[0].url == "//cdn.test/a.png", "protocol-relative target kept raw");
+    }
+
+    // Multi-value declarations yield every target in order.
+    {
+        const auto urls = extract_css_urls("a { background: url(a.png), url(b.png); }");
+        require(urls.size() == 2, "two urls in a multi-value declaration");
+        require(urls[0].url == "a.png" && urls[1].url == "b.png", "urls kept in order");
+    }
+
+    // `url` as part of an identifier (e.g. a custom property) is not a function call.
+    {
+        const auto urls = extract_css_urls("a { --myurl: 1; }");
+        require(urls.empty(), "identifier ending in 'url' is not a url() token");
+    }
+}
+
+void test_css_scan_parse_percentage()
+{
+    using pagecore::parse_css_percentage;
+
+    require(parse_css_percentage("50%") == 50.0f, "plain percentage");
+    require(parse_css_percentage("  33.5%  ") == 33.5f, "surrounding whitespace trimmed");
+    require(parse_css_percentage("50% !important") == 50.0f, "!important stripped");
+    require(!parse_css_percentage("50px").has_value(), "px is not a percentage");
+    require(!parse_css_percentage("100").has_value(), "missing unit is not a percentage");
+    require(!parse_css_percentage("").has_value(), "empty value has no percentage");
+    require(!parse_css_percentage("auto").has_value(), "keyword is not a percentage");
+}
+
+void test_css_scan_attribute_selectors()
+{
+    using pagecore::collect_css_attribute_selectors;
+    using pagecore::css_attribute_selector_names;
+    using pagecore::CssAttributeSelectorUsage;
+
+    auto names_of = [](std::string_view css) {
+        CssAttributeSelectorUsage usage;
+        collect_css_attribute_selectors(css, usage);
+        auto names = css_attribute_selector_names(usage);
+        std::sort(names.begin(), names.end());
+        return std::pair<std::vector<std::string>, bool>{names, usage.wildcard};
+    };
+
+    {
+        auto [names, wildcard] = names_of("a[data-x=\"y\"] b[data-z] { color: red; }");
+        require(!wildcard, "concrete selectors do not set wildcard");
+        require(names == (std::vector<std::string>{"data-x", "data-z"}), "collects both attribute names");
+    }
+    {
+        auto [names, wildcard] = names_of("[DATA-Foo] {}");
+        require(!wildcard, "single named selector is not wildcard");
+        require(names == (std::vector<std::string>{"data-foo"}), "attribute name is lowercased");
+    }
+    {
+        auto [names, wildcard] = names_of("[svg|href] {}");
+        require(!wildcard, "namespaced selector is not wildcard");
+        require(names == (std::vector<std::string>{"href"}), "namespace prefix stripped to local name");
+    }
+    {
+        auto [names, wildcard] = names_of("[  ] {}");
+        require(wildcard, "empty attribute selector forces wildcard");
+    }
+    {
+        auto [names, wildcard] = names_of("a[foo");
+        require(wildcard, "unterminated attribute selector forces wildcard");
+    }
+    {
+        auto [names, wildcard] = names_of("[foo\\=bar] {}");
+        require(wildcard, "escaped attribute name forces wildcard");
+    }
+}
+
+void test_css_scan_default_computed_style()
+{
+    using pagecore::default_computed_style_property_value;
+
+    auto display = [](std::string_view tag) {
+        return default_computed_style_property_value("display", tag).value_or("<none>");
+    };
+    require(display("div") == "block", "div defaults to block");
+    require(display("span") == "inline", "span defaults to inline");
+    require(display("li") == "list-item", "li defaults to list-item");
+    require(display("table") == "table", "table default display");
+    require(display("td") == "table-cell", "td default display");
+    require(display("input") == "inline-block", "form control defaults to inline-block");
+    require(display("script") == "none", "script defaults to display:none");
+    require(display("UNKNOWNTAG") == "inline", "unknown tag defaults to inline");
+
+    // Non-display properties with simple tag-independent defaults.
+    require(default_computed_style_property_value("position", "div") == "static", "position default");
+    require(default_computed_style_property_value("margin-left", "div") == "0px", "margin default");
+    require(default_computed_style_property_value("width", "div") == "auto", "width default");
+    require(default_computed_style_property_value("max-width", "div") == "none", "max-width default");
+    // Property matching is case-insensitive.
+    require(default_computed_style_property_value("DISPLAY", "DIV") == "block", "case-insensitive property/tag");
+    // Properties without a simple default return nullopt.
+    require(!default_computed_style_property_value("color", "div").has_value(), "color has no simple default");
 }
 
 void test_page_activity_tracker_counters_and_stability()
@@ -8455,6 +8685,12 @@ int main()
         test_fetch_xhr_credentials_control_cookie_injection();
         test_cookie_attributes_path_domain_expires_secure_samesite();
         test_base64_codec_roundtrip_and_edge_cases();
+        test_script_type_classification();
+        test_css_scan_url_target();
+        test_css_scan_extract_urls();
+        test_css_scan_parse_percentage();
+        test_css_scan_attribute_selectors();
+        test_css_scan_default_computed_style();
         test_page_activity_tracker_counters_and_stability();
         test_cookie_public_suffix_and_injection_rejected();
         test_cookie_secure_not_overwritten_by_insecure();

@@ -1,5 +1,7 @@
 #include "web_fonts.hpp"
 
+#include "css_scan.hpp"
+
 #include <fontconfig/fontconfig.h>
 #include <fontconfig/fcfreetype.h>
 #include <pango/pangocairo.h>
@@ -223,36 +225,7 @@ std::vector<std::string> parse_src_urls(std::string_view value)
                 continue;
             }
             ++j;
-            while (j < value.size() && std::isspace(static_cast<unsigned char>(value[j]))) {
-                ++j;
-            }
-
-            std::string target;
-            if (j < value.size() && (value[j] == '"' || value[j] == '\'')) {
-                const char quote = value[j++];
-                while (j < value.size() && value[j] != quote) {
-                    if (value[j] == '\\' && j + 1 < value.size()) {
-                        target.push_back(value[j + 1]);
-                        j += 2;
-                    } else {
-                        target.push_back(value[j++]);
-                    }
-                }
-                if (j < value.size()) {
-                    ++j;
-                }
-                while (j < value.size() && value[j] != ')') {
-                    ++j;
-                }
-            } else {
-                while (j < value.size() && value[j] != ')') {
-                    target.push_back(value[j++]);
-                }
-                target = trim(target);
-            }
-            if (j < value.size()) {
-                ++j;
-            }
+            std::string target = parse_css_url_target(value, j);
             if (!target.empty()) {
                 out.push_back(std::move(target));
             }
