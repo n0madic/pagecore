@@ -444,6 +444,10 @@ if(PAGECORE_ENABLE_RENDERING)
         litehtml
         GIT_REPOSITORY https://github.com/litehtml/litehtml.git
         GIT_TAG 932439c91afb04dbce30903673292e3bf2da01dc
+        PATCH_COMMAND ${CMAKE_COMMAND}
+            -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/0001-litehtml-external-tree-build.patch
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake
         ${PAGECORE_FETCHCONTENT_EXCLUDE_FROM_ALL}
     )
     pagecore_fetchcontent_make_available_excluded(litehtml)
