@@ -8955,6 +8955,222 @@ void test_layout_engine_load_dom_collects_absolute_percent_overrides()
     }
 }
 
+// Full-pipeline fixture for the layout-tree-input A/B comparison: external
+// stylesheet, image, inline <style>, noscript, and JS-driven DOM mutations.
+std::string page_display_list_json_for_layout_input(pagecore::LayoutTreeInput input, bool enable_js = true)
+{
+    pagecore::LoadOptions load_options;
+    load_options.layout_tree_input = input;
+    load_options.enable_js = enable_js;
+
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://example.test/app.css",
+                ".linked{width:140px;height:36px;background:rgb(20,120,220)}",
+                "text/css");
+    loader->add("https://example.test/img.png", png_body(pagecore::Color{200, 40, 40, 255}), "image/png");
+
+    pagecore::Page page(load_options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<!DOCTYPE html>
+<html><head>
+<link rel="stylesheet" href="app.css">
+<style>#anchor{color:rgb(10,20,30)}</style>
+</head><body>
+<div class="linked"></div>
+<img src="img.png" width="20" height="20">
+<p id="anchor">static text</p>
+<noscript><div style="width:44px;height:22px;background:rgb(240,20,30)">fallback</div></noscript>
+<script>
+  var extra = document.createElement('div');
+  extra.setAttribute('style', 'width:60px;height:12px;background:rgb(5,150,60)');
+  extra.textContent = 'created';
+  document.body.appendChild(extra);
+  document.getElementById('anchor').style.fontSize = '20px';
+</script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{640, 480, 1.0f};
+    return pagecore::display_list_to_json(page.display_list(options));
+}
+
+void test_page_direct_dom_layout_display_list_parity()
+{
+    const std::string serialized =
+        page_display_list_json_for_layout_input(pagecore::LayoutTreeInput::SerializedHtml);
+    const std::string direct =
+        page_display_list_json_for_layout_input(pagecore::LayoutTreeInput::DirectDom);
+
+    require(direct.find("created") != std::string::npos,
+            "JS-created content must render through the direct-DOM path");
+    require(direct.find("\"r\":240,\"g\":20,\"b\":30") == std::string::npos,
+            "noscript fallback must not render when JS is enabled");
+    require(serialized == direct,
+            "the direct-DOM page display list must match the serialized path byte-for-byte");
+}
+
+void test_page_direct_dom_noscript_and_enable_js()
+{
+    const std::string serialized =
+        page_display_list_json_for_layout_input(pagecore::LayoutTreeInput::SerializedHtml, /*enable_js=*/false);
+    const std::string direct =
+        page_display_list_json_for_layout_input(pagecore::LayoutTreeInput::DirectDom, /*enable_js=*/false);
+
+    require(direct.find("\"r\":240,\"g\":20,\"b\":30") != std::string::npos,
+            "noscript fallback must render through the direct-DOM path when JS is disabled");
+    require(direct.find("created") == std::string::npos,
+            "scripts must not run when JS is disabled");
+    require(serialized == direct,
+            "the JS-disabled direct-DOM display list must match the serialized path byte-for-byte");
+}
+
+void test_page_direct_dom_absolute_percent_second_pass()
+{
+    const char* html = R"HTML(
+<html><head><style>
+  body { margin:0; }
+  .wrap { position:relative; width:400px; height:100px; }
+  .cell { position:absolute; left:0; top:0; width:50%; box-sizing:border-box; }
+  .card { width:100%; height:40px; background:#fff; }
+</style></head><body>
+  <div class="wrap"><div class="cell"><div class="card"></div></div></div>
+</body></html>
+)HTML";
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{800, 200, 1.0f};
+
+    pagecore::Page serialized_page;
+    serialized_page.load_html(html, "https://example.test/index.html");
+    const std::string serialized_json = pagecore::display_list_to_json(serialized_page.display_list(options));
+
+    pagecore::LoadOptions direct_options;
+    direct_options.layout_tree_input = pagecore::LayoutTreeInput::DirectDom;
+    pagecore::Page direct_page(direct_options);
+    direct_page.load_html(html, "https://example.test/index.html");
+
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::RenderOptions traced = options;
+    traced.perf_trace = [&](const pagecore::PerfEvent& event) { events.push_back(event); };
+    const std::string direct_json = pagecore::display_list_to_json(direct_page.display_list(traced));
+
+    require(serialized_json == direct_json,
+            "the corrected absolute-% display list must match across layout tree inputs");
+
+    const auto corrected_load_dom = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::LitehtmlLoadHtml
+            && e.name == "load_dom"
+            && e.property.find("absolute_percent_corrected:1") != std::string::npos;
+    });
+    require(corrected_load_dom, "the corrected second pass must load through load_dom");
+
+    const auto any_serialize = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::SerializeHtml || e.name == "load_html";
+    });
+    require(!any_serialize, "the direct-DOM path must never serialize the document for layout");
+}
+
+class EngineBuildCountingFactory final : public pagecore::LayoutEngineFactory {
+public:
+    explicit EngineBuildCountingFactory(std::shared_ptr<pagecore::LayoutEngineFactory> inner)
+        : builds(std::make_shared<int>(0))
+        , inner_(std::move(inner))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        ++(*builds);
+        return inner_->create_layout_engine();
+    }
+
+    std::shared_ptr<int> builds;
+
+private:
+    std::shared_ptr<pagecore::LayoutEngineFactory> inner_;
+};
+
+void test_page_direct_dom_memoization()
+{
+    auto counting = std::make_shared<EngineBuildCountingFactory>(pagecore::create_litehtml_layout_engine_factory());
+
+    pagecore::LoadOptions load_options;
+    load_options.layout_tree_input = pagecore::LayoutTreeInput::DirectDom;
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(counting);
+    page.load_html(
+        "<html><body><div id='x' style='width:50px;height:20px'>hi</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(*counting->builds == 1, "the first direct-DOM render must build one styled document");
+
+    (void) page.display_list(options);
+    require(*counting->builds == 1, "an unchanged page must reuse the memoized styled document");
+
+    options.viewport = pagecore::Viewport{640, 240, 1.0f};
+    (void) page.display_list(options);
+    require(*counting->builds == 2, "a viewport change must rebuild the styled document");
+
+    page.document().set_attribute(page.document().get_element_by_id("x"), "style", "width:70px;height:20px");
+    (void) page.display_list(options);
+    require(*counting->builds == 3, "a layout-affecting DOM mutation must rebuild the styled document");
+}
+
+void test_page_direct_dom_geometry_and_computed_style_equivalence()
+{
+    const char* html = R"HTML(
+<html><head><style>#probe{width:120px;height:44px;padding:6px;margin:10px;color:rgb(10,110,210)}</style></head>
+<body><div id="probe">probe</div>
+<script>
+  var probe = document.getElementById('probe');
+  probe.style.borderLeft = '3px solid rgb(0,0,0)';
+  probe.style.fontSize = '19px';
+</script>
+</body></html>
+)HTML";
+
+    pagecore::Page serialized_page;
+    serialized_page.load_html(html, "https://example.test/");
+
+    pagecore::LoadOptions direct_options;
+    direct_options.layout_tree_input = pagecore::LayoutTreeInput::DirectDom;
+    pagecore::Page direct_page(direct_options);
+    direct_page.load_html(html, "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{500, 300, 1.0f};
+    (void) serialized_page.display_list(options);
+    (void) direct_page.display_list(options);
+
+    const pagecore::NodeId serialized_probe = serialized_page.document().get_element_by_id("probe");
+    const pagecore::NodeId direct_probe = direct_page.document().get_element_by_id("probe");
+    require(serialized_probe != pagecore::kInvalidNodeId && direct_probe != pagecore::kInvalidNodeId,
+            "both pages must resolve #probe");
+
+    for (const char* property : {"width", "height", "font-size", "color", "padding-left", "display"}) {
+        const auto serialized_value = serialized_page.computed_style_property(serialized_probe, property);
+        const auto direct_value = direct_page.computed_style_property(direct_probe, property);
+        require(serialized_value == direct_value,
+                std::string("computed ") + property + " must match across layout tree inputs");
+    }
+
+    const auto serialized_geometry = serialized_page.element_geometry(serialized_probe);
+    const auto direct_geometry = direct_page.element_geometry(direct_probe);
+    require(serialized_geometry.has_value() && direct_geometry.has_value(),
+            "both pages must resolve #probe geometry");
+    require(serialized_geometry->border_box.width == direct_geometry->border_box.width
+                && serialized_geometry->border_box.height == direct_geometry->border_box.height
+                && serialized_geometry->border_box.x == direct_geometry->border_box.x
+                && serialized_geometry->border_box.y == direct_geometry->border_box.y,
+            "border boxes must match across layout tree inputs");
+}
+
 // Regression (Phase 3): the absolute-% correction is now collected by the engine
 // with typed getters, but must still trigger the corrective second layout pass and
 // produce a deterministic (byte-identical) display list.
@@ -9334,6 +9550,11 @@ int main()
         test_layout_engine_load_dom_quirks_class_matching();
         test_layout_engine_load_dom_computed_style_and_geometry();
         test_layout_engine_load_dom_collects_absolute_percent_overrides();
+        test_page_direct_dom_layout_display_list_parity();
+        test_page_direct_dom_noscript_and_enable_js();
+        test_page_direct_dom_absolute_percent_second_pass();
+        test_page_direct_dom_memoization();
+        test_page_direct_dom_geometry_and_computed_style_equivalence();
         test_render_absolute_percent_correction_runs_second_pass();
         test_render_without_absolute_elements_skips_second_pass();
         test_render_reflects_settled_dom_regardless_of_read_history();

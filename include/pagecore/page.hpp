@@ -32,8 +32,19 @@ struct PageReadinessOptions {
     std::chrono::milliseconds stable_window{350};
 };
 
+// Which input the layout engine receives when (re)building the styled
+// document: the serialized-HTML round trip (the engine re-parses the markup)
+// or a tree built directly from the live DOM (LayoutEngine::load_dom, no
+// serialize/re-parse). Engines without direct-DOM support always fall back to
+// the serialized path.
+enum class LayoutTreeInput {
+    SerializedHtml,
+    DirectDom,
+};
+
 struct LoadOptions {
     bool enable_js = true;
+    LayoutTreeInput layout_tree_input = LayoutTreeInput::SerializedHtml;
     std::chrono::milliseconds wait_time{15000};
     WaitUntil wait_until = WaitUntil::Ready;
     std::chrono::milliseconds stable_window{350};

@@ -152,6 +152,9 @@ struct Page::Impl {
 #if defined(PAGECORE_ENABLE_RENDERING)
         layout_factory = create_litehtml_layout_engine_factory();
 #endif
+        // With JS disabled, <noscript> content must parse as the real fallback
+        // elements browsers lay out (the flag carries across every parse()).
+        document.set_scripting_enabled(options.enable_js);
     }
 
     void invalidate_display_list_cache()
@@ -360,6 +363,43 @@ struct Page::Impl {
             style_overrides);
         trace.set_count(html.size());
         return html;
+    }
+
+    // Loads the current document into `engine`, honouring the configured
+    // layout tree input. DirectDom hands the live DOM to the engine
+    // (LayoutEngine::load_dom, no serialize/re-parse); engines without
+    // direct-DOM support fall back to the serialized-HTML round trip.
+    void load_engine_document(
+        LayoutEngine& engine,
+        const RenderOptions& render_options,
+        bool absolute_percent_corrected)
+    {
+        static const std::vector<DomDocument::LayoutStyleOverride> kNoOverrides;
+        if (options.layout_tree_input == LayoutTreeInput::DirectDom) {
+            const auto& style_overrides = absolute_percent_corrected ? render_local_overrides : kNoOverrides;
+            const std::string base = render_base_url(render_options);
+            LayoutEngine::DomLayoutRequest request;
+            request.document = &document;
+            request.base_url = base;
+            request.omit_js_disabled_content = options.enable_js;
+            request.style_overrides = &style_overrides;
+
+            bool loaded = false;
+            {
+                PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_dom");
+                trace.event().property = "absolute_percent_corrected:"
+                    + std::to_string(absolute_percent_corrected ? 1 : 0)
+                    + ";style_overrides:" + std::to_string(style_overrides.size());
+                loaded = engine.load_dom(request);
+            }
+            if (loaded) {
+                return;
+            }
+        }
+
+        std::string html = serialized_html_for_layout(render_options, absolute_percent_corrected);
+        PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
+        engine.load_html(html, render_base_url(render_options));
     }
 
     // The document's effective base URL for resolving sub-resources, honouring a
@@ -783,13 +823,7 @@ struct Page::Impl {
         layout->set_viewport(render_options.viewport);
         layout->set_resource_loader(std::move(render_loader));
         layout->set_font_environment(std::move(font_environment));
-        std::string html = serialized_html_for_layout(
-            render_options,
-            /*absolute_percent_corrected=*/false);
-        {
-            PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
-            layout->load_html(html, render_base_url(render_options));
-        }
+        load_engine_document(*layout, render_options, /*absolute_percent_corrected=*/false);
         {
             PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLayout, "layout");
             layout->layout();
@@ -841,11 +875,7 @@ struct Page::Impl {
         engine->set_font_environment(std::move(font_environment));
         {
             const auto t0 = std::chrono::steady_clock::now();
-            std::string html = serialized_html_for_layout(render_options, absolute_percent_corrected);
-            {
-                PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_html", html.size());
-                engine->load_html(html, render_base_url(render_options));
-            }
+            load_engine_document(*engine, render_options, absolute_percent_corrected);
             const auto rebuild_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             if (rebuild_us > kExpensiveStyledDocumentUs) {
