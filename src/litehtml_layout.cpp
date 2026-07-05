@@ -6,6 +6,9 @@
 
 #include <cairo.h>
 #include <litehtml.h>
+#include <litehtml/el_comment.h>
+#include <litehtml/el_space.h>
+#include <litehtml/el_text.h>
 #include <litehtml/render_item.h>
 #include <pango/pangocairo.h>
 
@@ -764,6 +767,118 @@ private:
     PangoLayout* measure_layout_ = nullptr;
 };
 
+// Builds a litehtml element tree directly from the DomDocument layout view
+// (visit_layout_tree), mirroring what litehtml's gumbo path produces from the
+// serialized HTML: every element carries data-pc-sid so NodeId lookups keep
+// working, and text is segmented through the same document_container
+// split_text used by the parser path (script text stays one unsplit run).
+class LiteHtmlTreeBuilder final : public DomDocument::LayoutTreeVisitor {
+public:
+    LiteHtmlTreeBuilder(
+        litehtml::document::ptr document,
+        litehtml::document_container* container,
+        std::unordered_map<std::string, litehtml::element::ptr>& tagged_elements)
+        : document_(std::move(document))
+        , container_(container)
+        , tagged_elements_(tagged_elements)
+    {
+    }
+
+    void enter_element(
+        NodeId id,
+        std::string_view tag_name,
+        const std::vector<DomDocument::Attribute>& attributes) override
+    {
+        litehtml::string_map attrs;
+        for (const auto& attribute : attributes) {
+            attrs[attribute.name] = attribute.value;
+        }
+        std::string sid = std::to_string(id);
+        attrs["data-pc-sid"] = sid;
+
+        auto element = document_->create_element(std::string(tag_name).c_str(), attrs);
+        if (element) {
+            tagged_elements_.emplace(std::move(sid), element);
+            if (!stack_.empty()) {
+                // appendChild may refuse (e.g. el_style only accepts text);
+                // the gumbo path drops such children the same way.
+                (void) stack_.back()->appendChild(element);
+            } else if (!root_) {
+                // First document-level element becomes the root; anything else
+                // at document level (never produced by a real DOM) is dropped,
+                // matching gumbo whose output root is the single <html>.
+                root_ = element;
+            }
+        }
+        // Push even a null/detached element so enter/leave stays balanced and
+        // its subtree hangs off it rather than a wrong ancestor.
+        stack_.push_back(element);
+    }
+
+    void leave_element(NodeId) override
+    {
+        if (!stack_.empty()) {
+            stack_.pop_back();
+        }
+    }
+
+    void text_run(std::string_view text, bool raw_run) override
+    {
+        if (stack_.empty() || !stack_.back()) {
+            return;
+        }
+        const std::string text_str(text);
+        litehtml::element::ptr& parent = stack_.back();
+        if (raw_run) {
+            (void) parent->appendChild(std::make_shared<litehtml::el_text>(text_str.c_str(), document_));
+            return;
+        }
+        container_->split_text(
+            text_str.c_str(),
+            [&](const char* word) {
+                (void) parent->appendChild(std::make_shared<litehtml::el_text>(word, document_));
+            },
+            [&](const char* space) {
+                (void) parent->appendChild(std::make_shared<litehtml::el_space>(space, document_));
+            });
+    }
+
+    void comment(std::string_view text) override
+    {
+        if (stack_.empty() || !stack_.back()) {
+            return;
+        }
+        auto comment_element = std::make_shared<litehtml::el_comment>(document_);
+        comment_element->set_data(std::string(text).c_str());
+        (void) stack_.back()->appendChild(comment_element);
+    }
+
+    litehtml::element::ptr root() const
+    {
+        return root_;
+    }
+
+private:
+    litehtml::document::ptr document_;
+    litehtml::document_container* container_ = nullptr;
+    std::unordered_map<std::string, litehtml::element::ptr>& tagged_elements_;
+    std::vector<litehtml::element::ptr> stack_;
+    litehtml::element::ptr root_;
+};
+
+litehtml::document_mode to_litehtml_document_mode(DomDocument::QuirksMode mode)
+{
+    switch (mode) {
+    case DomDocument::QuirksMode::Quirks:
+        return litehtml::quirks_mode;
+    case DomDocument::QuirksMode::LimitedQuirks:
+        return litehtml::limited_quirks_mode;
+    case DomDocument::QuirksMode::NoQuirks:
+    default:
+        return litehtml::no_quirks_mode;
+    }
+}
+
 class LiteHtmlLayoutEngine final : public LayoutEngine {
 public:
     void set_resource_loader(std::shared_ptr<ResourceLoader> loader) override
@@ -807,6 +922,49 @@ public:
         // waiting for the next find_tagged_element() call to overwrite them.
         tagged_elements_.clear();
         tagged_elements_indexed_ = false;
+    }
+
+    bool load_dom(const DomLayoutRequest& request) override
+    {
+        if (request.document == nullptr) {
+            throw std::runtime_error("load_dom requires a DOM document");
+        }
+
+        html_.clear();
+        base_url_.assign(request.base_url);
+        container_.set_resource_loader(loader_);
+        container_.set_document_base_url(base_url_);
+        container_.requested_images_clear();
+
+        auto document = std::make_shared<litehtml::document>(&container_);
+        // Quirks mode must be seeded before elements exist: html_tag::set_attr
+        // lowercases class/id values for quirks-mode selector matching.
+        document->set_document_mode(to_litehtml_document_mode(request.document->quirks_mode()));
+
+        tagged_elements_.clear();
+        LiteHtmlTreeBuilder builder(document, &container_, tagged_elements_);
+        static const std::vector<DomDocument::LayoutStyleOverride> kNoOverrides;
+        request.document->visit_layout_tree(
+            builder,
+            request.omit_js_disabled_content,
+            request.style_overrides != nullptr ? *request.style_overrides : kNoOverrides);
+
+        litehtml::element::ptr root = builder.root();
+        if (!root) {
+            root = document->create_element("html", {});
+        }
+        // Same finalization sequence createFromString runs after gumbo parsing
+        // (master CSS, linked stylesheets, cascade, render tree, table fixup).
+        document->finalize_from_external_root(root);
+
+        document_ = std::move(document);
+        styles_computed_ = true;
+        display_list_.clear();
+        display_list_.viewport = viewport_;
+        display_list_.font_environment = font_environment_;
+        // The builder registered every element eagerly; no lazy index pass.
+        tagged_elements_indexed_ = true;
+        return true;
     }
 
     void layout() override

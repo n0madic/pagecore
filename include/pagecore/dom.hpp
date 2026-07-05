@@ -143,13 +143,14 @@ public:
         bool omit_js_disabled_content = false,
         const std::vector<LayoutStyleOverride>& style_overrides = {}) const;
 
-    // Pre-order walk over the layout view of the document: the same node set
-    // serialize_html_for_layout() emits (same detach rules for <noscript> and
-    // direct text children of <head>), with style_overrides merged into the
+    // Pre-order walk over the layout view of the document: the node set a
+    // layout engine renders (same <noscript>/head-text detach rules as
+    // serialize_html_for_layout()), with style_overrides merged into the
     // reported "style" attribute value. Adjacent text nodes — including ones
-    // separated only by detached nodes — are coalesced into one text_run, and
-    // <template> content fragments are walked as element children, both
-    // mirroring what a serialize/re-parse round trip would produce. Doctype
+    // separated only by detached nodes — are coalesced into one text_run,
+    // mirroring what a serialize/re-parse round trip would produce. Inert
+    // <template> subtrees are skipped entirely (browsers never lay them out)
+    // but still break text-run coalescing like any element boundary. Doctype
     // and processing instructions are skipped; comments are reported. The
     // document is not mutated and no version counters move.
     void visit_layout_tree(

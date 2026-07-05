@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pagecore/dom.hpp"
 #include "pagecore/perf.hpp"
 
 #include <chrono>
@@ -204,6 +205,24 @@ public:
     }
     virtual void set_viewport(Viewport viewport) = 0;
     virtual void load_html(std::string_view html, std::string_view base_url) = 0;
+
+    // Direct-DOM input: builds the engine's internal tree straight from the
+    // live DOM (no serialize/re-parse round trip), equivalent to
+    // load_html(document->serialize_html_for_layout(...), base_url). Returns
+    // false when the engine doesn't support it, in which case the caller must
+    // fall back to load_html().
+    struct DomLayoutRequest {
+        const DomDocument* document = nullptr;
+        std::string_view base_url;
+        bool omit_js_disabled_content = false;
+        const std::vector<DomDocument::LayoutStyleOverride>* style_overrides = nullptr;
+    };
+    virtual bool load_dom(const DomLayoutRequest& request)
+    {
+        (void) request;
+        return false;
+    }
+
     virtual void layout() = 0;
     virtual const DisplayList& display_list() const = 0;
 

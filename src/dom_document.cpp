@@ -1417,21 +1417,14 @@ void DomDocument::visit_layout_tree(
     struct Frame {
         lxb_dom_node_t* element = nullptr;       // nullptr for the document level
         lxb_dom_node_t* next_child = nullptr;
-        // <template> direct children, walked after its content fragment (the
-        // serializer emits the content fragment ahead of any direct children).
-        lxb_dom_node_t* deferred_child = nullptr;
         bool raw_text = false;                   // inside <script>
     };
 
     std::vector<Frame> stack;
-    stack.push_back(Frame{nullptr, lxb_dom_interface_node(impl_->document)->first_child, nullptr, false});
+    stack.push_back(Frame{nullptr, lxb_dom_interface_node(impl_->document)->first_child, false});
 
     while (!stack.empty()) {
         Frame& frame = stack.back();
-        if (frame.next_child == nullptr && frame.deferred_child != nullptr) {
-            frame.next_child = frame.deferred_child;
-            frame.deferred_child = nullptr;
-        }
         if (frame.next_child == nullptr) {
             if (frame.element != nullptr) {
                 visitor.leave_element(impl_->id_for(frame.element));
@@ -1450,6 +1443,12 @@ void DomDocument::visit_layout_tree(
 
         switch (current->type) {
         case LXB_DOM_NODE_TYPE_ELEMENT: {
+            // Inert content: <template> subtrees never participate in layout
+            // (browsers keep them in a content fragment the renderer ignores).
+            // As an element boundary it still breaks text-run coalescing.
+            if (is_html_tag(current, LXB_TAG_TEMPLATE)) {
+                break;
+            }
             auto* element = lxb_dom_interface_element(current);
 
             std::vector<Attribute> attrs;
@@ -1488,13 +1487,6 @@ void DomDocument::visit_layout_tree(
             child_frame.element = current;
             child_frame.raw_text = parent_raw || is_html_tag(current, LXB_TAG_SCRIPT);
             child_frame.next_child = current->first_child;
-            if (is_html_tag(current, LXB_TAG_TEMPLATE)) {
-                auto* content = lxb_html_interface_template(current)->content;
-                if (content != nullptr && content->node.first_child != nullptr) {
-                    child_frame.next_child = content->node.first_child;
-                    child_frame.deferred_child = current->first_child;
-                }
-            }
             stack.push_back(child_frame);
             break;
         }

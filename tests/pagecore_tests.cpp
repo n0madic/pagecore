@@ -5522,35 +5522,25 @@ void test_dom_visit_layout_tree_coalesces_adjacent_text_runs()
     require(saw_comment, "comments must be reported");
 }
 
-void test_dom_visit_layout_tree_includes_template_content()
+void test_dom_visit_layout_tree_skips_template_subtrees()
 {
     pagecore::DomDocument doc;
-    doc.parse("<html><body><template id='t'><p>tpl text</p></template></body></html>");
+    doc.parse(
+        "<html><body><div id='d'>a<template id='t'><p>tpl text</p></template>b</div></body></html>");
 
     RecordingLayoutTreeVisitor visitor;
     doc.visit_layout_tree(visitor);
 
-    const auto* template_enter = visitor.find_enter("template");
-    require(template_enter != nullptr, "template element must be visited");
-    require(visitor.find_enter("p") != nullptr, "template content elements must be visited as children");
-    require(visitor.has_text("tpl text"), "template content text must be visited");
+    require(visitor.find_enter("template") == nullptr, "inert template elements must not be visited");
+    require(visitor.find_enter("p") == nullptr, "template content must not be visited");
+    require(!visitor.has_text("tpl text"), "template content text must not be visited");
 
-    // Content must be nested inside the template's enter/leave bracket.
-    std::size_t template_enter_index = 0;
-    std::size_t template_leave_index = 0;
-    std::size_t p_enter_index = 0;
-    for (std::size_t i = 0; i < visitor.events.size(); ++i) {
-        const auto& event = visitor.events[i];
-        if (event.kind == "enter" && event.tag == "template") {
-            template_enter_index = i;
-        } else if (event.kind == "leave" && event.id == template_enter->id) {
-            template_leave_index = i;
-        } else if (event.kind == "enter" && event.tag == "p") {
-            p_enter_index = i;
-        }
-    }
-    require(template_enter_index < p_enter_index && p_enter_index < template_leave_index,
-            "template content must be walked between the template's enter and leave");
+    // The skipped template is still an element boundary: the surrounding text
+    // nodes must stay separate runs (a serialize/re-parse round trip keeps
+    // them apart because the template element remains in the markup).
+    require(visitor.has_text("a") && visitor.has_text("b"),
+            "text around a template must be visited as separate runs");
+    require(!visitor.has_text("ab"), "text must not coalesce across a template element");
 }
 
 void test_dom_visit_layout_tree_does_not_mutate()
@@ -8793,6 +8783,178 @@ void test_render_absolute_percent_correction_pins_native_width_not_narrower()
         "the abs-% correction must pin litehtml's own cell width so the width:100% child stays full-width, never narrow it with a re-derived formula");
 }
 
+// Lays the same document out through both engine inputs — load_html() over the
+// layout serialization and load_dom() over the live DOM — and returns both
+// display-list JSON dumps for byte comparison.
+struct LayoutInputParity {
+    std::string html_json;
+    std::string dom_json;
+    std::unique_ptr<pagecore::LayoutEngine> html_engine;
+    std::unique_ptr<pagecore::LayoutEngine> dom_engine;
+};
+
+LayoutInputParity run_layout_input_parity(
+    pagecore::DomDocument& doc,
+    bool omit_js_disabled_content = false,
+    const std::vector<pagecore::DomDocument::LayoutStyleOverride>& overrides = {})
+{
+    const pagecore::Viewport viewport{800, 600, 1.0f};
+    const std::string base_url = "https://example.test/page/index.html";
+
+    LayoutInputParity result;
+
+    result.html_engine = pagecore::create_litehtml_layout_engine();
+    result.html_engine->set_viewport(viewport);
+    result.html_engine->load_html(
+        doc.serialize_html_for_layout(omit_js_disabled_content, overrides), base_url);
+    result.html_engine->layout();
+    result.html_json = pagecore::display_list_to_json(result.html_engine->display_list());
+
+    result.dom_engine = pagecore::create_litehtml_layout_engine();
+    result.dom_engine->set_viewport(viewport);
+    pagecore::LayoutEngine::DomLayoutRequest request;
+    request.document = &doc;
+    request.base_url = base_url;
+    request.omit_js_disabled_content = omit_js_disabled_content;
+    request.style_overrides = &overrides;
+    require(result.dom_engine->load_dom(request), "litehtml engine must support direct DOM input");
+    result.dom_engine->layout();
+    result.dom_json = pagecore::display_list_to_json(result.dom_engine->display_list());
+
+    return result;
+}
+
+void test_layout_engine_load_dom_matches_load_html_display_list()
+{
+    const std::vector<std::pair<std::string, std::string>> corpus = {
+        {"headings_paragraphs_inline_styles",
+         "<!DOCTYPE html><html><head><title>t</title></head><body>"
+         "<h1>Header</h1><p style='color:rgb(200,10,10)'>styled <b>bold</b> tail</p>"
+         "<p>plain</p></body></html>"},
+        {"floats",
+         "<!DOCTYPE html><html><body>"
+         "<div style='float:left;width:100px;height:40px;background:rgb(10,10,200)'></div>"
+         "<div style='float:right;width:80px;height:30px;background:rgb(10,200,10)'></div>"
+         "<p>flow text around floats</p></body></html>"},
+        {"table",
+         "<!DOCTYPE html><html><body><table border='1'>"
+         "<tr><td>a</td><td>b</td></tr><tr><td colspan='2'>wide</td></tr>"
+         "</table></body></html>"},
+        {"absolute_positioning",
+         "<!DOCTYPE html><html><body style='margin:0'>"
+         "<div style='position:relative;width:300px;height:100px'>"
+         "<div style='position:absolute;left:20px;top:10px;width:50px;height:20px;"
+         "background:rgb(250,120,10)'></div></div></body></html>"},
+        {"style_element",
+         "<!DOCTYPE html><html><head><style>"
+         ".card{width:150px;height:60px;background:rgb(90,90,90);margin:4px}"
+         "p{color:rgb(20,20,120)}"
+         "</style></head><body><div class='card'></div><p>styled paragraph</p></body></html>"},
+        {"entities",
+         "<!DOCTYPE html><html><body><p>&amp; &lt; &gt; and&nbsp;nbsp</p></body></html>"},
+        {"cjk_and_whitespace_runs",
+         "<!DOCTYPE html><html><body><p>Latin 漢字テスト mixed\t runs\n here</p></body></html>"},
+        {"comments_in_text",
+         "<!DOCTYPE html><html><body><p>before<!-- split -->after</p></body></html>"},
+        {"base_href",
+         "<!DOCTYPE html><html><head><base href='https://other.test/root/'></head>"
+         "<body><p>based</p></body></html>"},
+        {"template_content",
+         "<!DOCTYPE html><html><body><template><p>tpl</p></template><p>visible</p></body></html>"},
+        {"svg_island",
+         "<!DOCTYPE html><html><body><svg width='40' height='40'>"
+         "<rect width='30' height='20'></rect></svg><p>after svg</p></body></html>"},
+    };
+
+    for (const auto& [name, html] : corpus) {
+        pagecore::DomDocument doc;
+        doc.parse(html);
+        const auto parity = run_layout_input_parity(doc);
+        require(parity.html_json == parity.dom_json,
+                "load_dom display list must match load_html byte-for-byte for corpus case: " + name);
+        require(parity.dom_json.find("\"commands\":[]") == std::string::npos,
+                "corpus case must produce a non-empty display list: " + name);
+    }
+}
+
+void test_layout_engine_load_dom_quirks_class_matching()
+{
+    // No doctype: quirks mode, where class selectors match ASCII
+    // case-insensitively. The direct path must seed litehtml's document mode
+    // before creating elements or .abc would not match class="ABC".
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<html><head><style>.abc{width:200px;height:50px;background:rgb(200,30,30)}</style></head>"
+        "<body><div class='ABC'></div></body></html>");
+    require(doc.quirks_mode() == pagecore::DomDocument::QuirksMode::Quirks,
+            "doctype-less fixture must parse in quirks mode");
+
+    const auto parity = run_layout_input_parity(doc);
+    require(parity.html_json == parity.dom_json, "quirks display lists must match byte-for-byte");
+    require(parity.dom_json.find("solidFill") != std::string::npos,
+            "quirks-mode class selector must match the uppercase class in the direct path");
+}
+
+void test_layout_engine_load_dom_computed_style_and_geometry()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<!DOCTYPE html><html><head><style>"
+        "#x{width:120px;height:44px;padding:6px;border:2px solid rgb(0,0,0);margin:10px;"
+        "color:rgb(10,110,210);font-size:18px;float:left}"
+        "</style></head><body><div id='x'>probe</div></body></html>");
+
+    auto parity = run_layout_input_parity(doc);
+    const std::string key = std::to_string(doc.get_element_by_id("x"));
+
+    const auto html_style = parity.html_engine->computed_style(key);
+    const auto dom_style = parity.dom_engine->computed_style(key);
+    require(html_style.has_value() && dom_style.has_value(),
+            "both engine inputs must resolve the tagged element's computed style");
+    require(html_style->properties == dom_style->properties,
+            "computed style properties must be identical across engine inputs");
+
+    const auto html_geometry = parity.html_engine->element_geometry(key);
+    const auto dom_geometry = parity.dom_engine->element_geometry(key);
+    require(html_geometry.has_value() && dom_geometry.has_value(),
+            "both engine inputs must resolve the tagged element's geometry");
+    auto rect_equal = [](const pagecore::Rect& a, const pagecore::Rect& b) {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+    };
+    require(rect_equal(html_geometry->border_box, dom_geometry->border_box),
+            "border boxes must be identical across engine inputs");
+    require(rect_equal(html_geometry->padding_box, dom_geometry->padding_box),
+            "padding boxes must be identical across engine inputs");
+}
+
+void test_layout_engine_load_dom_collects_absolute_percent_overrides()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<!DOCTYPE html><html><head><style>"
+        "body{margin:0}"
+        ".wrap{position:relative;width:400px;height:100px}"
+        ".cell{position:absolute;left:0;top:0;width:50%;box-sizing:border-box}"
+        ".card{width:100%;height:40px;background:rgb(255,255,255)}"
+        "</style></head><body>"
+        "<div class='wrap'><div class='cell'><div class='card'></div></div></div>"
+        "</body></html>");
+
+    auto parity = run_layout_input_parity(doc);
+
+    const auto html_overrides = parity.html_engine->collect_absolute_percent_width_overrides();
+    const auto dom_overrides = parity.dom_engine->collect_absolute_percent_width_overrides();
+    require(!dom_overrides.empty(), "the abs-% fixture must produce overrides in the direct path");
+    require(html_overrides.size() == dom_overrides.size(),
+            "override counts must match across engine inputs");
+    for (std::size_t i = 0; i < html_overrides.size(); ++i) {
+        require(html_overrides[i].node_key == dom_overrides[i].node_key,
+                "override node keys must match across engine inputs");
+        require(html_overrides[i].border_box_width_px == dom_overrides[i].border_box_width_px,
+                "override widths must match across engine inputs");
+    }
+}
+
 // Regression (Phase 3): the absolute-% correction is now collected by the engine
 // with typed getters, but must still trigger the corrective second layout pass and
 // produce a deterministic (byte-identical) display list.
@@ -9082,7 +9244,7 @@ int main()
         test_dom_visit_layout_tree_omits_noscript_and_head_text();
         test_dom_visit_layout_tree_merges_style_overrides();
         test_dom_visit_layout_tree_coalesces_adjacent_text_runs();
-        test_dom_visit_layout_tree_includes_template_content();
+        test_dom_visit_layout_tree_skips_template_subtrees();
         test_dom_visit_layout_tree_does_not_mutate();
         test_dom_quirks_mode_from_doctype();
         test_layout_input_digest_superset_invariants();
@@ -9168,6 +9330,10 @@ int main()
         test_computed_style_property_reuses_digest_across_unrelated_mutation();
         test_render_never_injects_cross_viewport_measured_width();
         test_render_absolute_percent_correction_pins_native_width_not_narrower();
+        test_layout_engine_load_dom_matches_load_html_display_list();
+        test_layout_engine_load_dom_quirks_class_matching();
+        test_layout_engine_load_dom_computed_style_and_geometry();
+        test_layout_engine_load_dom_collects_absolute_percent_overrides();
         test_render_absolute_percent_correction_runs_second_pass();
         test_render_without_absolute_elements_skips_second_pass();
         test_render_reflects_settled_dom_regardless_of_read_history();
