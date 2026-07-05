@@ -5288,6 +5288,316 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
         "script text mutations must not invalidate layout/style cache");
 }
 
+struct RecordingLayoutTreeVisitor : pagecore::DomDocument::LayoutTreeVisitor {
+    struct Event {
+        std::string kind;  // "enter", "leave", "text", "raw_text", "comment"
+        pagecore::NodeId id = pagecore::kInvalidNodeId;
+        std::string tag;
+        std::vector<pagecore::DomDocument::Attribute> attributes;
+        std::string text;
+    };
+
+    std::vector<Event> events;
+
+    void enter_element(
+        pagecore::NodeId id,
+        std::string_view tag_name,
+        const std::vector<pagecore::DomDocument::Attribute>& attributes) override
+    {
+        events.push_back(Event{"enter", id, std::string(tag_name), attributes, {}});
+    }
+
+    void leave_element(pagecore::NodeId id) override
+    {
+        events.push_back(Event{"leave", id, {}, {}, {}});
+    }
+
+    void text_run(std::string_view text, bool raw_run) override
+    {
+        events.push_back(Event{raw_run ? "raw_text" : "text", pagecore::kInvalidNodeId, {}, {}, std::string(text)});
+    }
+
+    void comment(std::string_view text) override
+    {
+        events.push_back(Event{"comment", pagecore::kInvalidNodeId, {}, {}, std::string(text)});
+    }
+
+    const Event* find_enter(std::string_view tag) const
+    {
+        for (const auto& event : events) {
+            if (event.kind == "enter" && event.tag == tag) {
+                return &event;
+            }
+        }
+        return nullptr;
+    }
+
+    bool has_text(std::string_view text) const
+    {
+        for (const auto& event : events) {
+            if ((event.kind == "text" || event.kind == "raw_text") && event.text == text) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+std::optional<std::string> visitor_attribute(
+    const RecordingLayoutTreeVisitor::Event& event,
+    std::string_view name)
+{
+    for (const auto& attribute : event.attributes) {
+        if (attribute.name == name) {
+            return attribute.value;
+        }
+    }
+    return std::nullopt;
+}
+
+void test_dom_visit_layout_tree_structure_and_attributes()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<!DOCTYPE html><html><head><style>p{color:red}</style></head><body>"
+        "<div id='a' class='b' style='color:red'>Hi <span>x</span></div>"
+        "<script>var s = \"a b\";</script>"
+        "</body></html>");
+
+    RecordingLayoutTreeVisitor visitor;
+    doc.visit_layout_tree(visitor);
+
+    require(!visitor.events.empty(), "visitor must receive events");
+    require(visitor.events.front().kind == "enter" && visitor.events.front().tag == "html",
+            "walk must start at the html element (doctype skipped)");
+    require(visitor.events.front().id == doc.document_element(),
+            "html enter event must carry the document element id");
+
+    const auto* div = visitor.find_enter("div");
+    require(div != nullptr, "div must be visited");
+    require(div->id == doc.get_element_by_id("a"), "div id must match the DOM NodeId");
+    require(visitor_attribute(*div, "id") == std::optional<std::string>("a"), "div id attribute reported");
+    require(visitor_attribute(*div, "class") == std::optional<std::string>("b"), "div class attribute reported");
+    require(visitor_attribute(*div, "style") == std::optional<std::string>("color:red"),
+            "div style attribute reported");
+
+    require(visitor.has_text("Hi "), "text run inside div must be reported verbatim");
+
+    bool saw_raw_script_text = false;
+    for (const auto& event : visitor.events) {
+        if (event.kind == "raw_text" && event.text == "var s = \"a b\";") {
+            saw_raw_script_text = true;
+        }
+    }
+    require(saw_raw_script_text, "script text must be reported as one raw run");
+
+    int depth = 0;
+    for (const auto& event : visitor.events) {
+        if (event.kind == "enter") {
+            ++depth;
+        } else if (event.kind == "leave") {
+            require(depth > 0, "leave events must not underflow");
+            --depth;
+        }
+    }
+    require(depth == 0, "enter/leave events must be balanced");
+}
+
+void test_dom_visit_layout_tree_omits_noscript_and_head_text()
+{
+    const std::string_view html =
+        "<html><head><title>t</title></head><body>"
+        "<noscript><p>fallback</p></noscript><div>content</div>"
+        "</body></html>";
+
+    pagecore::DomDocument doc;
+    doc.parse(html);
+
+    // Text directly inside <head> can only appear via DOM mutation.
+    doc.append_child(doc.head(), doc.create_text_node("stray head text"));
+
+    RecordingLayoutTreeVisitor with_js;
+    doc.visit_layout_tree(with_js, /*omit_js_disabled_content=*/true);
+    require(with_js.find_enter("noscript") == nullptr, "noscript subtree must be omitted when JS is enabled");
+    require(!with_js.has_text("fallback"), "noscript content must be omitted when JS is enabled");
+    require(!with_js.has_text("stray head text"), "direct head text must always be omitted");
+    require(with_js.has_text("content"), "regular content must be visited");
+
+    // With the parser scripting flag off (JS-disabled pages), <noscript>
+    // content parses as real elements and the walk visits them.
+    pagecore::DomDocument no_js_doc;
+    no_js_doc.set_scripting_enabled(false);
+    no_js_doc.parse(html);
+    no_js_doc.append_child(no_js_doc.head(), no_js_doc.create_text_node("stray head text"));
+
+    RecordingLayoutTreeVisitor without_js;
+    no_js_doc.visit_layout_tree(without_js, /*omit_js_disabled_content=*/false);
+    require(without_js.find_enter("noscript") != nullptr, "noscript must be visited when JS is disabled");
+    require(without_js.find_enter("p") != nullptr, "noscript fallback elements must be visited when JS is disabled");
+    require(without_js.has_text("fallback"), "noscript content must be visited when JS is disabled");
+    require(!without_js.has_text("stray head text"), "direct head text must be omitted regardless of JS mode");
+}
+
+void test_dom_visit_layout_tree_merges_style_overrides()
+{
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<html><body>"
+        "<div id='styled' style='color:red'></div>"
+        "<div id='bare'></div>"
+        "</body></html>");
+
+    const pagecore::NodeId styled = doc.get_element_by_id("styled");
+    const pagecore::NodeId bare = doc.get_element_by_id("bare");
+
+    std::vector<pagecore::DomDocument::LayoutStyleOverride> overrides;
+    overrides.push_back({styled, "width:10px"});
+    overrides.push_back({bare, "height:5px"});
+    overrides.push_back({pagecore::kInvalidNodeId, "ignored:1"});
+    overrides.push_back({styled + bare + 1000, "ignored:2"});
+
+    RecordingLayoutTreeVisitor visitor;
+    doc.visit_layout_tree(visitor, false, overrides);
+
+    bool checked_styled = false;
+    bool checked_bare = false;
+    for (const auto& event : visitor.events) {
+        if (event.kind != "enter") {
+            continue;
+        }
+        if (event.id == styled) {
+            require(visitor_attribute(event, "style") == std::optional<std::string>("color:red;width:10px"),
+                    "override must merge after the existing inline style");
+            checked_styled = true;
+        }
+        if (event.id == bare) {
+            require(visitor_attribute(event, "style") == std::optional<std::string>("height:5px"),
+                    "override must synthesize a style attribute when absent");
+            checked_bare = true;
+        }
+    }
+    require(checked_styled && checked_bare, "both override targets must be visited");
+
+    require(doc.get_attribute(styled, "style") == std::optional<std::string>("color:red"),
+            "overrides must not leak into the DOM");
+}
+
+void test_dom_visit_layout_tree_coalesces_adjacent_text_runs()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><p id='p'></p><p id='q'></p></body></html>");
+
+    const pagecore::NodeId p = doc.get_element_by_id("p");
+    doc.append_child(p, doc.create_text_node("fo"));
+    doc.append_child(p, doc.create_text_node("o"));
+    doc.append_child(p, doc.create_comment("split"));
+    doc.append_child(p, doc.create_text_node("bar"));
+
+    const pagecore::NodeId q = doc.get_element_by_id("q");
+    const pagecore::NodeId noscript = doc.create_element("noscript");
+    doc.append_child(q, doc.create_text_node("a"));
+    doc.append_child(q, noscript);
+    doc.append_child(q, doc.create_text_node("b"));
+
+    RecordingLayoutTreeVisitor visitor;
+    doc.visit_layout_tree(visitor, /*omit_js_disabled_content=*/true);
+
+    std::vector<std::string> texts;
+    for (const auto& event : visitor.events) {
+        if (event.kind == "text") {
+            texts.push_back(event.text);
+        }
+    }
+    require(texts.size() == 3, "expected exactly three coalesced text runs");
+    require(texts[0] == "foo", "adjacent text nodes must coalesce into one run");
+    require(texts[1] == "bar", "comments must break text runs");
+    require(texts[2] == "ab", "text separated only by detached nodes must coalesce");
+
+    bool saw_comment = false;
+    for (const auto& event : visitor.events) {
+        if (event.kind == "comment" && event.text == "split") {
+            saw_comment = true;
+        }
+    }
+    require(saw_comment, "comments must be reported");
+}
+
+void test_dom_visit_layout_tree_includes_template_content()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><template id='t'><p>tpl text</p></template></body></html>");
+
+    RecordingLayoutTreeVisitor visitor;
+    doc.visit_layout_tree(visitor);
+
+    const auto* template_enter = visitor.find_enter("template");
+    require(template_enter != nullptr, "template element must be visited");
+    require(visitor.find_enter("p") != nullptr, "template content elements must be visited as children");
+    require(visitor.has_text("tpl text"), "template content text must be visited");
+
+    // Content must be nested inside the template's enter/leave bracket.
+    std::size_t template_enter_index = 0;
+    std::size_t template_leave_index = 0;
+    std::size_t p_enter_index = 0;
+    for (std::size_t i = 0; i < visitor.events.size(); ++i) {
+        const auto& event = visitor.events[i];
+        if (event.kind == "enter" && event.tag == "template") {
+            template_enter_index = i;
+        } else if (event.kind == "leave" && event.id == template_enter->id) {
+            template_leave_index = i;
+        } else if (event.kind == "enter" && event.tag == "p") {
+            p_enter_index = i;
+        }
+    }
+    require(template_enter_index < p_enter_index && p_enter_index < template_leave_index,
+            "template content must be walked between the template's enter and leave");
+}
+
+void test_dom_visit_layout_tree_does_not_mutate()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='a' style='color:red'>x</div></body></html>");
+
+    const auto mutation_version = doc.mutation_version();
+    const auto layout_version = doc.layout_mutation_version();
+    const auto stylesheet_generation = doc.stylesheet_generation();
+
+    std::vector<pagecore::DomDocument::LayoutStyleOverride> overrides;
+    overrides.push_back({doc.get_element_by_id("a"), "width:10px"});
+
+    RecordingLayoutTreeVisitor visitor;
+    doc.visit_layout_tree(visitor, true, overrides);
+
+    require(doc.mutation_version() == mutation_version, "visit must not bump mutation_version");
+    require(doc.layout_mutation_version() == layout_version, "visit must not bump layout_mutation_version");
+    require(doc.stylesheet_generation() == stylesheet_generation, "visit must not bump stylesheet_generation");
+    require(doc.serialize_html().find("data-pc-sid") == std::string::npos,
+            "visit must not leave transient attributes in the DOM");
+    require(doc.get_attribute(doc.get_element_by_id("a"), "style") == std::optional<std::string>("color:red"),
+            "visit must not leave merged style overrides in the DOM");
+}
+
+void test_dom_quirks_mode_from_doctype()
+{
+    pagecore::DomDocument no_quirks;
+    no_quirks.parse("<!DOCTYPE html><html><body></body></html>");
+    require(no_quirks.quirks_mode() == pagecore::DomDocument::QuirksMode::NoQuirks,
+            "a standard doctype must parse in no-quirks mode");
+
+    pagecore::DomDocument quirks;
+    quirks.parse("<html><body></body></html>");
+    require(quirks.quirks_mode() == pagecore::DomDocument::QuirksMode::Quirks,
+            "a missing doctype must parse in quirks mode");
+
+    pagecore::DomDocument limited;
+    limited.parse(
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" "
+        "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">"
+        "<html><body></body></html>");
+    require(limited.quirks_mode() == pagecore::DomDocument::QuirksMode::LimitedQuirks,
+            "a transitional doctype must parse in limited-quirks mode");
+}
+
 void test_layout_input_digest_superset_invariants()
 {
     pagecore::DomDocument doc;
@@ -8768,6 +9078,13 @@ int main()
         test_deep_dom_traversal_is_iterative();
         test_deep_clone_assigns_fresh_subtree_ids();
         test_dom_layout_mutation_version_ignores_service_attributes();
+        test_dom_visit_layout_tree_structure_and_attributes();
+        test_dom_visit_layout_tree_omits_noscript_and_head_text();
+        test_dom_visit_layout_tree_merges_style_overrides();
+        test_dom_visit_layout_tree_coalesces_adjacent_text_runs();
+        test_dom_visit_layout_tree_includes_template_content();
+        test_dom_visit_layout_tree_does_not_mutate();
+        test_dom_quirks_mode_from_doctype();
         test_layout_input_digest_superset_invariants();
         test_subtree_dirty_epoch_tracks_descendant_mutations();
         test_query_selector_cache_returns_all_and_first();

@@ -41,6 +41,9 @@ struct DomDocument::Impl {
     mutable NodeId next_id = 1;
     std::uint64_t mutation_version = 1;
     std::uint64_t layout_mutation_version = 1;
+    // HTML parser scripting flag (see DomDocument::set_scripting_enabled).
+    // Carried across parse() so the mode survives document replacement.
+    bool scripting_enabled = true;
     std::unordered_set<std::string> layout_sensitive_attributes;
     bool layout_sensitive_attribute_wildcard = false;
 

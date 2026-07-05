@@ -26,6 +26,23 @@ public:
         std::string extra_style;
     };
 
+    enum class QuirksMode { NoQuirks, Quirks, LimitedQuirks };
+
+    // Receives the layout view of the document from visit_layout_tree(): the
+    // same set of nodes serialize_html_for_layout() emits, without the
+    // serialize/re-parse round trip. enter/leave calls are balanced per
+    // element; text_run receives coalesced adjacent character data (raw_run is
+    // true inside <script>, whose text must not be whitespace-split).
+    class LayoutTreeVisitor {
+    public:
+        virtual ~LayoutTreeVisitor() = default;
+        virtual void enter_element(NodeId id, std::string_view tag_name,
+                                   const std::vector<Attribute>& attributes) = 0;
+        virtual void leave_element(NodeId id) = 0;
+        virtual void text_run(std::string_view text, bool raw_run) = 0;
+        virtual void comment(std::string_view text) = 0;
+    };
+
     DomDocument();
     ~DomDocument();
 
@@ -36,6 +53,12 @@ public:
     DomDocument& operator=(DomDocument&&) noexcept;
 
     void parse(std::string_view html);
+
+    // Sets the HTML parser scripting flag for subsequent parse() calls. When
+    // false, <noscript> content is parsed as real elements — the fallback
+    // content real browsers lay out with JavaScript disabled — instead of one
+    // raw text node. Defaults to true.
+    void set_scripting_enabled(bool enabled);
 
     NodeId document_node();
     NodeId document_element();
@@ -119,6 +142,23 @@ public:
     std::string serialize_html_for_layout(
         bool omit_js_disabled_content = false,
         const std::vector<LayoutStyleOverride>& style_overrides = {}) const;
+
+    // Pre-order walk over the layout view of the document: the same node set
+    // serialize_html_for_layout() emits (same detach rules for <noscript> and
+    // direct text children of <head>), with style_overrides merged into the
+    // reported "style" attribute value. Adjacent text nodes — including ones
+    // separated only by detached nodes — are coalesced into one text_run, and
+    // <template> content fragments are walked as element children, both
+    // mirroring what a serialize/re-parse round trip would produce. Doctype
+    // and processing instructions are skipped; comments are reported. The
+    // document is not mutated and no version counters move.
+    void visit_layout_tree(
+        LayoutTreeVisitor& visitor,
+        bool omit_js_disabled_content = false,
+        const std::vector<LayoutStyleOverride>& style_overrides = {}) const;
+
+    // Compatibility mode the document was parsed in (from the doctype).
+    QuirksMode quirks_mode() const;
 
     NodeId append_child(NodeId parent, NodeId child);
     NodeId insert_before(NodeId parent, NodeId child, NodeId reference_child);

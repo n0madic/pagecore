@@ -858,12 +858,14 @@ void DomDocument::parse(std::string_view html)
     std::uint64_t carried_layout_mutation_version = 1;
     std::uint64_t carried_forget_version = 1;
     std::uint64_t carried_stylesheet_generation = 1;
+    bool carried_scripting_enabled = true;
     if (impl_ != nullptr) {
         carried_next_id = impl_->next_id;
         carried_mutation_version = impl_->mutation_version;
         carried_layout_mutation_version = impl_->layout_mutation_version;
         carried_forget_version = impl_->forget_version;
         carried_stylesheet_generation = impl_->stylesheet_generation;
+        carried_scripting_enabled = impl_->scripting_enabled;
     }
 
     // Construct the replacement first, then swap: if the Impl constructor throws
@@ -878,6 +880,8 @@ void DomDocument::parse(std::string_view html)
     impl_->layout_mutation_version = carried_layout_mutation_version + 1;
     impl_->stylesheet_generation = carried_stylesheet_generation + 1;
     impl_->forget_version = carried_forget_version + 1;
+    impl_->scripting_enabled = carried_scripting_enabled;
+    lxb_html_document_scripting_set(impl_->document, carried_scripting_enabled);
 
     const auto status = lxb_html_document_parse(
         impl_->document,
@@ -892,6 +896,12 @@ void DomDocument::parse(std::string_view html)
     (void) document_element();
     (void) head();
     (void) body();
+}
+
+void DomDocument::set_scripting_enabled(bool enabled)
+{
+    impl_->scripting_enabled = enabled;
+    lxb_html_document_scripting_set(impl_->document, enabled);
 }
 
 NodeId DomDocument::document_node()
@@ -1383,6 +1393,153 @@ std::string DomDocument::serialize_html_for_layout(
     restore_transient_attributes(transient_restore);
 
     return html;
+}
+
+void DomDocument::visit_layout_tree(
+    LayoutTreeVisitor& visitor,
+    bool omit_js_disabled_content,
+    const std::vector<LayoutStyleOverride>& style_overrides) const
+{
+    std::unordered_map<lxb_dom_node_t*, const std::string*> override_styles;
+    for (const auto& override : style_overrides) {
+        const auto found = impl_->id_to_node.find(override.node);
+        if (found == impl_->id_to_node.end()
+            || found->second == nullptr
+            || found->second->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || override.extra_style.empty()) {
+            continue;
+        }
+        override_styles[found->second] = &override.extra_style;
+    }
+
+    // Iterative walk — recursion would overflow the native stack on deeply
+    // nested DOM trees (attacker-controlled via HTML or JS).
+    struct Frame {
+        lxb_dom_node_t* element = nullptr;       // nullptr for the document level
+        lxb_dom_node_t* next_child = nullptr;
+        // <template> direct children, walked after its content fragment (the
+        // serializer emits the content fragment ahead of any direct children).
+        lxb_dom_node_t* deferred_child = nullptr;
+        bool raw_text = false;                   // inside <script>
+    };
+
+    std::vector<Frame> stack;
+    stack.push_back(Frame{nullptr, lxb_dom_interface_node(impl_->document)->first_child, nullptr, false});
+
+    while (!stack.empty()) {
+        Frame& frame = stack.back();
+        if (frame.next_child == nullptr && frame.deferred_child != nullptr) {
+            frame.next_child = frame.deferred_child;
+            frame.deferred_child = nullptr;
+        }
+        if (frame.next_child == nullptr) {
+            if (frame.element != nullptr) {
+                visitor.leave_element(impl_->id_for(frame.element));
+            }
+            stack.pop_back();
+            continue;
+        }
+
+        auto* current = frame.next_child;
+        frame.next_child = current->next;
+        const bool parent_raw = frame.raw_text;
+
+        if (should_detach_layout_node(current, omit_js_disabled_content)) {
+            continue;
+        }
+
+        switch (current->type) {
+        case LXB_DOM_NODE_TYPE_ELEMENT: {
+            auto* element = lxb_dom_interface_element(current);
+
+            std::vector<Attribute> attrs;
+            for (auto* attr = lxb_dom_element_first_attribute(element);
+                 attr != nullptr;
+                 attr = lxb_dom_element_next_attribute(attr)) {
+                size_t name_len = 0;
+                const auto* name = lxb_dom_attr_qualified_name(attr, &name_len);
+                size_t value_len = 0;
+                const auto* value = lxb_dom_attr_value(attr, &value_len);
+                attrs.push_back(Attribute{to_string(name, name_len), to_string(value, value_len)});
+            }
+            const auto override_it = override_styles.find(current);
+            if (override_it != override_styles.end()) {
+                bool merged = false;
+                for (auto& attr : attrs) {
+                    if (attr.name == "style") {
+                        attr.value = append_css_declarations(attr.value, *override_it->second);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    attrs.push_back(Attribute{"style", *override_it->second});
+                }
+            }
+
+            size_t tag_len = 0;
+            const auto* tag = lxb_dom_element_qualified_name(element, &tag_len);
+            visitor.enter_element(
+                impl_->id_for(current),
+                std::string_view(reinterpret_cast<const char*>(tag), tag_len),
+                attrs);
+
+            Frame child_frame;
+            child_frame.element = current;
+            child_frame.raw_text = parent_raw || is_html_tag(current, LXB_TAG_SCRIPT);
+            child_frame.next_child = current->first_child;
+            if (is_html_tag(current, LXB_TAG_TEMPLATE)) {
+                auto* content = lxb_html_interface_template(current)->content;
+                if (content != nullptr && content->node.first_child != nullptr) {
+                    child_frame.next_child = content->node.first_child;
+                    child_frame.deferred_child = current->first_child;
+                }
+            }
+            stack.push_back(child_frame);
+            break;
+        }
+        case LXB_DOM_NODE_TYPE_TEXT:
+        case LXB_DOM_NODE_TYPE_CDATA_SECTION: {
+            std::string text = character_data(current);
+            auto* scan = frame.next_child;
+            while (scan != nullptr) {
+                if (should_detach_layout_node(scan, omit_js_disabled_content)) {
+                    scan = scan->next;
+                    continue;
+                }
+                if (is_text_content_descendant(scan)) {
+                    text += character_data(scan);
+                    scan = scan->next;
+                    continue;
+                }
+                break;
+            }
+            frame.next_child = scan;
+            if (!text.empty()) {
+                visitor.text_run(text, parent_raw);
+            }
+            break;
+        }
+        case LXB_DOM_NODE_TYPE_COMMENT:
+            visitor.comment(character_data(current));
+            break;
+        default:
+            break;  // doctype, processing instructions
+        }
+    }
+}
+
+DomDocument::QuirksMode DomDocument::quirks_mode() const
+{
+    switch (impl_->document->dom_document.compat_mode) {
+    case LXB_DOM_DOCUMENT_CMODE_QUIRKS:
+        return QuirksMode::Quirks;
+    case LXB_DOM_DOCUMENT_CMODE_LIMITED_QUIRKS:
+        return QuirksMode::LimitedQuirks;
+    case LXB_DOM_DOCUMENT_CMODE_NO_QUIRKS:
+    default:
+        return QuirksMode::NoQuirks;
+    }
 }
 
 NodeId DomDocument::append_child(NodeId parent, NodeId child)
