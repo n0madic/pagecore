@@ -655,6 +655,13 @@ void test_dom_shim_spec_regressions()
   document.body.appendChild(box);
   box.replaceChild(incoming, old);
   document.body.setAttribute('data-frag', String(frag.childNodes.length));
+
+  // elementFromPoint must exist (baseline API libraries call unguarded) and
+  // return null rather than throw or hand back a wrong element.
+  var efp = (typeof document.elementFromPoint === 'function')
+    ? (document.elementFromPoint(1, 1) === null ? 'null' : 'wrong')
+    : 'missing';
+  document.body.setAttribute('data-efp', efp);
 </script>
 </body></html>
 )HTML");
@@ -667,6 +674,8 @@ void test_dom_shim_spec_regressions()
             "an event on a non-Node EventTarget must not propagate to window");
     require(page.outer_html("body[data-frag='0']").has_value(),
             "replaceChild must detach a fragment-parented incoming node from its fragment");
+    require(page.outer_html("body[data-efp='null']").has_value(),
+            "document.elementFromPoint must be present and return null (baseline API called unguarded)");
 }
 
 void test_js_console_log_callback()

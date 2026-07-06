@@ -331,8 +331,9 @@ Known geometry-channel limitations: `scrollWidth`/`scrollHeight` are approximate
 as `clientWidth`/`clientHeight`; `scrollTop`/`scrollLeft` are no-op stubs;
 `getClientRects()` returns a single bounding rect rather than one per line-box
 fragment; `Range.getBoundingClientRect`/`getClientRects` return empty; and
-`document.elementFromPoint` is a compatibility stub that returns `document.body`
-rather than performing real hit-testing.
+`document.elementFromPoint`/`elementsFromPoint` do no coordinate-based
+hit-testing (they return `null`/`[]` — present because libraries call them
+without feature-detecting, but never a real point-to-element lookup).
 
 ## Raster backend
 

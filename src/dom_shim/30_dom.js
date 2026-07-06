@@ -3424,7 +3424,12 @@
           createRange() { return new Range(this); }
           getSelection() { return selection; }
           hasFocus() { return true; }
-          elementFromPoint() { return this.body; }
+          // No coordinate-based hit-testing (PageCore has no visual hit region
+          // model), but the API must exist: it is a baseline method many libraries
+          // call without feature-detecting it. Returning null is a spec-legitimate
+          // result ("no element at the point") and never a wrong element.
+          elementFromPoint() { return null; }
+          elementsFromPoint() { return []; }
           adoptNode(node) { return node; }
           importNode(node, deep = false) { return node.cloneNode ? node.cloneNode(Boolean(deep)) : node; }
           open() { return documentOpen(this); }
@@ -3511,7 +3516,8 @@
           createRange() { return document.createRange(); }
           getSelection() { return selection; }
           hasFocus() { return false; }
-          elementFromPoint() { return this.body; }
+          elementFromPoint() { return null; }
+          elementsFromPoint() { return []; }
           adoptNode(node) { return node; }
           importNode(node, deep = false) { return node && node.cloneNode ? node.cloneNode(Boolean(deep)) : node; }
 
