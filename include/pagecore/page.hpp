@@ -44,7 +44,7 @@ enum class LayoutTreeInput {
 
 struct LoadOptions {
     bool enable_js = true;
-    LayoutTreeInput layout_tree_input = LayoutTreeInput::SerializedHtml;
+    LayoutTreeInput layout_tree_input = LayoutTreeInput::DirectDom;
     std::chrono::milliseconds wait_time{15000};
     WaitUntil wait_until = WaitUntil::Ready;
     std::chrono::milliseconds stable_window{350};

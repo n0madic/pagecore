@@ -7885,15 +7885,21 @@ void test_perf_trace_records_render_geometry_and_png_phases()
         return count;
     };
 
-    require(has_phase(pagecore::PerfPhase::SerializeHtml), "perf trace should record HTML serialization");
+    // The direct-DOM default feeds litehtml straight from the DOM, so no
+    // serialization phase may appear; the document load is traced as load_dom.
+    require(!has_phase(pagecore::PerfPhase::SerializeHtml),
+            "the direct-DOM path must not serialize the document for layout");
     require(has_phase(pagecore::PerfPhase::SubresourceScan), "perf trace should record subresource scanning");
-    require(has_phase(pagecore::PerfPhase::LitehtmlLoadHtml), "perf trace should record litehtml load_html");
+    require(has_phase(pagecore::PerfPhase::LitehtmlLoadHtml), "perf trace should record the litehtml document load");
+    const auto load_dom_event = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::LitehtmlLoadHtml && event.name == "load_dom";
+    });
+    require(load_dom_event, "the direct-DOM document load should be traced as load_dom");
     require(has_phase(pagecore::PerfPhase::LitehtmlLayout), "perf trace should record litehtml layout");
     require(has_phase(pagecore::PerfPhase::ComputedStyle), "perf trace should record computed style reads");
     require(has_phase(pagecore::PerfPhase::Geometry), "perf trace should record geometry reads");
     require(has_phase(pagecore::PerfPhase::Raster), "perf trace should record rasterization");
     require(has_phase(pagecore::PerfPhase::PngEncode), "perf trace should record PNG encoding");
-    require(count_for(pagecore::PerfPhase::SerializeHtml) > 0, "serialize trace count should report bytes");
     require(count_for(pagecore::PerfPhase::PngEncode) == png.size(), "PNG trace count should report encoded bytes");
 
     auto computed = std::find_if(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
@@ -8025,6 +8031,7 @@ public:
     }
     void set_viewport(pagecore::Viewport viewport) override { inner_->set_viewport(viewport); }
     void load_html(std::string_view html, std::string_view base_url) override { inner_->load_html(html, base_url); }
+    bool load_dom(const DomLayoutRequest& request) override { return inner_->load_dom(request); }
     void layout() override
     {
         ++(*layout_calls_);
@@ -9171,6 +9178,93 @@ void test_page_direct_dom_geometry_and_computed_style_equivalence()
             "border boxes must match across layout tree inputs");
 }
 
+// Documented divergence of the direct-DOM path: DOM anomalies JavaScript can
+// create but an HTML parser would normalize away (a <p> nested inside another
+// <p>) now reach the layout engine as the real tree — the behavior of real
+// browsers — instead of being flattened by the serialize/re-parse round trip.
+void test_page_direct_dom_preserves_js_created_nesting()
+{
+    const char* html = R"HTML(
+<html><body>
+<p id="outer" style="padding-left:30px">outer</p>
+<script>
+  var inner = document.createElement('p');
+  inner.id = 'inner';
+  inner.textContent = 'inner';
+  document.getElementById('outer').appendChild(inner);
+</script>
+</body></html>
+)HTML";
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 300, 1.0f};
+
+    pagecore::Page direct_page;  // DirectDom is the default
+    direct_page.load_html(html, "https://example.test/");
+    (void) direct_page.display_list(options);
+
+    const pagecore::NodeId direct_outer = direct_page.document().get_element_by_id("outer");
+    const pagecore::NodeId direct_inner = direct_page.document().get_element_by_id("inner");
+    const auto direct_outer_geometry = direct_page.element_geometry(direct_outer);
+    const auto direct_inner_geometry = direct_page.element_geometry(direct_inner);
+    require(direct_outer_geometry.has_value() && direct_inner_geometry.has_value(),
+            "both paragraphs must lay out in the direct path");
+    require(direct_inner_geometry->border_box.x
+                == direct_outer_geometry->border_box.x + 30.0f,
+            "the JS-nested <p> must lay out inside its real parent (inheriting its padding offset)");
+
+    // The serialized round trip re-parses the markup, so the HTML parser
+    // splits the nested <p> out to a sibling with no padding offset.
+    pagecore::LoadOptions serialized_options;
+    serialized_options.layout_tree_input = pagecore::LayoutTreeInput::SerializedHtml;
+    pagecore::Page serialized_page(serialized_options);
+    serialized_page.load_html(html, "https://example.test/");
+    (void) serialized_page.display_list(options);
+
+    const pagecore::NodeId serialized_outer = serialized_page.document().get_element_by_id("outer");
+    const pagecore::NodeId serialized_inner = serialized_page.document().get_element_by_id("inner");
+    const auto serialized_outer_geometry = serialized_page.element_geometry(serialized_outer);
+    const auto serialized_inner_geometry = serialized_page.element_geometry(serialized_inner);
+    require(serialized_outer_geometry.has_value() && serialized_inner_geometry.has_value(),
+            "both paragraphs must lay out in the serialized path");
+    require(serialized_inner_geometry->border_box.x == serialized_outer_geometry->border_box.x,
+            "the serialized round trip flattens the JS-created nesting (documented divergence)");
+}
+
+// Permanent A/B regression hook: the serialized layout input stays available
+// behind LoadOptions and keeps its serialize+load_html perf signature.
+void test_page_serialized_layout_input_still_available()
+{
+    pagecore::LoadOptions load_options;
+    load_options.layout_tree_input = pagecore::LayoutTreeInput::SerializedHtml;
+
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::Page page(load_options);
+    page.load_html(
+        "<html><body><div style='width:50px;height:20px;background:rgb(9,9,9)'>x</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+    options.perf_trace = [&](const pagecore::PerfEvent& event) { events.push_back(event); };
+
+    const auto display_list = page.display_list(options);
+    require(!display_list.commands.empty(), "the serialized path must still render");
+
+    const auto serialized = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::SerializeHtml;
+    });
+    const auto loaded_html = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.phase == pagecore::PerfPhase::LitehtmlLoadHtml && e.name == "load_html";
+    });
+    const auto loaded_dom = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.name == "load_dom";
+    });
+    require(serialized, "the serialized path must trace HTML serialization");
+    require(loaded_html, "the serialized path must trace load_html");
+    require(!loaded_dom, "the serialized path must never call load_dom");
+}
+
 // Regression (Phase 3): the absolute-% correction is now collected by the engine
 // with typed getters, but must still trigger the corrective second layout pass and
 // produce a deterministic (byte-identical) display list.
@@ -9199,18 +9293,19 @@ void test_render_absolute_percent_correction_runs_second_pass()
 
     const std::string json_first = pagecore::display_list_to_json(page.display_list(options));
 
-    const auto corrected_pass = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
-        return e.phase == pagecore::PerfPhase::SerializeHtml
-            && e.property.find("absolute_percent_corrected:1") != std::string::npos;
-    });
-    require(corrected_pass,
+    // Both layout tree inputs tag the document-load event with the pass kind:
+    // SerializeHtml for the serialized path, LitehtmlLoadHtml/load_dom for the
+    // direct-DOM path.
+    auto has_pass = [&](std::string_view marker) {
+        return std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& e) {
+            return (e.phase == pagecore::PerfPhase::SerializeHtml
+                    || e.phase == pagecore::PerfPhase::LitehtmlLoadHtml)
+                && e.property.find(marker) != std::string::npos;
+        });
+    };
+    require(has_pass("absolute_percent_corrected:1"),
             "an absolute-% border-box page must run the second, corrected layout pass");
-
-    const auto first_pass = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
-        return e.phase == pagecore::PerfPhase::SerializeHtml
-            && e.property.find("absolute_percent_corrected:0") != std::string::npos;
-    });
-    require(first_pass, "the uncorrected first pass must still run");
+    require(has_pass("absolute_percent_corrected:0"), "the uncorrected first pass must still run");
 
     // An independent render of the same page must reproduce the corrected display
     // list exactly: the typed override collection is deterministic.
@@ -9555,6 +9650,8 @@ int main()
         test_page_direct_dom_absolute_percent_second_pass();
         test_page_direct_dom_memoization();
         test_page_direct_dom_geometry_and_computed_style_equivalence();
+        test_page_direct_dom_preserves_js_created_nesting();
+        test_page_serialized_layout_input_still_available();
         test_render_absolute_percent_correction_runs_second_pass();
         test_render_without_absolute_elements_skips_second_pass();
         test_render_reflects_settled_dom_regardless_of_read_history();
