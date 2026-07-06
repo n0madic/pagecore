@@ -240,12 +240,18 @@ JSValue js_attributes(JSContext* ctx, const std::vector<DomDocument::Attribute>&
 // hasNode + nodeType + tagName round-trip per node.
 JSValue js_node_descriptor(JSContext* ctx, DomDocument& document, NodeId id)
 {
-    JSValue item = JS_NewObject(ctx);
+    // Read everything that can throw (require_node/require_element) BEFORE
+    // allocating the JS object, so an exception cannot leak a half-built object.
     const int type = document.node_type(id);
+    std::string tag;
+    if (type == 1) {
+        tag = document.tag_name(id);
+    }
+    JSValue item = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, item, "id", js_id(ctx, id));
     JS_SetPropertyStr(ctx, item, "type", JS_NewInt32(ctx, type));
     if (type == 1) {
-        JS_SetPropertyStr(ctx, item, "tag", js_string(ctx, document.tag_name(id)));
+        JS_SetPropertyStr(ctx, item, "tag", js_string(ctx, tag));
     }
     return item;
 }
@@ -350,9 +356,18 @@ bool js_resource_load_blocked(
     case JsResourceLoadPolicy::BlockAll:
         return true;
     case JsResourceLoadPolicy::SameOriginOnly: {
-        const std::string base_origin = network_origin(base_url);
         const std::string request_origin = network_origin(request_url);
-        return !base_origin.empty() && !request_origin.empty() && base_origin != request_origin;
+        // A non-network target (data:) has no network origin and is not a
+        // cross-origin network fetch; leave it to the ResourceLoader policy, which
+        // separately gates file:// reads from a network origin.
+        if (request_origin.empty()) {
+            return false;
+        }
+        // Fail closed: an http(s) target from a document with no comparable network
+        // origin (a data:/file: or empty base_url) cannot be proven same-origin, so
+        // it must be blocked rather than silently degrading to Allow.
+        const std::string base_origin = network_origin(base_url);
+        return base_origin.empty() || base_origin != request_origin;
     }
     }
     return false;
@@ -401,6 +416,28 @@ void set_function(JSContext* ctx, JSValueConst object, const char* name, JSCFunc
 int interrupt_handler(JSRuntime*, void* opaque)
 {
     return static_cast<JsRuntime*>(opaque)->is_timed_out() ? 1 : 0;
+}
+
+// Surfaces unhandled promise rejections as console errors. Without this, a module
+// that throws at top level (JS_EvalFunction returns a rejected promise, not an
+// exception), a rejected async timer callback, and a dropped fetch()/XHR chain all
+// vanish silently — unlike classic scripts, whose errors are logged.
+void promise_rejection_tracker(
+    JSContext* ctx, JSValueConst /*promise*/, JSValueConst reason, bool is_handled, void* opaque)
+{
+    if (is_handled) {
+        return; // A previously unhandled rejection just gained a handler.
+    }
+    auto* runtime = static_cast<JsRuntime*>(opaque);
+    if (runtime == nullptr) {
+        return;
+    }
+    const char* reason_str = JS_ToCString(ctx, reason);
+    std::string message = reason_str != nullptr ? reason_str : "unknown reason";
+    if (reason_str != nullptr) {
+        JS_FreeCString(ctx, reason_str);
+    }
+    runtime->log_console("error", "Uncaught (in promise) " + message);
 }
 
 ResourceKind resource_kind_from_string(std::string_view value)
@@ -1260,6 +1297,7 @@ JsRuntime::JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr
     JS_SetMaxStackSize(runtime_, 1024 * 1024);
     JS_SetInterruptHandler(runtime_, interrupt_handler, this);
     JS_SetModuleLoaderFunc(runtime_, normalize_module, load_module, this);
+    JS_SetHostPromiseRejectionTracker(runtime_, promise_rejection_tracker, this);
 
     context_ = JS_NewContext(runtime_);
     if (context_ == nullptr) {
@@ -1540,7 +1578,12 @@ int JsRuntime::deliver_mutation_observers()
     check_exception(result, "<mutation-observer>");
 
     int32_t delivered = 0;
-    JS_ToInt32(context_, &delivered, result);
+    if (JS_ToInt32(context_, &delivered, result) < 0) {
+        // The shim contract returns a number; clear any stray pending exception a
+        // non-numeric return would leave so it can't surface on the next JS call.
+        JS_FreeValue(context_, JS_GetException(context_));
+        delivered = 0;
+    }
     JS_FreeValue(context_, result);
     return delivered;
 }
@@ -1585,7 +1628,10 @@ int JsRuntime::run_event_loop_step(std::chrono::milliseconds advance)
     }
 
     int32_t ran = 0;
-    JS_ToInt32(context_, &ran, result);
+    if (JS_ToInt32(context_, &ran, result) < 0) {
+        JS_FreeValue(context_, JS_GetException(context_));
+        ran = 0;
+    }
     JS_FreeValue(context_, result);
     if (ran > 0 && run_microtask_checkpoint_logged() < 0) {
         return -1;
@@ -1618,7 +1664,10 @@ JsRuntime::EventLoopSnapshot JsRuntime::event_loop_snapshot(std::chrono::millise
     auto int_property = [this, result](const char* name) -> int64_t {
         JSValue value = JS_GetPropertyStr(context_, result, name);
         int64_t out = 0;
-        JS_ToInt64(context_, &out, value);
+        if (JS_ToInt64(context_, &out, value) < 0) {
+            JS_FreeValue(context_, JS_GetException(context_));
+            out = 0;
+        }
         JS_FreeValue(context_, value);
         return out;
     };

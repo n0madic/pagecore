@@ -737,6 +737,49 @@ test('runtime reports circular dependencies', () => {
     /Circular PageCore DOM shim module dependency: a/);
 });
 
+test('dom nextSibling/previousSibling traverse DocumentFragment children', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const fragment = document.createDocumentFragment();
+  const a = document.createElement('a');
+  const b = document.createElement('b');
+  const c = document.createElement('i');
+  fragment.appendChild(a);
+  fragment.appendChild(b);
+  fragment.appendChild(c);
+
+  // Regression: these getters used to call parent._liveId() on the fragment
+  // (which is not a Node), throwing a TypeError for any fragment/shadow child.
+  assert.strictEqual(a.nextSibling, b);
+  assert.strictEqual(b.nextSibling, c);
+  assert.strictEqual(c.nextSibling, null);
+  assert.strictEqual(c.previousSibling, b);
+  assert.strictEqual(a.previousSibling, null);
+});
+
+test('web URLSearchParams sort uses UTF-16 code-unit order', () => {
+  const { web } = installWeb();
+  const params = new web.URLSearchParams('b=1&a=2&B=3&a=4');
+  params.sort();
+  // Code units: 'B'(66) < 'a'(97) < 'b'(98); equal keys keep insertion order.
+  // localeCompare (the old behavior) would order these differently.
+  assert.strictEqual(params.toString(), 'B=3&a=2&a=4&b=1');
+});
+
+test('runtime removes native bridges even when a module install throws', () => {
+  const root = { __dom: { tag: 'dom' }, __host: { tag: 'host' } };
+  runtimeInstaller(root);
+  root.__pagecore_dom_shim_define({
+    name: 'boom',
+    deps: [],
+    install: () => { throw new Error('install failed'); }
+  });
+
+  assert.throws(() => root.__pagecore_dom_shim_install(root), /install failed/);
+  assert.strictEqual(root.__dom, undefined, 'raw __dom bridge must be removed even on a failed install');
+  assert.strictEqual(root.__host, undefined, 'raw __host bridge must be removed even on a failed install');
+});
+
 Promise.all(testPromises).catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exitCode = 1;

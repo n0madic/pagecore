@@ -79,3 +79,40 @@ for (const file of files) {
     throw new Error(`${base} has invalid deps: [${(exported.deps || []).join(',')}]`);
   }
 }
+
+// Build the actual dependency graph from the module definitions and detect any
+// cycle directly (a DFS topological check), instead of trusting only the expected
+// table above. A new cycle the runtime installer would reject at boot is then
+// caught at build time too, and the tool's name is honest.
+const graph = new Map();
+for (const file of files) {
+  const base = path.basename(file);
+  if (base === '00_runtime.js' || base === '99_boot.js') continue;
+  const exported = require(file);
+  graph.set(exported.name, Array.isArray(exported.deps) ? exported.deps.slice() : []);
+}
+
+const VISITING = 1;
+const DONE = 2;
+const state = new Map();
+const stack = [];
+function visit(name) {
+  const current = state.get(name);
+  if (current === DONE) return;
+  if (current === VISITING) {
+    const start = stack.indexOf(name);
+    const cycle = stack.slice(start >= 0 ? start : 0).concat(name);
+    throw new Error(`Dependency cycle detected: ${cycle.join(' -> ')}`);
+  }
+  state.set(name, VISITING);
+  stack.push(name);
+  for (const dep of graph.get(name) || []) {
+    if (!graph.has(dep)) {
+      throw new Error(`Module '${name}' depends on unknown module '${dep}'`);
+    }
+    visit(dep);
+  }
+  stack.pop();
+  state.set(name, DONE);
+}
+for (const name of graph.keys()) visit(name);

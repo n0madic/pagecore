@@ -200,10 +200,12 @@
             path.push(node);
           }
           // Only escalate to window when the node is actually rooted in the
-          // document; a detached node must not reach window.
+          // document; a detached node must not reach window. A non-Node
+          // EventTarget (XHR, AbortSignal, a bare EventTarget) has no isConnected
+          // and must NOT escalate — browsers never route its events to window.
           const rooted = start === global
             || start === global.document
-            || (typeof start.isConnected === 'boolean' ? start.isConnected : true);
+            || (typeof start.isConnected === 'boolean' ? start.isConnected : false);
           if (rooted && path[path.length - 1] !== global) {
             path.push(global);
           }

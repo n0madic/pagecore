@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -110,10 +111,20 @@ void validate_render_dimensions(const pagecore::Viewport& viewport)
 // sub-resource resolution against the base URL works for paths with such chars.
 std::string to_file_url(const std::string& path)
 {
+    // Absolutize first so a relative --file path yields a well-formed absolute
+    // file:// URL (file:///abs/...) and relative sub-resource resolution against
+    // that base works, instead of an ambiguous file://relative/path.
+    std::string absolute_path = path;
+    try {
+        absolute_path = std::filesystem::absolute(path).lexically_normal().string();
+    } catch (const std::exception&) {
+        absolute_path = path; // fall back to the raw path if the FS can't resolve it
+    }
+
     static const char* kHexDigits = "0123456789ABCDEF";
     std::string encoded;
-    encoded.reserve(path.size());
-    for (unsigned char ch : path) {
+    encoded.reserve(absolute_path.size());
+    for (unsigned char ch : absolute_path) {
         const bool unreserved = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
             || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~'
             || ch == '/' || ch == ':';
@@ -501,6 +512,10 @@ int main(int argc, char** argv)
                 pagecore::DisplayList display = page.display_list(render_options);
                 validate_full_page_height(display.content_height);
                 display.viewport.height = std::max(display.viewport.height, std::max(1, display.content_height));
+                // The pre-expansion pre-flight ran on the original viewport; re-check
+                // the expanded surface so width x expanded-height x scale^2 can't blow
+                // past the render-surface budget after the full-page height grows.
+                validate_render_dimensions(display.viewport);
                 full_page_display_list = std::move(display);
             }
             return *full_page_display_list;

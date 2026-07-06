@@ -737,7 +737,11 @@ void DomDocument::Impl::fold_element_selectors(
         }
         const std::string_view lower(reinterpret_cast<const char*>(name), name_len);
         if (lower == "style") {
-            if (!include_style) {
+            // The target/ancestor chain (include_style=true) always folds inline
+            // style. Sibling context (include_style=false) normally skips it, but
+            // must still fold it when a [style] attribute selector is live: a
+            // sibling's style write can then change this node's selector match.
+            if (!include_style && !digest_folds_attribute("style")) {
                 continue;
             }
         } else if (!digest_folds_attribute(lower)) {
@@ -1425,6 +1429,20 @@ void DomDocument::set_inner_html(NodeId id, std::string_view html)
         collect_subtree(child, previous_nodes);
     }
 
+    // Read and forget the old subtree BEFORE replacing it: lxb_html_element_inner_html_set
+    // destroys the existing children (lxb_dom_node_destroy_deep), so inspecting these raw
+    // pointers afterwards is a use-after-free — and forgetting them by the freed pointer
+    // would erase the wrong id (or none), leaving the old ids dangling in id_to_node.
+    // The old children are still alive here (Lexbor parses the new fragment first and only
+    // frees the old ones once that succeeds), so this is safe.
+    bool removed_stylesheet = false;
+    for (auto* previous : previous_nodes) {
+        if (is_stylesheet_element(previous)) {
+            removed_stylesheet = true;
+        }
+        impl_->forget_node(previous);
+    }
+
     auto* result = lxb_html_element_inner_html_set(
         lxb_html_interface_element(lxb_dom_interface_element(node)),
         reinterpret_cast<const lxb_char_t*>(html.data()),
@@ -1434,13 +1452,6 @@ void DomDocument::set_inner_html(NodeId id, std::string_view html)
         throw std::runtime_error("failed to set DOM innerHTML");
     }
 
-    bool removed_stylesheet = false;
-    for (auto* previous : previous_nodes) {
-        if (is_stylesheet_element(previous)) {
-            removed_stylesheet = true;
-        }
-        impl_->forget_node(previous);
-    }
     // React to both inserted and removed <style>/<link>/<base> content.
     const bool affects_sheets = removed_stylesheet || impl_->mutation_affects_stylesheets(node);
     impl_->mark_mutated(impl_->node_affects_layout(node), id, affects_sheets);
@@ -1672,6 +1683,7 @@ NodeId DomDocument::append_child(NodeId parent, NodeId child)
 {
     auto* parent_node = impl_->require_node(parent);
     auto* child_node = impl_->require_node(child);
+    auto* old_parent = child_node->parent; // non-null when this append is a move
     const bool affects_layout = impl_->node_affects_layout(parent_node) && impl_->node_affects_layout(child_node);
     const auto status = lxb_dom_node_append_child(parent_node, child_node);
     if (status != LXB_DOM_EXCEPTION_OK) {
@@ -1679,6 +1691,11 @@ NodeId DomDocument::append_child(NodeId parent, NodeId child)
     }
     const NodeId child_id = impl_->id_for(child_node);
     impl_->mark_mutated(affects_layout, child_id, impl_->mutation_affects_stylesheets(child_node));
+    // A move detaches the child from its former parent, whose remaining subtree
+    // (its former siblings' context) also changed; mark it dirty like remove_child.
+    if (affects_layout && old_parent != nullptr && old_parent != parent_node) {
+        impl_->mark_layout_dirty_from(old_parent);
+    }
     return child_id;
 }
 
@@ -1691,6 +1708,7 @@ NodeId DomDocument::insert_before(NodeId parent, NodeId child, NodeId reference_
     auto* parent_node = impl_->require_node(parent);
     auto* child_node = impl_->require_node(child);
     auto* reference_node = impl_->require_node(reference_child);
+    auto* old_parent = child_node->parent; // non-null when this insert is a move
     const bool affects_layout = impl_->node_affects_layout(parent_node) && impl_->node_affects_layout(child_node);
     const auto status = lxb_dom_node_insert_before_spec(
         parent_node,
@@ -1703,6 +1721,11 @@ NodeId DomDocument::insert_before(NodeId parent, NodeId child, NodeId reference_
 
     const NodeId child_id = impl_->id_for(child_node);
     impl_->mark_mutated(affects_layout, child_id, impl_->mutation_affects_stylesheets(child_node));
+    // A move detaches the child from its former parent, whose remaining subtree
+    // (its former siblings' context) also changed; mark it dirty like remove_child.
+    if (affects_layout && old_parent != nullptr && old_parent != parent_node) {
+        impl_->mark_layout_dirty_from(old_parent);
+    }
     return child_id;
 }
 

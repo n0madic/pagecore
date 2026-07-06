@@ -709,6 +709,16 @@ if(PAGECORE_BUILD_TESTS)
     endif()
 endif()
 
+# The installed/exported package is intentionally NON-RELOCATABLE. The static-first
+# dependency targets (pagecore_static_pkg_deps / pagecore_libpsl_deps) bake this
+# build host's absolute archive/-I/-L paths — plus hardcoded Homebrew prefixes on
+# Apple — into the exported PageCoreTargets.cmake. A find_package(PageCore) consumer
+# must therefore run on the same host and package layout that built it; moving the
+# install tree (or a Homebrew upgrade relocating an archive) breaks linking. Turn
+# this option off to skip generating install/export rules entirely.
+option(PAGECORE_INSTALL "Generate install/export rules for PageCore (non-relocatable)" ON)
+if(PAGECORE_INSTALL)
+
 set(PAGECORE_INSTALL_CMAKEDIR
     "${CMAKE_INSTALL_LIBDIR}/cmake/PageCore"
     CACHE STRING
@@ -765,3 +775,5 @@ install(
         "${CMAKE_CURRENT_BINARY_DIR}/PageCoreConfigVersion.cmake"
     DESTINATION "${PAGECORE_INSTALL_CMAKEDIR}"
 )
+
+endif() # PAGECORE_INSTALL

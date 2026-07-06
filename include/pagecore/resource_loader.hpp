@@ -5,6 +5,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -90,6 +91,13 @@ struct ResourcePolicy {
     // When non-empty, confine file:// reads to this directory (symlink escapes
     // are rejected after canonicalization).
     std::string file_root{};
+    // Proxy for network transfers. std::nullopt (the default) disables proxying
+    // AND ignores the ambient http_proxy/HTTPS_PROXY/ALL_PROXY environment
+    // variables: an env proxy would relay to the real target itself, hiding it
+    // from the connect-time SSRF socket guard (which only sees the proxy's
+    // address) and silently defeating block_private_hosts. Set an explicit value
+    // (including "" to force-disable) to opt back into a specific proxy.
+    std::optional<std::string> proxy{};
 };
 
 class ResourceError final : public std::runtime_error {
@@ -132,11 +140,17 @@ public:
         const std::vector<ResourceRequest>& requests,
         BatchErrorMode mode = BatchErrorMode::FailFast) override;
 
+    // policy() returns a reference for configuration before loading starts; it is
+    // not synchronized against a concurrent set_policy. In-flight load()/load_all()
+    // calls are safe against set_policy: each takes a private snapshot up front.
     const ResourcePolicy& policy() const noexcept;
     void set_policy(ResourcePolicy policy);
 
 private:
+    ResourcePolicy snapshot_policy() const;
+
     std::string user_agent_;
+    mutable std::mutex policy_mutex_;
     ResourcePolicy policy_;
     // Opaque libcurl share handle (connection/DNS/TLS-session reuse) plus its
     // lock mutexes. Type-erased so the public header stays curl-free; shared so
@@ -176,6 +190,9 @@ public:
     std::size_t size() const noexcept;
 
 private:
+    // Promote key to the most-recently-used end of order_. Caller holds mutex_.
+    void touch_locked(const std::string& key);
+
     std::shared_ptr<ResourceLoader> inner_;
     std::size_t max_entries_;
     mutable std::mutex mutex_;

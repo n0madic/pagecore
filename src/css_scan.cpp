@@ -368,6 +368,40 @@ void collect_css_attribute_selectors(std::string_view css, CssAttributeSelectorU
             }
             continue;
         }
+        // CSS functions such as content:attr(data-x) read an attribute's value
+        // directly, not through a selector. litehtml re-reads it on every layout,
+        // so the attribute must be treated as layout-sensitive too — otherwise a
+        // dataset write that only changes generated content is dropped by the
+        // service-attribute fast path and a stale render is served.
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+            // A function name is [A-Za-z-] only; do NOT consume ':' here (that is a
+            // valid attribute-name char), or "content:attr" would read as one token.
+            const std::size_t id_start = i;
+            while (i < n
+                && (std::isalpha(static_cast<unsigned char>(css[i])) || css[i] == '-')) {
+                ++i;
+            }
+            const std::string_view ident = css.substr(id_start, i - id_start);
+            std::size_t j = i;
+            while (j < n && std::isspace(static_cast<unsigned char>(css[j]))) {
+                ++j;
+            }
+            if (j < n && css[j] == '(' && ascii_lower(ident) == "attr") {
+                std::size_t k = j + 1;
+                while (k < n && std::isspace(static_cast<unsigned char>(css[k]))) {
+                    ++k;
+                }
+                const std::size_t name_start = k;
+                while (k < n && is_css_attribute_name_char(static_cast<unsigned char>(css[k]))) {
+                    ++k;
+                }
+                if (k > name_start) {
+                    usage.names.insert(ascii_lower(css.substr(name_start, k - name_start)));
+                }
+            }
+            --i; // compensate for the outer for-loop's ++i
+            continue;
+        }
         if (ch != '[') {
             continue;
         }

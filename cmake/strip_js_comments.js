@@ -160,7 +160,23 @@ function main() {
   }
   const fs = require('fs');
   const source = fs.readFileSync(input, 'utf8');
-  fs.writeFileSync(output, stripComments(source));
+  const stripped = stripComments(source);
+
+  // The regex-vs-division heuristic above cannot be perfect; guard against it
+  // corrupting the source by re-parsing the stripped output. vm.Script only
+  // compiles (parses) — it never runs the code — so a syntax error here means the
+  // stripper broke a regex literal / string / template and the build must fail
+  // loudly instead of shipping broken JS the shim would only reject at runtime.
+  try {
+    // eslint-disable-next-line no-new
+    new (require('vm').Script)(stripped, { filename: output });
+  } catch (error) {
+    process.stderr.write(
+      'strip_js_comments produced invalid JS for ' + input + ': ' + error.message + '\n');
+    process.exit(1);
+  }
+
+  fs.writeFileSync(output, stripped);
 }
 
 main();

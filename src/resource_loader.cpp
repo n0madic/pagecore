@@ -406,33 +406,47 @@ bool is_blocked_ipv4(std::uint32_t addr)
     return false;
 }
 
+std::uint32_t load_be32(const std::uint8_t* p)
+{
+    return (static_cast<std::uint32_t>(p[0]) << 24)
+        | (static_cast<std::uint32_t>(p[1]) << 16)
+        | (static_cast<std::uint32_t>(p[2]) << 8)
+        | static_cast<std::uint32_t>(p[3]);
+}
+
+bool all_zero_bytes(const std::uint8_t* p, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        if (p[i] != 0) return false;
+    }
+    return true;
+}
+
 bool is_blocked_ipv6(const std::uint8_t* b)
 {
-    bool all_zero = true;
-    for (int i = 0; i < 16; ++i) {
-        if (b[i] != 0) { all_zero = false; break; }
-    }
-    if (all_zero) return true;                                    // ::
-    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0
-        && b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0
-        && b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0
-        && b[12] == 0 && b[13] == 0 && b[14] == 0 && b[15] == 1) {
-        return true;                                             // ::1 loopback
-    }
+    if (all_zero_bytes(b, 16)) return true;                       // ::
+    if (all_zero_bytes(b, 15) && b[15] == 1) return true;         // ::1 loopback
     if ((b[0] & 0xfe) == 0xfc) return true;                       // fc00::/7 ULA
     if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true;       // fe80::/10 link-local
     if (b[0] == 0xff) return true;                               // multicast
     // IPv4-mapped ::ffff:a.b.c.d
-    bool mapped = true;
-    for (int i = 0; i < 10; ++i) {
-        if (b[i] != 0) { mapped = false; break; }
+    if (all_zero_bytes(b, 10) && b[10] == 0xff && b[11] == 0xff) {
+        return is_blocked_ipv4(load_be32(b + 12));
     }
-    if (mapped && b[10] == 0xff && b[11] == 0xff) {
-        const std::uint32_t v4 = (static_cast<std::uint32_t>(b[12]) << 24)
-            | (static_cast<std::uint32_t>(b[13]) << 16)
-            | (static_cast<std::uint32_t>(b[14]) << 8)
-            | static_cast<std::uint32_t>(b[15]);
-        return is_blocked_ipv4(v4);
+    // IPv4-compatible ::a.b.c.d (deprecated, but the resolver still reaches the
+    // embedded v4). :: and ::1 are already handled above, so any remaining
+    // all-zero high 96 bits carry a routable embedded address.
+    if (all_zero_bytes(b, 12)) {
+        return is_blocked_ipv4(load_be32(b + 12));
+    }
+    // 6to4 2002:V4::/16 — bytes 2..5 embed the IPv4 address.
+    if (b[0] == 0x20 && b[1] == 0x02) {
+        return is_blocked_ipv4(load_be32(b + 2));
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 — bytes 12..15 embed the IPv4 address.
+    if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b
+        && all_zero_bytes(b + 4, 8)) {
+        return is_blocked_ipv4(load_be32(b + 12));
     }
     return false;
 }
@@ -518,10 +532,16 @@ std::optional<std::uint32_t> parse_numeric_ipv4(const std::string& host)
 
 // Block literal-IP and well-known-local hosts before any DNS lookup. DNS names
 // that resolve to internal addresses are caught later by the socket callback.
-bool is_blocked_literal_host(const std::string& host, const ResourcePolicy& policy)
+bool is_blocked_literal_host(const std::string& raw_host, const ResourcePolicy& policy)
 {
-    if (host.empty()) {
+    if (raw_host.empty()) {
         return false;
+    }
+    // Normalize a single trailing dot: the FQDN form ("localhost." / "127.0.0.1.")
+    // resolves identically and would otherwise slip past the checks below.
+    std::string host = raw_host;
+    if (host.size() > 1 && host.back() == '.') {
+        host.pop_back();
     }
     for (const auto& blocked : policy.blocked_hosts) {
         if (ascii_lower(blocked) == host) {
@@ -1276,6 +1296,11 @@ CurlHeaderList configure_network_handle(
     socket_context.blocked = false;
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, guarded_open_socket);
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &socket_context);
+    // Neutralize ambient proxy env vars unless a proxy is explicitly configured.
+    // A proxy resolves and connects to the real target itself, so the socket guard
+    // above only ever sees the proxy's address — an env proxy would silently defeat
+    // the SSRF guarantee (DNS-rebinding / redirect-to-internal) in proxied setups.
+    curl_easy_setopt(curl, CURLOPT_PROXY, policy.proxy ? policy.proxy->c_str() : "");
     curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_body);
@@ -1422,20 +1447,24 @@ void ensure_curl_global_init()
 
 ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
 {
-    enforce_request_policy(request, policy_);
+    // Snapshot the policy once so this transfer — including the &policy pointer
+    // handed to the connect-time socket callback — is unaffected by a concurrent
+    // set_policy.
+    const ResourcePolicy policy = snapshot_policy();
+    enforce_request_policy(request, policy);
 
     const std::string url_string(request.url);
     const std::string scheme = scheme_of(url_string);
 
     if (is_data_scheme(scheme)) {
-        return load_data_url(request, policy_);
+        return load_data_url(request, policy);
     }
 
     if (!is_network_scheme(scheme)) {
         const std::string mime_type = infer_mime_type(url_string, request.kind);
         ResourceResponse response{
             url_string,
-            read_file(url_string, policy_),
+            read_file(url_string, policy),
             200,
             mime_type,
             request.kind,
@@ -1443,7 +1472,7 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
             "OK",
             content_type_header(mime_type),
         };
-        enforce_response_policy(request, response, policy_);
+        enforce_response_policy(request, response, policy);
         return response;
     }
 
@@ -1461,10 +1490,10 @@ ResourceResponse CurlResourceLoader::load(const ResourceRequest& request)
     CurlHeaders response_headers;
     OpenSocketContext socket_context;
     CurlHeaderList headers =
-        configure_network_handle(curl.get(), request, user_agent_, policy_, share, body, response_headers, socket_context);
+        configure_network_handle(curl.get(), request, user_agent_, policy, share, body, response_headers, socket_context);
 
     const CURLcode code = curl_easy_perform(curl.get());
-    return build_network_response(curl.get(), request, policy_, body, response_headers, socket_context, code);
+    return build_network_response(curl.get(), request, policy, body, response_headers, socket_context, code);
 }
 
 std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<ResourceRequest>& requests, BatchErrorMode mode)
@@ -1484,6 +1513,10 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
     }
 
     ensure_curl_global_init();
+
+    // One snapshot for the whole batch (see load()): every handle's socket-callback
+    // &policy pointer references this stack copy, not the member.
+    const ResourcePolicy policy = snapshot_policy();
 
     const std::size_t count = requests.size();
     std::vector<ResourceResponse> responses(count);
@@ -1516,10 +1549,10 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
 
     for (std::size_t i = 0; i < count; ++i) {
         try {
-            enforce_request_policy(requests[i], policy_);
+            enforce_request_policy(requests[i], policy);
             const std::string scheme = scheme_of(requests[i].url);
             if (is_data_scheme(scheme)) {
-                responses[i] = load_data_url(requests[i], policy_);
+                responses[i] = load_data_url(requests[i], policy);
                 done[i] = true;
                 continue;
             }
@@ -1527,7 +1560,7 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
                 const std::string mime_type = infer_mime_type(requests[i].url, requests[i].kind);
                 ResourceResponse response{
                     requests[i].url,
-                    read_file(requests[i].url, policy_),
+                    read_file(requests[i].url, policy),
                     200,
                     mime_type,
                     requests[i].kind,
@@ -1535,7 +1568,7 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
                     "OK",
                     content_type_header(mime_type),
                 };
-                enforce_response_policy(requests[i], response, policy_);
+                enforce_response_policy(requests[i], response, policy);
                 responses[i] = std::move(response);
                 done[i] = true;
                 continue;
@@ -1550,7 +1583,7 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
                     handle,
                     requests[i],
                     user_agent_,
-                    policy_,
+                    policy,
                     share,
                     bodies[i],
                     response_headers[i],
@@ -1591,7 +1624,7 @@ std::vector<ResourceResponse> CurlResourceLoader::load_all(const std::vector<Res
         const CURLcode code = found == result_codes.end() ? CURLE_RECV_ERROR : found->second;
         try {
             responses[i] =
-                build_network_response(handles[i], requests[i], policy_, bodies[i], response_headers[i], contexts[i], code);
+                build_network_response(handles[i], requests[i], policy, bodies[i], response_headers[i], contexts[i], code);
         } catch (...) {
             errors[i] = std::current_exception();
         }
@@ -1623,7 +1656,14 @@ const ResourcePolicy& CurlResourceLoader::policy() const noexcept
 
 void CurlResourceLoader::set_policy(ResourcePolicy policy)
 {
+    std::lock_guard<std::mutex> lock(policy_mutex_);
     policy_ = std::move(policy);
+}
+
+ResourcePolicy CurlResourceLoader::snapshot_policy() const
+{
+    std::lock_guard<std::mutex> lock(policy_mutex_);
+    return policy_;
 }
 
 MemoryResourceLoader::MemoryResourceLoader(ResourcePolicy policy)
@@ -1697,6 +1737,15 @@ CachingResourceLoader::CachingResourceLoader(std::shared_ptr<ResourceLoader> inn
     }
 }
 
+void CachingResourceLoader::touch_locked(const std::string& key)
+{
+    auto it = std::find(order_.begin(), order_.end(), key);
+    if (it != order_.end()) {
+        order_.erase(it);
+    }
+    order_.push_back(key);
+}
+
 ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
 {
     const std::string key = cache_key_for(request);
@@ -1704,6 +1753,7 @@ ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
         std::lock_guard<std::mutex> lock(mutex_);
         auto cached = cache_.find(key);
         if (cached != cache_.end()) {
+            touch_locked(key); // LRU: a hit becomes most-recently-used.
             ResourceResponse response = cached->second;
             response.from_cache = true;
             return response;
@@ -1744,6 +1794,7 @@ std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<
             keys[i] = cache_key_for(requests[i]);
             auto cached = cache_.find(keys[i]);
             if (cached != cache_.end()) {
+                touch_locked(keys[i]); // LRU: a hit becomes most-recently-used.
                 responses[i] = cached->second;
                 responses[i].from_cache = true;
             } else {

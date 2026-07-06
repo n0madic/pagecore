@@ -668,11 +668,23 @@ struct Page::Impl {
 
     std::uint64_t computed_style_digest(NodeId node) const
     {
-        return document.layout_input_digest(
+        const std::uint64_t digest = document.layout_input_digest(
             node,
             last_render_options.viewport.width,
             last_render_options.viewport.height,
             last_render_options.viewport.device_scale_factor);
+        // layout_input_digest returns 0 to signal "no such node"; preserve it.
+        if (digest == 0) {
+            return 0;
+        }
+        // Fold the base URL: relative @import/url() in the cascade resolve against
+        // it, so the same DOM at the same viewport but a different base can yield a
+        // different computed style. The styled-document cache already keys on it.
+        std::uint64_t combined = digest;
+        const std::size_t base_hash = std::hash<std::string>{}(render_base_url(last_render_options));
+        combined ^= static_cast<std::uint64_t>(base_hash) + 0x9e3779b97f4a7c15ULL
+            + (combined << 6) + (combined >> 2);
+        return combined == 0 ? 0x9e3779b97f4a7c15ULL : combined;
     }
 
     void sync_computed_style_cache_for_forget_version()

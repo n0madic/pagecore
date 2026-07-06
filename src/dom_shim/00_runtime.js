@@ -53,18 +53,23 @@
         return exports;
       }
 
-      for (const definition of definitions) installModule(definition.name);
-      delete target.__pagecore_dom_shim_define;
-      delete target.__pagecore_dom_shim_install;
-      // Remove the raw native bridges from the page-visible global so page
-      // script cannot bypass the shim wrapper layer (e.g. host.loadResource).
-      // The modules captured ctx.bridge / ctx.host in closures during install.
+      // Remove the raw native bridges from the page-visible global so page script
+      // cannot bypass the shim wrapper layer (e.g. host.loadResource). The modules
+      // captured ctx.bridge / ctx.host in closures during install. This runs in a
+      // finally so a module throwing mid-install can never leave the bridges
+      // reachable to page script.
       try {
-        delete target.__dom;
-        delete target.__host;
-      } catch (_removeBridgeError) {
-        target.__dom = undefined;
-        target.__host = undefined;
+        for (const definition of definitions) installModule(definition.name);
+      } finally {
+        delete target.__pagecore_dom_shim_define;
+        delete target.__pagecore_dom_shim_install;
+        try {
+          delete target.__dom;
+          delete target.__host;
+        } catch (_removeBridgeError) {
+          target.__dom = undefined;
+          target.__host = undefined;
+        }
       }
       return exportsByName;
     }

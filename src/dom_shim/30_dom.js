@@ -350,15 +350,18 @@
           get previousSibling() {
             const parent = this.parentNode;
             if (!parent) return null;
-            const nodes = liveChildNodeList(parent);
-            const index = nodes.findIndex((node) => node.__id === this.__id);
+            // A node parented in a DocumentFragment/ShadowRoot has no bridge-backed
+            // parent (it isn't a Lexbor node), so walk the fragment's own childNodes
+            // array instead of liveChildNodeList(), which would call parent._liveId().
+            const nodes = this.__fragmentParent ? parent.childNodes : liveChildNodeList(parent);
+            const index = nodes.findIndex((node) => node === this || node.__id === this.__id);
             return index > 0 ? nodes[index - 1] : null;
           }
           get nextSibling() {
             const parent = this.parentNode;
             if (!parent) return null;
-            const nodes = liveChildNodeList(parent);
-            const index = nodes.findIndex((node) => node.__id === this.__id);
+            const nodes = this.__fragmentParent ? parent.childNodes : liveChildNodeList(parent);
+            const index = nodes.findIndex((node) => node === this || node.__id === this.__id);
             return index >= 0 && index + 1 < nodes.length ? nodes[index + 1] : null;
           }
           get isConnected() {
@@ -508,6 +511,10 @@
               this.removeChild(replacedChild);
               return replacedChild;
             }
+            // Detach an incoming node from a DocumentFragment/ShadowRoot first, as
+            // insertBefore/appendChild do; otherwise it stays linked in both the
+            // fragment's childNodes and the live tree.
+            if (child && child.__fragmentParent) child.__fragmentParent.removeChild(child);
             const id = bridge.replaceChild(this._liveId(), liveId(child), liveId(replacedChild));
             const result = afterMutation(wrapNode(id) || replacedChild, {
               type: 'childList',
@@ -570,7 +577,31 @@
             return isNodeWrapper(candidate) && candidate.__id === this.__id;
           }
           isEqualNode(candidate) { return this.isSameNode(candidate); }
-          normalize() {}
+          normalize() {
+            const normalizeNode = (node) => {
+              let child = node.firstChild;
+              while (child) {
+                if (child.nodeType === 3) {
+                  const next = child.nextSibling;
+                  if (child.textContent === '') {
+                    const empty = child;
+                    child = child.nextSibling;
+                    node.removeChild(empty);
+                    continue;
+                  }
+                  if (next && next.nodeType === 3) {
+                    child.textContent = child.textContent + next.textContent;
+                    node.removeChild(next);
+                    continue; // re-examine child against its new next sibling
+                  }
+                } else if (child.nodeType === 1) {
+                  normalizeNode(child);
+                }
+                child = child.nextSibling;
+              }
+            };
+            normalizeNode(this);
+          }
         }
 
         class Text extends Node {
@@ -2845,6 +2876,10 @@
             return ['submit', 'reset', 'button'].includes(type) ? type : 'submit';
           }
           set type(value) { this.setAttribute('type', String(value)); }
+          // The value IDL attribute reflects the content attribute, so a
+          // <button name=x value=y> submitter contributes x=y to form submission.
+          get value() { return this.getAttribute('value') || ''; }
+          set value(value) { this.setAttribute('value', String(value)); }
           get willValidate() { return false; }
         }
         class HTMLCanvasElement extends HTMLElement {

@@ -294,7 +294,12 @@
             this._entries = out;
             this._notify();
           }
-          sort() { this._entries.sort((left, right) => left[0].localeCompare(right[0])); this._notify(); }
+          sort() {
+            // WHATWG sorts by UTF-16 code units (stably), not locale collation, so
+            // canonical query strings (OAuth1/SigV4 signing) come out consistent.
+            this._entries.sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
+            this._notify();
+          }
           forEach(callback, thisArg = undefined) {
             for (const [name, value] of this._entries) callback.call(thisArg, value, name, this);
           }

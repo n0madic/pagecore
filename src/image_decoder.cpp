@@ -1838,6 +1838,13 @@ std::shared_ptr<const DecodedImage> decode_svg_rgba(std::string_view bytes)
         const SvgStyle style = style_from_attributes(style_stack.back(), tag.attributes);
         if (container) {
             if (!tag.self_closing) {
+                // Bound nesting depth: unbounded <g> nesting would grow style_stack,
+                // pushed_context, and the cairo save-stack proportionally to input
+                // size (a memory/time DoS). Stop parsing beyond the cap.
+                constexpr std::size_t kMaxSvgNestingDepth = 1024;
+                if (style_stack.size() >= kMaxSvgNestingDepth) {
+                    break;
+                }
                 bool saved = false;
                 if (auto transform = attr(tag.attributes, "transform")) {
                     cairo_save(cr.get());

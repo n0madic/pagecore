@@ -618,6 +618,57 @@ void test_timers_and_events()
     require(!console_logs[2].second.empty(), "timer callback exception log should include stack details");
 }
 
+void test_dom_shim_spec_regressions()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+<form id="f"><button id="btn" name="action" value="save">Go</button></form>
+<script>
+  // normalize(): merge adjacent text nodes, drop empties.
+  var d = document.createElement('div');
+  d.appendChild(document.createTextNode('foo'));
+  d.appendChild(document.createTextNode(''));
+  d.appendChild(document.createTextNode('bar'));
+  document.body.appendChild(d);
+  d.normalize();
+  document.body.setAttribute('data-normalize', d.childNodes.length + ':' + d.textContent);
+
+  // FormData must include the submitter button's value.
+  var fd = new FormData(document.getElementById('f'), document.getElementById('btn'));
+  document.body.setAttribute('data-fd', String(fd.get('action')));
+
+  // Events on a non-Node EventTarget must not propagate to window.
+  var reached = false;
+  window.addEventListener('custom-et', function(){ reached = true; });
+  var et = new EventTarget();
+  et.dispatchEvent(new CustomEvent('custom-et', { bubbles: true }));
+  document.body.setAttribute('data-et', reached ? 'leaked' : 'isolated');
+
+  // replaceChild must detach a fragment-parented incoming node from its fragment.
+  var frag = document.createDocumentFragment();
+  var incoming = document.createElement('span');
+  frag.appendChild(incoming);
+  var box = document.createElement('div');
+  var old = document.createElement('p');
+  box.appendChild(old);
+  document.body.appendChild(box);
+  box.replaceChild(incoming, old);
+  document.body.setAttribute('data-frag', String(frag.childNodes.length));
+</script>
+</body></html>
+)HTML");
+
+    require(page.outer_html("body[data-normalize='1:foobar']").has_value(),
+            "normalize() must merge adjacent text nodes and drop empty ones");
+    require(page.outer_html("body[data-fd='save']").has_value(),
+            "FormData must include the submitter button's value (button.value reflects its attribute)");
+    require(page.outer_html("body[data-et='isolated']").has_value(),
+            "an event on a non-Node EventTarget must not propagate to window");
+    require(page.outer_html("body[data-frag='0']").has_value(),
+            "replaceChild must detach a fragment-parented incoming node from its fragment");
+}
+
 void test_js_console_log_callback()
 {
     std::vector<std::pair<std::string, std::string>> console_logs;
@@ -641,6 +692,65 @@ void test_js_console_log_callback()
     require(console_logs[0].second == "hello 42", "console callback should join multiple arguments");
     require(console_logs[1].first == "warn", "console.warn should preserve severity");
     require(console_logs[1].second.empty(), "console callback should allow empty messages");
+}
+
+void test_unhandled_promise_rejection_is_logged()
+{
+    // Regression: an unhandled rejection (here from a top-level Promise.reject) used
+    // to vanish silently for lack of a host promise-rejection tracker, unlike a
+    // classic-script throw which is logged.
+    std::vector<std::pair<std::string, std::string>> console_logs;
+    pagecore::LoadOptions options;
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console_logs.emplace_back(severity, message);
+    };
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    Promise.reject(new Error('boom-rejection'));
+  </script>
+</body></html>
+)HTML");
+    page.run_until_idle();
+
+    const bool found = std::any_of(console_logs.begin(), console_logs.end(),
+        [](const auto& entry) {
+            return entry.first == "error" && entry.second.find("boom-rejection") != std::string::npos;
+        });
+    require(found, "an unhandled promise rejection must be surfaced as a console error");
+}
+
+void test_same_origin_policy_fails_closed_without_document_origin()
+{
+    // Regression: SameOriginOnly used to fail OPEN when the document had no network
+    // origin (empty/data:/file: base) — network_origin("") is empty, so the guard
+    // silently degraded to Allow and let a script fetch any cross-origin host.
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add("https://other.test/x", "x", "text/plain");
+
+    pagecore::LoadOptions options;
+    options.js_resource_load_policy = pagecore::JsResourceLoadPolicy::SameOriginOnly;
+
+    pagecore::Page page(options);
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('https://other.test/x')
+      .then(() => document.body.setAttribute('data-fetch','ok'))
+      .catch(() => document.body.setAttribute('data-fetch','blocked'));
+  </script>
+</body></html>
+)HTML");
+    page.run_until_idle();
+
+    require(!page.outer_html("body[data-fetch='ok']").has_value(),
+            "SameOriginOnly must not allow a cross-origin fetch from a document with no "
+            "network origin (fail closed)");
+    require(find_request(*loader, "https://other.test/x") == nullptr,
+            "the blocked cross-origin request must never reach the resource loader");
 }
 
 void test_inner_html_fragment_parsing()
@@ -2984,6 +3094,9 @@ void test_cookie_public_suffix_and_injection_rejected()
     document.cookie = '__Secure-bad=1';
     document.cookie = 'maxwins=1; Max-Age=0; Expires=Tue, 01 Jan 2030 00:00:00 GMT';
     document.cookie = 'maxkeep=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=100000';
+    document.cookie = 'maxbig=1; Max-Age=10000000000';
+    document.cookie = '__HoSt-ci=1; Path=/; Secure';
+    document.cookie = '__SeCuRe-ci=1';
     var c = document.cookie;
     var mark = function(name, needle){ document.body.setAttribute('data-' + name, c.indexOf(needle) >= 0 ? '1' : '0'); };
     mark('good', 'good=1');
@@ -2996,6 +3109,9 @@ void test_cookie_public_suffix_and_injection_rejected()
     mark('securebad', '__Secure-bad=1');
     mark('maxwins', 'maxwins=1');
     mark('maxkeep', 'maxkeep=1');
+    mark('maxbig', 'maxbig=1');
+    mark('hostci', '__HoSt-ci=1');
+    mark('secureci', '__SeCuRe-ci=1');
   </script>
 </body></html>
 )HTML", "https://shop.example/start/index.html");
@@ -3013,6 +3129,37 @@ void test_cookie_public_suffix_and_injection_rejected()
     require(marked("securebad", "0"), "__Secure- cookie without the Secure attribute must be rejected");
     require(marked("maxwins", "0"), "Max-Age=0 must take precedence over a later future Expires");
     require(marked("maxkeep", "1"), "Max-Age must take precedence over an earlier past Expires");
+    require(marked("maxbig", "1"),
+            "a huge Max-Age must be clamped, not overflow the clock and wrap the expiry into the past");
+    require(marked("hostci", "1"),
+            "the __Host- prefix must be matched case-insensitively (accepted when its rules are met)");
+    require(marked("secureci", "0"),
+            "the __Secure- prefix must be matched case-insensitively (rejected without Secure)");
+}
+
+void test_cookie_domain_rejected_on_ip_host()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    document.cookie = 'ipdomain=1; Domain=2.3.4';
+    document.cookie = 'iphost=1';
+    var c = document.cookie;
+    var mark = function(name, needle){ document.body.setAttribute('data-' + name, c.indexOf(needle) >= 0 ? '1' : '0'); };
+    mark('ipdomain', 'ipdomain=1');
+    mark('iphost', 'iphost=1');
+  </script>
+</body></html>
+)HTML", "http://1.2.3.4/start/index.html");
+
+    const auto marked = [&](const char* name, const char* value) {
+        return page.outer_html(std::string("body[data-") + name + "='" + value + "']").has_value();
+    };
+    require(marked("iphost", "1"), "a host-only cookie on an IP-literal host should be accepted");
+    require(marked("ipdomain", "0"),
+            "a Domain attribute that is not the IP host itself must be rejected so the cookie "
+            "cannot leak across unrelated IP hosts (RFC 6265 §5.3)");
 }
 
 void test_public_suffix_list_covers_modern_hosting_platforms()
@@ -3787,6 +3934,32 @@ void test_resource_request_kind_and_cache()
     require(raw_loader->requests.size() == 1, "cache hit should not call inner loader again");
 }
 
+void test_caching_resource_loader_is_lru()
+{
+    auto inner = std::make_shared<RecordingResourceLoader>();
+    inner->add("https://example.test/a", "A", "text/plain");
+    inner->add("https://example.test/b", "B", "text/plain");
+    inner->add("https://example.test/c", "C", "text/plain");
+
+    pagecore::CachingResourceLoader cache(inner, 2);
+    const auto get = [&](const char* url) {
+        return cache.load(pagecore::ResourceRequest{url, pagecore::ResourceKind::Other});
+    };
+
+    (void) get("https://example.test/a"); // miss -> {a}
+    (void) get("https://example.test/b"); // miss -> {a, b}
+    (void) get("https://example.test/a"); // hit  -> a becomes most-recently-used
+    (void) get("https://example.test/c"); // miss -> evicts least-recently-used (b), keeps {a, c}
+
+    const auto a_again = get("https://example.test/a");
+    require(a_again.from_cache,
+            "a recently-used entry must survive eviction (LRU, not FIFO): 'a' was touched after insertion");
+
+    const auto b_again = get("https://example.test/b");
+    require(!b_again.from_cache,
+            "the least-recently-used entry ('b') must have been the one evicted when 'c' was inserted");
+}
+
 void test_resource_url_resolution_normalizes_dot_segments()
 {
     require(
@@ -3922,6 +4095,13 @@ void test_resource_policy_blocks_private_hosts()
         "http://0x7f000001/",     // hex 127.0.0.1
         "http://0177.0.0.1/",     // octal-leading 127.0.0.1
         "http://127.1/",          // short form 127.0.0.1
+        // FQDN trailing-dot forms resolve identically and must not slip past.
+        "http://localhost./x",
+        "http://127.0.0.1./x",
+        // IPv6 encodings that embed a private/loopback IPv4 address.
+        "http://[::127.0.0.1]/",       // IPv4-compatible ::127.0.0.1
+        "http://[2002:7f00:1::]/",     // 6to4 embedding 127.0.0.1
+        "http://[64:ff9b::7f00:1]/",   // NAT64 well-known prefix embedding 127.0.0.1
     };
     for (const char* url : blocked_urls) {
         require_resource_error(
@@ -4112,6 +4292,15 @@ void test_curl_loader_preserves_set_cookie_headers_across_redirects()
     });
 
     try {
+        // block_private_hosts is disabled here only so the loopback fixture is
+        // reachable at all. The connect-time socket guard's redirect-to-internal /
+        // DNS-rebinding defense cannot be exercised hermetically over loopback: the
+        // first hop would itself have to be 127.0.0.1 (rejected by the literal
+        // pre-flight before any redirect) and CI has no non-private first hop that
+        // could 302 to an internal address. The literal-IP arm of that guard is
+        // covered directly by test_resource_policy_blocks_private_hosts (including
+        // IPv6-embedded and trailing-dot forms); the post-DNS redirect arm relies on
+        // the same is_blocked_sockaddr check and is not asserted here.
         pagecore::ResourcePolicy policy;
         policy.block_private_hosts = false;
         pagecore::CurlResourceLoader loader("pagecore-test", policy);
@@ -5273,6 +5462,52 @@ void test_deep_dom_traversal_is_iterative()
     doc.set_inner_html(root, "<span>x</span>");
     require(doc.query_selector(root, "span") != pagecore::kInvalidNodeId,
             "set_inner_html over a deep subtree must not overflow the native stack");
+}
+
+void test_set_inner_html_forgets_old_subtree_ids()
+{
+    // Regression: set_inner_html must read/forget the old subtree BEFORE Lexbor
+    // destroys it. Reading those raw pointers afterwards is a use-after-free, and
+    // forgetting them by the freed pointer erased the wrong id (or none), leaving
+    // the old ids dangling in id_to_node -> has_node(old) wrongly true -> the next
+    // require_node(old) handed back a freed node (second UAF).
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='host'>"
+              "<span id='old'><b id='deep'>x</b></span>"
+              "<style id='sheet'>.a{color:red}</style>"
+              "</div></body></html>");
+
+    const pagecore::NodeId host = doc.get_element_by_id("host");
+    const pagecore::NodeId old_span = doc.get_element_by_id("old");
+    const pagecore::NodeId deep = doc.get_element_by_id("deep");
+    const pagecore::NodeId sheet = doc.get_element_by_id("sheet");
+    require(host != pagecore::kInvalidNodeId, "fixture #host must resolve");
+    require(doc.has_node(old_span) && doc.has_node(deep) && doc.has_node(sheet),
+            "old subtree ids must be live before the innerHTML replacement");
+
+    const std::uint64_t forget_before = doc.forget_version();
+
+    doc.set_inner_html(host, "<p id='fresh'>new</p>");
+
+    require(!doc.has_node(old_span), "old child id must be forgotten after innerHTML replace");
+    require(!doc.has_node(deep), "deep descendant id must be forgotten after innerHTML replace");
+    require(!doc.has_node(sheet), "old <style> child id must be forgotten after innerHTML replace");
+    require(doc.forget_version() > forget_before,
+            "forgetting invalidated ids must bump forget_version");
+
+    require(doc.has_node(host), "the host element id must survive its own innerHTML write");
+    const pagecore::NodeId fresh = doc.get_element_by_id("fresh");
+    require(fresh != pagecore::kInvalidNodeId && doc.has_node(fresh),
+            "new innerHTML content must be addressable");
+    require(doc.text_content(host) == "new", "host text must reflect the new innerHTML");
+
+    // Reuse the freed memory with fresh allocations; a corrupted id map would now
+    // mis-resolve the stale ids.
+    for (int i = 0; i < 64; ++i) {
+        (void) doc.create_element("div");
+    }
+    require(!doc.has_node(old_span) && !doc.has_node(deep) && !doc.has_node(sheet),
+            "stale ids must stay forgotten even after new allocations reuse freed memory");
 }
 
 void test_deep_clone_assigns_fresh_subtree_ids()
@@ -7037,6 +7272,31 @@ void test_page_render_uses_cairo_raster_backend()
     require(image_has_non_solid_text_pixel(image), "Page::render should rasterize real anti-aliased text");
 }
 
+void test_tiny_tiled_background_does_not_explode()
+{
+    // Regression: a 1px background tile over a large element would otherwise force
+    // up to ~canvas-pixels cairo fills (a CPU DoS). The tile-count cap covers the
+    // area with a single stretched draw instead, so the render must still complete
+    // and return a valid image.
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    loader->add("https://example.test/dot.png", png_body(pagecore::Color{10, 20, 30, 255}), "image/png");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div style="width:3000px;height:3000px;background-image:url(/dot.png);background-size:1px 1px;background-repeat:repeat"></div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{3000, 3000, 1.0f};
+    const auto image = page.render(options);
+    require(image.width == 3000 && image.height == 3000,
+            "a pathological 1px repeating background must still render a valid image "
+            "(the tile-count cap prevents a CPU DoS)");
+}
+
 void test_page_render_uses_web_font_formats()
 {
     const auto fallback_image = [] {
@@ -8339,7 +8599,11 @@ public:
     void layout() override
     {
         ++(*layout_calls_);
-        std::this_thread::sleep_for(std::chrono::milliseconds(65));
+        // Two forced layouts must exceed the 100ms cumulative geometry budget that
+        // trips bounded mode (2 x 80ms = 160ms), while one op stays well under the
+        // 250ms single-op "expensive" threshold. This is a must-exceed lower bound,
+        // so a contended scheduler only increases the margin, never shrinks it.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
         laid_out_ = true;
         display_list_.viewport = viewport_;
         display_list_.content_width = viewport_.width;
@@ -8467,7 +8731,11 @@ public:
     void compute_styles_only() override
     {
         ++(*compute_calls_);
-        std::this_thread::sleep_for(std::chrono::milliseconds(65));
+        // Two forced layouts must exceed the 100ms cumulative geometry budget that
+        // trips bounded mode (2 x 80ms = 160ms), while one op stays well under the
+        // 250ms single-op "expensive" threshold. This is a must-exceed lower bound,
+        // so a contended scheduler only increases the margin, never shrinks it.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
     }
     std::optional<std::string> computed_style_property(
         std::string_view,
@@ -9423,6 +9691,63 @@ std::string page_display_list_json_for_layout_input(pagecore::LayoutTreeInput in
     return pagecore::display_list_to_json(page.display_list(options));
 }
 
+void test_attr_function_makes_data_attribute_layout_sensitive()
+{
+    // Regression: content:attr(data-*) reads an attribute directly, outside any
+    // selector. Writing that attribute must invalidate the memoized display list;
+    // otherwise the service-attribute fast path drops the mutation and the cached
+    // (stale) render is returned.
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>.badge::before{content:attr(data-count)}</style></head>
+<body><span id="b" class="badge" data-count="3">x</span></body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{640, 480, 1.0f};
+
+    const std::string before = pagecore::display_list_to_json(page.display_list(options));
+    require(before.find("\"text\":\"3\"") != std::string::npos,
+            "generated content from content:attr() should render the initial attribute value");
+
+    page.eval("document.getElementById('b').setAttribute('data-count','7');");
+    const std::string after = pagecore::display_list_to_json(page.display_list(options));
+
+    require(before != after,
+            "changing an attribute read by content:attr() must invalidate the memoized render "
+            "(not serve a stale display list)");
+    require(after.find("\"text\":\"7\"") != std::string::npos,
+            "the updated content:attr() value must appear in the re-rendered display list");
+}
+
+void test_cdata_layout_parity_direct_vs_serialized()
+{
+    // A CDATA section in foreign (SVG) content must be handled identically by the
+    // direct-DOM and serialized layout-input paths, so neither leaks CDATA text
+    // into visible layout that the other omits.
+    const char* html = R"HTML(<!DOCTYPE html>
+<html><body>
+<svg width="100" height="40"><text x="0" y="20"><![CDATA[cdata-payload]]></text></svg>
+<p>visible</p>
+</body></html>)HTML";
+
+    const auto render = [&](pagecore::LayoutTreeInput input) {
+        pagecore::LoadOptions opts;
+        opts.layout_tree_input = input;
+        opts.enable_js = false;
+        pagecore::Page page(opts);
+        page.load_html(html, "https://example.test/");
+        pagecore::RenderOptions ro;
+        ro.viewport = pagecore::Viewport{200, 100, 1.0f};
+        return pagecore::display_list_to_json(page.display_list(ro));
+    };
+
+    require(render(pagecore::LayoutTreeInput::DirectDom)
+                == render(pagecore::LayoutTreeInput::SerializedHtml),
+            "CDATA sections must produce an identical display list on the direct-DOM "
+            "and serialized layout-input paths");
+}
+
 void test_page_direct_dom_layout_display_list_parity()
 {
     const std::string serialized =
@@ -10126,6 +10451,9 @@ int main()
         test_inline_script_mutates_lexbor_dom();
         test_timers_and_events();
         test_js_console_log_callback();
+        test_dom_shim_spec_regressions();
+        test_unhandled_promise_rejection_is_logged();
+        test_same_origin_policy_fails_closed_without_document_origin();
         test_inner_html_fragment_parsing();
         test_tree_operations_and_clone();
         test_dataset_attributes_and_cached_facades();
@@ -10183,6 +10511,7 @@ int main()
         test_css_scan_default_computed_style();
         test_page_activity_tracker_counters_and_stability();
         test_cookie_public_suffix_and_injection_rejected();
+        test_cookie_domain_rejected_on_ip_host();
         test_public_suffix_list_covers_modern_hosting_platforms();
         test_cookie_secure_not_overwritten_by_insecure();
         test_cookie_jar_growth_is_bounded();
@@ -10202,6 +10531,7 @@ int main()
         test_dynamic_script_insertion_executes_classic_scripts();
         test_dynamic_module_scripts_are_not_executed();
         test_resource_request_kind_and_cache();
+        test_caching_resource_loader_is_lru();
         test_resource_url_resolution_normalizes_dot_segments();
         test_resource_loader_decodes_data_urls();
         test_resource_policy_errors();
@@ -10257,6 +10587,7 @@ int main()
         test_cairo_raster_and_io_error_paths();
 #endif
         test_deep_dom_traversal_is_iterative();
+        test_set_inner_html_forgets_old_subtree_ids();
         test_deep_clone_assigns_fresh_subtree_ids();
         test_dom_layout_mutation_version_ignores_service_attributes();
         test_dom_layout_mutation_journal_records_inline_style();
@@ -10305,6 +10636,7 @@ int main()
         test_render_resource_cache_persists_across_rebuilds();
         test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();
+        test_tiny_tiled_background_does_not_explode();
         test_page_render_uses_web_font_formats();
         test_page_render_decodes_and_draws_png_images();
         test_page_render_decodes_and_draws_data_url_images();
@@ -10364,6 +10696,8 @@ int main()
         test_layout_engine_inline_style_patch_inherited_properties();
         test_layout_engine_load_dom_drops_refused_style_child();
         test_layout_engine_inline_style_patch_display_none_target_refuses();
+        test_attr_function_makes_data_attribute_layout_sensitive();
+        test_cdata_layout_parity_direct_vs_serialized();
         test_page_direct_dom_layout_display_list_parity();
         test_page_direct_dom_noscript_and_enable_js();
         test_page_direct_dom_absolute_percent_second_pass();

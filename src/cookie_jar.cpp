@@ -545,8 +545,18 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
             while (!domain.empty() && domain.front() == '.') {
                 domain.erase(domain.begin());
             }
+            const bool host_is_ip = is_ipv4_address(parsed.host)
+                || (!parsed.host.empty() && parsed.host.front() == '[');
             if (domain.empty()) {
                 reject_cookie = true;
+            } else if (host_is_ip) {
+                // RFC 6265 §5.3: when the request host is an IP literal, a Domain
+                // attribute is only acceptable if it equals the host (and the
+                // cookie stays host-only). Otherwise Domain=2.3.4 on host 1.2.3.4
+                // would scope the cookie across unrelated IP hosts.
+                if (domain != parsed.host) {
+                    reject_cookie = true;
+                }
             } else if (is_public_suffix(domain)) {
                 // A cookie may only be scoped to a public suffix when that suffix is
                 // exactly the request host (staying host-only); otherwise it would be
@@ -574,7 +584,12 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
             expires_attr = parse_cookie_time(value);
         } else if (name == "max-age") {
             try {
-                max_age_attr = std::stoll(value);
+                long long parsed_age = std::stoll(value);
+                // Clamp to RFC 6265bis's 400-day maximum (matching browsers) so the
+                // subsequent now() + seconds(age) cannot overflow the clock duration
+                // and wrap a long-lived cookie into the past.
+                constexpr long long kMaxCookieAgeSeconds = 400LL * 24 * 60 * 60;
+                max_age_attr = std::clamp(parsed_age, -kMaxCookieAgeSeconds, kMaxCookieAgeSeconds);
             } catch (...) {
             }
         } else if (name == "samesite") {
@@ -592,10 +607,12 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
     }
 
     // Enforce the __Secure-/__Host- name prefixes servers rely on for integrity.
-    if (cookie.name.rfind("__Secure-", 0) == 0 && (!cookie.secure || !parsed.secure)) {
+    // Prefix matching is ASCII case-insensitive per RFC 6265bis.
+    const std::string lower_name = ascii_lower(cookie.name);
+    if (lower_name.rfind("__secure-", 0) == 0 && (!cookie.secure || !parsed.secure)) {
         return;
     }
-    if (cookie.name.rfind("__Host-", 0) == 0
+    if (lower_name.rfind("__host-", 0) == 0
         && (!cookie.secure || !parsed.secure || !cookie.host_only || cookie.path != "/")) {
         return;
     }

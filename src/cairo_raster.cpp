@@ -341,7 +341,10 @@ PangoWeight pango_weight(int weight)
 
 int scaled_font_pango_size(const Font& font, float scale)
 {
-    const double device_px = std::max(1.0, static_cast<double>(font.size_px) * scale);
+    // std::max/min propagate NaN, so a NaN font-size would reach static_cast<int>
+    // (undefined behavior). Fall back to 1px for any non-finite size.
+    const double raw = static_cast<double>(font.size_px) * scale;
+    const double device_px = std::isfinite(raw) ? std::max(1.0, raw) : 1.0;
     // Clamp before multiplying by PANGO_SCALE so a pathological font-size cannot
     // overflow the int Pango size (signed overflow is UB and yields garbage sizes).
     const double max_device_px = static_cast<double>(std::numeric_limits<int>::max() / PANGO_SCALE);
@@ -693,9 +696,29 @@ void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale, R
         cairo_restore(cr);
     };
 
-    for (int y = 0; y < count_y; ++y) {
-        for (int x = 0; x < count_x; ++x) {
-            draw_tile(start_x + x * tile.width, start_y + y * tile.height);
+    // Cap the total number of tile fills. The area is already clamped to the
+    // canvas, but a pathological tiny tile (e.g. background-size:1px) still yields
+    // up to ~canvas-pixels fills — tens of millions of cairo save/fill/restore
+    // cycles, a CPU DoS. Beyond the cap, cover the area with a single stretched
+    // draw instead; visually near-identical for such a fine repeat, but O(1) work.
+    constexpr long long kMaxTiles = 1LL << 20; // ~1M fills
+    const long long total_tiles = static_cast<long long>(count_x) * static_cast<long long>(count_y);
+    if (total_tiles > kMaxTiles) {
+        cairo_save(cr);
+        cairo_translate(cr, area.x, area.y);
+        cairo_scale(
+            cr,
+            static_cast<double>(area.width) / static_cast<double>(image.width),
+            static_cast<double>(area.height) / static_cast<double>(image.height));
+        cairo_set_source_surface(cr, surface, 0, 0);
+        cairo_rectangle(cr, 0, 0, image.width, image.height);
+        cairo_fill(cr);
+        cairo_restore(cr);
+    } else {
+        for (int y = 0; y < count_y; ++y) {
+            for (int x = 0; x < count_x; ++x) {
+                draw_tile(start_x + x * tile.width, start_y + y * tile.height);
+            }
         }
     }
     cairo_restore(cr);

@@ -350,7 +350,10 @@ public:
     {
         auto* handle = new FontHandle;
         handle->font.family = descr.family.empty() ? get_default_font_name() : descr.family;
-        handle->font.size_px = std::max(1.0f, px(descr.size));
+        // std::max propagates NaN, which would later reach static_cast<int> (UB).
+        // Fall back to 1px for any non-finite computed size.
+        const float raw_size = px(descr.size);
+        handle->font.size_px = std::isfinite(raw_size) ? std::max(1.0f, raw_size) : 1.0f;
         handle->font.weight = descr.weight;
         handle->font.italic = descr.style == litehtml::font_style_italic;
         handle->description = pango_font_description_new();

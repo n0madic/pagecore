@@ -507,23 +507,38 @@ struct FontEnvironment {
         , config(create_font_config())
         , font_map(create_font_map())
     {
-        if (config == nullptr || font_map == nullptr || !PANGO_IS_FC_FONT_MAP(font_map)) {
-            throw std::runtime_error("failed to create font environment");
-        }
+        // The destructor does not run for a throwing constructor, so any failure
+        // after the raw FcConfig/PangoFontMap/temp_dir are acquired must release
+        // them here or they leak (memory + an on-disk temp directory).
+        try {
+            if (config == nullptr || font_map == nullptr || !PANGO_IS_FC_FONT_MAP(font_map)) {
+                throw std::runtime_error("failed to create font environment");
+            }
 
-        const std::filesystem::path cache_dir = temp_dir / "cache";
-        std::filesystem::create_directory(cache_dir);
-        const std::string xml =
-            "<?xml version=\"1.0\"?>"
-            "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">"
-            "<fontconfig>"
-            "<include ignore_missing=\"yes\">fonts.conf</include>"
-            "<cachedir>" + cache_dir.string() + "</cachedir>"
-            "</fontconfig>";
-        FcConfigParseAndLoadFromMemory(config, reinterpret_cast<const FcChar8*>(xml.c_str()), FcFalse);
-        FcConfigPreferAppFont(config, FcTrue);
-        pango_fc_font_map_set_config(PANGO_FC_FONT_MAP(font_map), config);
-        pango_fc_font_map_set_default_substitute(PANGO_FC_FONT_MAP(font_map), font_substitute, &aliases, nullptr);
+            const std::filesystem::path cache_dir = temp_dir / "cache";
+            std::filesystem::create_directory(cache_dir);
+            const std::string xml =
+                "<?xml version=\"1.0\"?>"
+                "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">"
+                "<fontconfig>"
+                "<include ignore_missing=\"yes\">fonts.conf</include>"
+                "<cachedir>" + cache_dir.string() + "</cachedir>"
+                "</fontconfig>";
+            FcConfigParseAndLoadFromMemory(config, reinterpret_cast<const FcChar8*>(xml.c_str()), FcFalse);
+            FcConfigPreferAppFont(config, FcTrue);
+            pango_fc_font_map_set_config(PANGO_FC_FONT_MAP(font_map), config);
+            pango_fc_font_map_set_default_substitute(PANGO_FC_FONT_MAP(font_map), font_substitute, &aliases, nullptr);
+        } catch (...) {
+            if (font_map != nullptr) {
+                g_object_unref(font_map);
+            }
+            if (config != nullptr) {
+                FcConfigDestroy(config);
+            }
+            std::error_code ignored;
+            std::filesystem::remove_all(temp_dir, ignored);
+            throw;
+        }
     }
 
     FontEnvironment(const FontEnvironment&) = delete;
