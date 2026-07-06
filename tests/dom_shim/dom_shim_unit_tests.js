@@ -585,6 +585,53 @@ test('dom TreeWalker and NodeIterator traverse with filters', () => {
   assert.strictEqual(iterator.nextNode(), null);
 });
 
+test('dom compareDocumentPosition reports containment and document order', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const CONTAINED_BY = 16;
+  const CONTAINS = 8;
+  const FOLLOWING = 4;
+  const PRECEDING = 2;
+  const DISCONNECTED = 1;
+
+  const section = document.createElement('section');
+  const first = document.createElement('p');
+  const second = document.createElement('span');
+  const child = document.createElement('em');
+  first.appendChild(child);
+  section.appendChild(first);
+  section.appendChild(second);
+  document.body.appendChild(section);
+
+  assert.strictEqual(first.compareDocumentPosition(first), 0);
+  // The Angular sanitizer's DOM-clobbering guard relies on this exact bit.
+  assert.strictEqual(first.compareDocumentPosition(child) & CONTAINED_BY, CONTAINED_BY);
+  assert.strictEqual(child.compareDocumentPosition(first) & CONTAINS, CONTAINS);
+  assert.strictEqual(child.compareDocumentPosition(first) & PRECEDING, PRECEDING);
+  assert.strictEqual(first.compareDocumentPosition(second) & FOLLOWING, FOLLOWING);
+  assert.strictEqual(second.compareDocumentPosition(first) & PRECEDING, PRECEDING);
+
+  const detached = document.createElement('div');
+  assert.strictEqual(section.compareDocumentPosition(detached) & DISCONNECTED, DISCONNECTED);
+});
+
+test('dom setAttributeNS folds namespace into a qualified name', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const xlink = 'http://www.w3.org/1999/xlink';
+  const use = document.createElement('use');
+
+  // Must not throw (the missing method previously crashed Angular's renderer).
+  use.setAttributeNS(xlink, 'xlink:href', '#icon-circle-right');
+  assert.strictEqual(use.getAttribute('xlink:href'), '#icon-circle-right');
+  assert.strictEqual(use.getAttributeNS(xlink, 'href'), '#icon-circle-right');
+  assert.strictEqual(use.hasAttributeNS(xlink, 'href'), true);
+
+  use.removeAttributeNS(xlink, 'href');
+  assert.strictEqual(use.getAttribute('xlink:href'), null);
+  assert.strictEqual(use.hasAttributeNS(xlink, 'href'), false);
+});
+
 test('dom form controls compute validity and dispatch invalid events', () => {
   const { dom } = installDomEnvironment();
   const { document } = dom;

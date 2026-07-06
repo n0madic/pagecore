@@ -565,6 +565,54 @@
             return bridge.contains(this.__id, candidate.__id);
           }
 
+          // Spec bit values (also mirrored onto Node/Node.prototype in the
+          // install step so page scripts can read Node.DOCUMENT_POSITION_*).
+          compareDocumentPosition(other) {
+            const DISCONNECTED = 1;
+            const PRECEDING = 2;
+            const FOLLOWING = 4;
+            const CONTAINS = 8;
+            const CONTAINED_BY = 16;
+            const IMPLEMENTATION_SPECIFIC = 32;
+            if (other == null || !isNodeWrapper(other)) {
+              return DISCONNECTED | IMPLEMENTATION_SPECIFIC | PRECEDING;
+            }
+            if (this === other || this.__id === other.__id) return 0;
+
+            const chainToRoot = (node) => {
+              const chain = [];
+              for (let current = node; current; current = current.parentNode) chain.push(current);
+              return chain;
+            };
+            const selfChain = chainToRoot(this);
+            const otherChain = chainToRoot(other);
+            const selfRoot = selfChain[selfChain.length - 1];
+            const otherRoot = otherChain[otherChain.length - 1];
+            if (!selfRoot || !otherRoot || selfRoot.__id !== otherRoot.__id) {
+              // Disconnected trees: pick a consistent-but-arbitrary order.
+              const following = this.__id < other.__id ? FOLLOWING : PRECEDING;
+              return DISCONNECTED | IMPLEMENTATION_SPECIFIC | following;
+            }
+            if (this.contains(other)) return CONTAINED_BY | FOLLOWING;
+            if (other.contains(this)) return CONTAINS | PRECEDING;
+
+            // Walk both self-inclusive chains from the shared root down until
+            // they diverge; the diverging children decide document order.
+            const fromRootSelf = selfChain.slice().reverse();
+            const fromRootOther = otherChain.slice().reverse();
+            let depth = 0;
+            while (depth < fromRootSelf.length && depth < fromRootOther.length
+              && fromRootSelf[depth].__id === fromRootOther[depth].__id) depth++;
+            const commonAncestor = fromRootSelf[depth - 1];
+            const branchSelf = fromRootSelf[depth];
+            const branchOther = fromRootOther[depth];
+            if (!commonAncestor || !branchSelf || !branchOther) return FOLLOWING;
+            const siblings = commonAncestor.childNodes;
+            const indexSelf = siblings.findIndex((node) => node.__id === branchSelf.__id);
+            const indexOther = siblings.findIndex((node) => node.__id === branchOther.__id);
+            return indexSelf < indexOther ? FOLLOWING : PRECEDING;
+          }
+
           getRootNode(options = {}) {
             let root = this;
             while (root.parentNode) root = root.parentNode;
@@ -933,6 +981,28 @@
           set textContent(value) {
             this.childNodes.length = 0;
             if (value !== '') this.appendChild(document.createTextNode(String(value ?? '')));
+          }
+
+          // Fragments are JS-only (no bridge id), so innerHTML round-trips
+          // through a throwaway bridge-backed <div> for lexbor parsing, then
+          // moves the parsed nodes in. This is what lets web components build
+          // their shadow tree via `shadowRoot.innerHTML = template`.
+          get innerHTML() {
+            let out = '';
+            for (const child of this.childNodes) {
+              if (child.nodeType === 1) out += child.outerHTML;
+              else if (child.nodeType === 8) out += '<!--' + (child.textContent || '') + '-->';
+              else out += String(child.textContent || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            }
+            return out;
+          }
+          set innerHTML(value) {
+            for (const child of [...this.childNodes]) this.removeChild(child);
+            const markup = String(value ?? '');
+            if (markup === '') return;
+            const temp = document.createElement('div');
+            temp.innerHTML = markup;
+            for (const child of [...temp.childNodes]) this.appendChild(child);
           }
 
           appendChild(child) {
@@ -2633,6 +2703,34 @@
               scheduleElementResourceLoad(this);
             }
             return result;
+          }
+          // The bridge stores attributes by qualified name, so namespaced
+          // variants fold the prefix into the name and reuse the plain paths
+          // (mutation records, custom-element/resource hooks). This matches
+          // how browsers serialize e.g. xlink:href into HTML markup.
+          setAttributeNS(_namespace, qualifiedName, value) {
+            return this.setAttribute(qualifiedName, value);
+          }
+          getAttributeNS(_namespace, localName) {
+            const local = String(localName);
+            const direct = this.getAttribute(local);
+            if (direct !== null) return direct;
+            const suffix = ':' + local;
+            for (const name of this.getAttributeNames()) {
+              if (name.endsWith(suffix)) return this.getAttribute(name);
+            }
+            return null;
+          }
+          hasAttributeNS(namespace, localName) {
+            return this.getAttributeNS(namespace, localName) !== null;
+          }
+          removeAttributeNS(_namespace, localName) {
+            const local = String(localName);
+            if (this.hasAttribute(local)) return this.removeAttribute(local);
+            const suffix = ':' + local;
+            for (const name of this.getAttributeNames()) {
+              if (name.endsWith(suffix)) return this.removeAttribute(name);
+            }
           }
           toggleAttribute(name, force = undefined) {
             const has = this.hasAttribute(name);

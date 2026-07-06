@@ -1896,6 +1896,42 @@ void test_shadow_root_and_element_internals_shims()
         "attachShadow, ShadowRoot, getRootNode and ElementInternals should support browser-like custom elements");
 }
 
+void test_shadow_root_builds_tree_from_inner_html()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <slider-host id="host"><div class="slide">A</div><div class="slide">B</div></slider-host>
+  <script>
+    // Web components such as Swiper build their shadow tree by assigning a
+    // template string to shadowRoot.innerHTML; the fragment must parse it.
+    customElements.define('slider-host', class extends HTMLElement {
+      connectedCallback () {
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = '<div class="wrap"><div class="track"><slot></slot></div></div>';
+        const track = root.querySelector('.track');
+        let childrenSpread = -1;
+        try { childrenSpread = [...track.children].length; } catch (e) { childrenSpread = -2; }
+        this.setAttribute('data-slider',
+          root.childNodes.length === 1 &&
+          root.querySelector('.wrap') !== null &&
+          track !== null &&
+          track.children[0] instanceof HTMLSlotElement &&
+          childrenSpread === 1 &&
+          root.innerHTML.indexOf('class="track"') !== -1
+            ? 'ok'
+            : 'bad');
+      }
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("#host[data-slider='ok']").has_value(),
+        "shadowRoot.innerHTML should parse a template into a queryable shadow tree");
+}
+
 void test_custom_elements_with_private_fields_construct_instances()
 {
     pagecore::Page page;
@@ -10490,6 +10526,7 @@ int main()
         test_event_options_bubbling_and_wpt_driver_shim();
         test_custom_elements_registry_shim();
         test_shadow_root_and_element_internals_shims();
+        test_shadow_root_builds_tree_from_inner_html();
         test_custom_elements_with_private_fields_construct_instances();
         test_external_script_via_resource_loader();
         test_current_script_and_reflected_url_attributes();
