@@ -2,6 +2,8 @@
 
 #include "util.hpp"
 
+#include <libpsl.h>
+
 #include <algorithm>
 #include <cctype>
 #include <ctime>
@@ -9,7 +11,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -187,54 +188,31 @@ bool is_ipv4_address(std::string_view host)
     return parts == 4;
 }
 
-// Whether `host` (already lowercased, not an IP/localhost) is a public suffix
-// under which independent registrants live. A bare single-label TLD ("com") is
-// always a public suffix; the curated set covers the common multi-label suffixes
-// that a full Public Suffix List would enumerate. This is intentionally a
-// heuristic subset — it is used to reject cookies scoped to a suffix (supercookie
-// defense) and to compute the registrable domain for SameSite, both of which fail
-// safe when the set is incomplete (a missing entry only narrows, never widens,
-// the set of hosts a cookie reaches).
+const psl_ctx_t* psl_context()
+{
+    static const psl_ctx_t* const context = psl_builtin();
+    return context; // null only if libpsl was built without embedded PSL data.
+}
+
+// Whether `host` (already lowercased) is a public suffix under which
+// independent registrants live, per the Mozilla Public Suffix List (via
+// libpsl). Used to reject cookies scoped to a suffix (supercookie defense)
+// and to compute the registrable domain for SameSite. Falls back to the
+// RFC 6265 minimum (bare single-label host only) if libpsl has no built-in
+// PSL data, matching the previous fail-safe behavior.
 bool is_public_suffix(std::string_view host)
 {
     if (host.empty()) {
         return true;
     }
-    if (host.find('.') == std::string_view::npos) {
-        return true; // Bare TLD, e.g. "com", "io", "localhost" handled by caller.
+    const psl_ctx_t* psl = psl_context();
+    if (!psl) {
+        return host.find('.') == std::string_view::npos;
     }
-    static const std::unordered_set<std::string_view> multi_label_suffixes = {
-        "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "ltd.uk", "plc.uk",
-        "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp", "ad.jp", "ed.jp", "gr.jp", "lg.jp",
-        "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
-        "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "geek.nz", "school.nz",
-        "com.br", "net.br", "org.br", "gov.br", "edu.br",
-        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-        "com.mx", "net.mx", "org.mx", "gob.mx", "edu.mx",
-        "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in", "gov.in",
-        "co.za", "net.za", "org.za", "gov.za", "web.za",
-        "com.tr", "net.tr", "org.tr", "gov.tr", "edu.tr",
-        "com.sg", "net.sg", "org.sg", "gov.sg", "edu.sg",
-        "com.hk", "net.hk", "org.hk", "gov.hk", "edu.hk",
-        "com.tw", "net.tw", "org.tw", "gov.tw", "edu.tw",
-        "co.kr", "ne.kr", "or.kr", "go.kr", "re.kr",
-        "com.ar", "net.ar", "org.ar", "gob.ar", "edu.ar",
-        "co.id", "net.id", "or.id", "web.id", "ac.id", "go.id",
-        "com.pl", "net.pl", "org.pl", "gov.pl", "edu.pl",
-        "com.ua", "net.ua", "org.ua", "gov.ua", "edu.ua",
-        "com.ru", "net.ru", "org.ru", "gov.ru", "edu.ru",
-        "co.il", "org.il", "net.il", "gov.il", "ac.il",
-        "co.th", "net.th", "or.th", "go.th", "ac.th",
-        "com.ph", "net.ph", "org.ph", "gov.ph", "edu.ph",
-        "com.my", "net.my", "org.my", "gov.my", "edu.my",
-        "com.vn", "net.vn", "org.vn", "gov.vn", "edu.vn",
-        "co.ke", "or.ke", "ne.ke", "go.ke", "ac.ke",
-        "github.io", "gitlab.io", "herokuapp.com", "appspot.com", "cloudfront.net",
-    };
-    return multi_label_suffixes.find(host) != multi_label_suffixes.end();
+    return psl_is_public_suffix(psl, std::string(host).c_str()) != 0;
 }
 
-std::string registrable_domain_heuristic(std::string_view host)
+std::string registrable_domain(std::string_view host)
 {
     const std::string lowered = ascii_lower(host);
     if (lowered.empty()
@@ -243,25 +221,12 @@ std::string registrable_domain_heuristic(std::string_view host)
         || is_ipv4_address(lowered)) {
         return lowered;
     }
-
-    // Registrable domain = the longest public suffix plus one more label.
-    std::size_t label_start = 0;
-    while (label_start < lowered.size()) {
-        const std::string_view candidate(lowered.data() + label_start, lowered.size() - label_start);
-        if (is_public_suffix(candidate)) {
-            if (label_start == 0) {
-                return lowered; // Whole host is a public suffix; nothing narrower.
-            }
-            const std::size_t previous_dot = lowered.rfind('.', label_start - 2);
-            return previous_dot == std::string::npos ? lowered : lowered.substr(previous_dot + 1);
-        }
-        const std::size_t next_dot = lowered.find('.', label_start);
-        if (next_dot == std::string::npos) {
-            break;
-        }
-        label_start = next_dot + 1;
+    const psl_ctx_t* psl = psl_context();
+    if (!psl) {
+        return lowered; // No PSL data: fail safe to exact-host matching.
     }
-    return lowered;
+    const char* registrable = psl_registrable_domain(psl, lowered.c_str());
+    return registrable ? registrable : lowered; // Null: host itself is a public suffix.
 }
 
 std::string site_of(std::string_view url)
@@ -270,7 +235,7 @@ std::string site_of(std::string_view url)
     if (parsed.scheme.empty() || parsed.host.empty()) {
         return {};
     }
-    return parsed.scheme + "://" + registrable_domain_heuristic(parsed.host);
+    return parsed.scheme + "://" + registrable_domain(parsed.host);
 }
 
 bool same_site_url(std::string_view left, std::string_view right)

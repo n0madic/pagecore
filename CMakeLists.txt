@@ -239,6 +239,8 @@ function(pagecore_fetchcontent_make_available_excluded dependency)
     endif()
 endfunction()
 
+pagecore_pkg_config_static_first(pagecore_libpsl_deps libpsl)
+
 if(PAGECORE_ENABLE_RENDERING)
     set(PAGECORE_RENDERING_PKG_MODULES
         cairo
@@ -523,12 +525,14 @@ target_link_libraries(pagecore
         $<BUILD_INTERFACE:CURL::libcurl>
         $<BUILD_INTERFACE:ZLIB::ZLIB>
         $<BUILD_INTERFACE:pagecore_static_pkg_deps>
+        $<BUILD_INTERFACE:pagecore_libpsl_deps>
     INTERFACE
         $<INSTALL_INTERFACE:PageCore::lexbor_static>
         $<INSTALL_INTERFACE:PageCore::qjs>
         $<INSTALL_INTERFACE:CURL::libcurl>
         $<INSTALL_INTERFACE:ZLIB::ZLIB>
         $<INSTALL_INTERFACE:PageCore::pagecore_static_pkg_deps>
+        $<INSTALL_INTERFACE:PageCore::pagecore_libpsl_deps>
 )
 
 target_compile_features(pagecore PUBLIC cxx_std_20)
@@ -583,7 +587,7 @@ if(PAGECORE_BUILD_TESTS)
             PAGECORE_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}"
     )
     target_include_directories(pagecore_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps)
+    target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps pagecore_libpsl_deps)
     pagecore_strip_release_binary(pagecore_tests)
     add_test(NAME pagecore_tests COMMAND pagecore_tests)
     # Cap the suite so a hung loopback-server test (blocking accept()) fails the
@@ -719,7 +723,7 @@ set(PAGECORE_WOFF2COMMON_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}woff2common$
 set(PAGECORE_WOFF2DEC_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}woff2dec${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
 install(
-    TARGETS pagecore pagecore_static_pkg_deps
+    TARGETS pagecore pagecore_static_pkg_deps pagecore_libpsl_deps
     EXPORT PageCoreTargets
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"

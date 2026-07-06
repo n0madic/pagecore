@@ -3015,6 +3015,49 @@ void test_cookie_public_suffix_and_injection_rejected()
     require(marked("maxkeep", "1"), "Max-Age must take precedence over an earlier past Expires");
 }
 
+void test_public_suffix_list_covers_modern_hosting_platforms()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://a.vercel.app/set-super",
+        "set-super",
+        "text/plain",
+        {{"Set-Cookie", "super=1; Domain=vercel.app; Path=/"}});
+    loader->add("https://a.vercel.app/read", "read-a", "text/plain");
+    loader->add(
+        "https://b.vercel.app/set-strict",
+        "set-strict",
+        "text/plain",
+        {{"Set-Cookie", "bStrict=1; Path=/; SameSite=Strict; Secure"}});
+    loader->add("https://b.vercel.app/read", "read-b", "text/plain");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('/set-super', { credentials: 'include' })
+      .then(() => fetch('/read', { credentials: 'include' }))
+      .then(() => fetch('https://b.vercel.app/set-strict', { credentials: 'include' }))
+      .then(() => fetch('https://b.vercel.app/read', { credentials: 'include' }))
+      .then(() => document.body.setAttribute('data-done', 'ok'));
+  </script>
+</body></html>
+)HTML", "https://a.vercel.app/start/index.html");
+
+    require(page.outer_html("body[data-done='ok']").has_value(),
+            "public suffix list chain should complete");
+
+    const auto* read_a = find_request(*loader, "https://a.vercel.app/read");
+    require(read_a != nullptr && !header_contains(*read_a, "cookie", "super=1"),
+            "Set-Cookie scoped to the public suffix vercel.app must be rejected (supercookie defense)");
+
+    const auto* read_b = find_request(*loader, "https://b.vercel.app/read");
+    require(read_b != nullptr && !header_contains(*read_b, "cookie", "bStrict=1"),
+            "a.vercel.app and b.vercel.app are independent registrants under one private PSL suffix; "
+            "a SameSite=Strict cookie set by b.vercel.app must not leak into a cross-site request from a.vercel.app");
+}
+
 void test_cookie_secure_not_overwritten_by_insecure()
 {
     auto loader = std::make_shared<RecordingResourceLoader>();
@@ -10140,6 +10183,7 @@ int main()
         test_css_scan_default_computed_style();
         test_page_activity_tracker_counters_and_stability();
         test_cookie_public_suffix_and_injection_rejected();
+        test_public_suffix_list_covers_modern_hosting_platforms();
         test_cookie_secure_not_overwritten_by_insecure();
         test_cookie_jar_growth_is_bounded();
         test_failed_external_script_does_not_abort_page();
