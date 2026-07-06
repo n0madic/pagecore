@@ -326,6 +326,7 @@ function installDomEnvironment() {
   ctx.global.location = web.locationFromURL(ctx.host.baseURL);
   const forms = formsDefinition.install(ctx, { dom, web });
   const streams = streamsDefinition.install(ctx, { events, web });
+  ctx.global.ReadableStream = streams.ReadableStream;
   const compat = compatDefinition.install(ctx, { events, dom });
   return { ctx, core, events, dom, web, forms, streams, compat, logs };
 }
@@ -459,6 +460,29 @@ test('web Headers normalizes names and appends values', () => {
     ['content-type', 'text/plain, charset=utf-8'],
     ['x-test', 'ok']
   ]);
+});
+
+test('web Response body is a readable stream consumable via getReader', async () => {
+  const { web } = installDomEnvironment();
+  const { Response } = web;
+  const response = new Response('icon-bytes');
+
+  assert.ok(response.body, 'body should be a ReadableStream, not the raw string');
+  assert.strictEqual(typeof response.body.getReader, 'function');
+
+  // The consumption path Angular's Fetch backend uses (getReader + read loop).
+  const reader = response.body.getReader();
+  let total = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.length;
+  }
+  assert.strictEqual(total, 'icon-bytes'.length);
+
+  // text() still resolves from the raw body; an absent body stays null.
+  assert.strictEqual(await new Response('hi').text(), 'hi');
+  assert.strictEqual(new Response(null).body, null);
 });
 
 test('web TextEncoder and TextDecoder round-trip UTF-8', () => {

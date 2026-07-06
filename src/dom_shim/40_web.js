@@ -676,7 +676,10 @@
 
         class Response {
           constructor(body = null, init = {}) {
-            this.body = body;
+            // Raw body kept internally; `body` is a spec ReadableStream getter
+            // (below) so fetch clients that stream the response — e.g. Angular's
+            // Fetch backend calling response.body.getReader() — work.
+            this._bodyInit = body;
             this.status = init.status === undefined ? 200 : Number(init.status);
             this.statusText = init.statusText === undefined ? '' : String(init.statusText);
             this.headers = new Headers(init.headers);
@@ -686,20 +689,32 @@
             this.ok = this.status >= 200 && this.status < 300;
           }
 
+          get body() {
+            if (this._bodyInit == null) return null;
+            if (this._bodyStream === undefined) {
+              const raw = this._bodyInit instanceof Blob ? this._bodyInit._bytes : this._bodyInit;
+              this._bodyStream = global.ReadableStream._fromBody(raw);
+            }
+            return this._bodyStream;
+          }
+          get bodyUsed() {
+            return Boolean(this._bodyStream && this._bodyStream.locked);
+          }
+
           text() {
-            if (this.body instanceof Blob) return this.body.text();
-            if (this.body == null) return Promise.resolve('');
-            return Promise.resolve(String(this.body));
+            if (this._bodyInit instanceof Blob) return this._bodyInit.text();
+            if (this._bodyInit == null) return Promise.resolve('');
+            return Promise.resolve(String(this._bodyInit));
           }
 
           arrayBuffer() {
-            if (this.body instanceof Blob) return this.body.arrayBuffer();
-            return new Blob([this.body == null ? '' : String(this.body)]).arrayBuffer();
+            if (this._bodyInit instanceof Blob) return this._bodyInit.arrayBuffer();
+            return new Blob([this._bodyInit == null ? '' : String(this._bodyInit)]).arrayBuffer();
           }
 
           json() { return this.text().then((text) => JSON.parse(text)); }
           clone() {
-            return new Response(this.body, {
+            return new Response(this._bodyInit, {
               status: this.status,
               statusText: this.statusText,
               headers: this.headers,
