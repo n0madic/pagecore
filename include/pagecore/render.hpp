@@ -279,6 +279,25 @@ public:
     {
         return {};
     }
+
+    // A single element's inline-style attribute set to `new_style` (empty string
+    // means the attribute was removed).
+    struct InlineStylePatch {
+        std::string node_key;
+        std::string new_style;
+    };
+
+    // Applies inline-style-only changes to the already-built document in place,
+    // reusing its render items instead of rebuilding. Returns false (with no
+    // side effects) when any target is missing or has no live render item
+    // (display:none territory, which needs a full rebuild), so the caller must
+    // fall back to a rebuild. On true the caller must re-run layout(). Engines
+    // without in-place restyle support return false.
+    virtual bool apply_inline_style_patches(const std::vector<InlineStylePatch>& patches)
+    {
+        (void) patches;
+        return false;
+    }
 };
 
 class LayoutEngineFactory {

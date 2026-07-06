@@ -9098,6 +9098,157 @@ void test_layout_engine_load_dom_collects_absolute_percent_overrides()
     }
 }
 
+// Loads a fresh direct-DOM engine on the current state of `doc`, lays it out,
+// and returns the display-list JSON — the ground truth an in-place patch must
+// reproduce.
+std::string fresh_direct_dom_display_list_json(
+    pagecore::DomDocument& doc,
+    const pagecore::Viewport& viewport,
+    std::string_view base_url)
+{
+    auto engine = pagecore::create_litehtml_layout_engine();
+    engine->set_viewport(viewport);
+    pagecore::LayoutEngine::DomLayoutRequest request;
+    request.document = &doc;
+    request.base_url = base_url;
+    require(engine->load_dom(request), "litehtml engine must support direct DOM input");
+    engine->layout();
+    return pagecore::display_list_to_json(engine->display_list());
+}
+
+std::unique_ptr<pagecore::LayoutEngine> laid_out_direct_dom_engine(
+    pagecore::DomDocument& doc,
+    const pagecore::Viewport& viewport,
+    std::string_view base_url)
+{
+    auto engine = pagecore::create_litehtml_layout_engine();
+    engine->set_viewport(viewport);
+    pagecore::LayoutEngine::DomLayoutRequest request;
+    request.document = &doc;
+    request.base_url = base_url;
+    require(engine->load_dom(request), "litehtml engine must support direct DOM input");
+    engine->layout();
+    return engine;
+}
+
+pagecore::LayoutEngine::InlineStylePatch style_patch_from_dom(
+    pagecore::DomDocument& doc,
+    pagecore::NodeId node)
+{
+    const auto style = doc.get_attribute(node, "style");
+    return pagecore::LayoutEngine::InlineStylePatch{std::to_string(node), style.value_or(std::string())};
+}
+
+void test_layout_engine_inline_style_patch_matches_fresh_build()
+{
+    const pagecore::Viewport viewport{600, 400, 1.0f};
+    const std::string base_url = "https://example.test/";
+    const char* html =
+        "<!DOCTYPE html><html><body style='margin:0'>"
+        "<div id='a' style='width:100px;height:30px;background:rgb(200,10,10)'>a</div>"
+        "<div id='b' style='width:80px;height:20px;background:rgb(10,10,200)'>b</div>"
+        "</body></html>";
+
+    pagecore::DomDocument doc;
+    doc.parse(html);
+    const pagecore::NodeId a = doc.get_element_by_id("a");
+    const pagecore::NodeId b = doc.get_element_by_id("b");
+
+    auto engine = laid_out_direct_dom_engine(doc, viewport, base_url);
+
+    // Mutate inline styles on the DOM, then apply the same changes in place.
+    doc.set_attribute(a, "style", "width:160px;height:50px;background:rgb(200,10,10)");
+    doc.set_attribute(b, "style", "width:40px;height:60px;background:rgb(10,10,200)");
+
+    std::vector<pagecore::LayoutEngine::InlineStylePatch> patches = {
+        style_patch_from_dom(doc, a),
+        style_patch_from_dom(doc, b),
+    };
+    require(engine->apply_inline_style_patches(patches), "inline style patches must apply to live render items");
+    engine->layout();
+    const std::string patched_json = pagecore::display_list_to_json(engine->display_list());
+
+    const std::string fresh_json = fresh_direct_dom_display_list_json(doc, viewport, base_url);
+    require(patched_json == fresh_json,
+            "an in-place inline-style patch must reproduce a fresh build byte-for-byte");
+}
+
+void test_layout_engine_inline_style_patch_unknown_key_is_noop()
+{
+    const pagecore::Viewport viewport{400, 300, 1.0f};
+    const std::string base_url = "https://example.test/";
+
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='a' style='width:50px;height:20px'>a</div></body></html>");
+    const pagecore::NodeId a = doc.get_element_by_id("a");
+
+    auto engine = laid_out_direct_dom_engine(doc, viewport, base_url);
+    const std::string before = pagecore::display_list_to_json(engine->display_list());
+
+    std::vector<pagecore::LayoutEngine::InlineStylePatch> patches = {
+        {std::to_string(a), "width:90px;height:20px"},
+        {"999999", "width:10px"},  // no such element
+    };
+    require(!engine->apply_inline_style_patches(patches),
+            "a patch batch with an unknown key must fail");
+
+    engine->layout();
+    const std::string after = pagecore::display_list_to_json(engine->display_list());
+    require(before == after,
+            "a failed patch batch must not have mutated any element (validate-all-before-mutate)");
+}
+
+void test_layout_engine_inline_style_patch_inherited_properties()
+{
+    const pagecore::Viewport viewport{500, 300, 1.0f};
+    const std::string base_url = "https://example.test/";
+    const char* html =
+        "<!DOCTYPE html><html><body>"
+        "<div id='parent' style='font-size:16px;color:rgb(0,0,0)'>"
+        "<span id='child'>inherited text</span></div>"
+        "</body></html>";
+
+    pagecore::DomDocument doc;
+    doc.parse(html);
+    const pagecore::NodeId parent = doc.get_element_by_id("parent");
+    const pagecore::NodeId child = doc.get_element_by_id("child");
+
+    auto engine = laid_out_direct_dom_engine(doc, viewport, base_url);
+
+    // Change an inherited property on the parent only.
+    doc.set_attribute(parent, "style", "font-size:32px;color:rgb(220,0,0)");
+    require(engine->apply_inline_style_patches({style_patch_from_dom(doc, parent)}),
+            "the inherited-property patch must apply");
+    engine->layout();
+    const std::string patched_json = pagecore::display_list_to_json(engine->display_list());
+
+    const std::string fresh_json = fresh_direct_dom_display_list_json(doc, viewport, base_url);
+    require(patched_json == fresh_json,
+            "an inherited-property patch must propagate to descendant text metrics like a fresh build");
+
+    // The child's computed font-size must reflect the inherited change.
+    const auto child_font = engine->computed_style_property(std::to_string(child), "font-size");
+    require(child_font && child_font->find("32") != std::string::npos,
+            "the child must inherit the parent's new font-size after the patch");
+}
+
+void test_layout_engine_inline_style_patch_display_none_target_refuses()
+{
+    const pagecore::Viewport viewport{400, 300, 1.0f};
+    const std::string base_url = "https://example.test/";
+
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='a' style='display:none'>a</div></body></html>");
+    const pagecore::NodeId a = doc.get_element_by_id("a");
+
+    auto engine = laid_out_direct_dom_engine(doc, viewport, base_url);
+
+    // A display:none element has no render item, so an in-place patch cannot
+    // stand in for a rebuild.
+    require(!engine->apply_inline_style_patches({{std::to_string(a), "display:block;width:20px;height:10px"}}),
+            "a display:none target has no render item and must refuse the patch");
+}
+
 // Full-pipeline fixture for the layout-tree-input A/B comparison: external
 // stylesheet, image, inline <style>, noscript, and JS-driven DOM mutations.
 std::string page_display_list_json_for_layout_input(pagecore::LayoutTreeInput input, bool enable_js = true)
@@ -9787,6 +9938,10 @@ int main()
         test_layout_engine_load_dom_quirks_class_matching();
         test_layout_engine_load_dom_computed_style_and_geometry();
         test_layout_engine_load_dom_collects_absolute_percent_overrides();
+        test_layout_engine_inline_style_patch_matches_fresh_build();
+        test_layout_engine_inline_style_patch_unknown_key_is_noop();
+        test_layout_engine_inline_style_patch_inherited_properties();
+        test_layout_engine_inline_style_patch_display_none_target_refuses();
         test_page_direct_dom_layout_display_list_parity();
         test_page_direct_dom_noscript_and_enable_js();
         test_page_direct_dom_absolute_percent_second_pass();

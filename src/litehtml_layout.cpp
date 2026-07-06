@@ -1064,6 +1064,39 @@ public:
         return overrides;
     }
 
+    bool apply_inline_style_patches(const std::vector<InlineStylePatch>& patches) override
+    {
+        if (!document_ || patches.empty()) {
+            return false;
+        }
+
+        // Validate every target before mutating anything: a missing element or
+        // one without a live render item (e.g. display:none) means an in-place
+        // restyle can't stand in for a rebuild, so bail with no side effects.
+        std::vector<litehtml::element::ptr> targets;
+        targets.reserve(patches.size());
+        for (const auto& patch : patches) {
+            auto element = find_tagged_element(patch.node_key);
+            if (!element || !element->get_render_item()) {
+                return false;
+            }
+            targets.push_back(std::move(element));
+        }
+
+        // Recipe (verified against litehtml sources): set the inline style, then
+        // refresh_styles() to clear m_style and re-apply the cached m_used_styles,
+        // then compute_styles(true) to recompute m_css over the subtree. No
+        // apply_stylesheet — that is not idempotent. The caller re-runs layout().
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            const auto& element = targets[i];
+            element->set_attr("style", patches[i].new_style.c_str());
+            element->refresh_styles();
+            element->compute_styles(true);
+        }
+        styles_computed_ = true;
+        return true;
+    }
+
 private:
     // Single typed tree walk mirroring the string-based page.cpp path exactly: for
     // every position:absolute; box-sizing:border-box; width:% element that litehtml
