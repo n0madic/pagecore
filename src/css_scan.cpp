@@ -234,6 +234,65 @@ std::optional<float> parse_css_percentage(std::string_view value)
     return std::nullopt;
 }
 
+bool css_declarations_require_tree_rebuild(std::string_view style)
+{
+    auto property_forces_rebuild = [](std::string_view name) {
+        const std::string lower = ascii_lower(trim_ascii(name));
+        return lower == "display"
+            || lower == "position"
+            || lower == "float"
+            || lower == "content"
+            || lower == "direction"
+            || lower.rfind("list-style", 0) == 0;
+    };
+
+    std::size_t segment_start = 0;
+    int paren_depth = 0;
+    char quote = '\0';
+
+    auto scan_segment = [&](std::string_view segment) {
+        const std::size_t colon = segment.find(':');
+        if (colon == std::string_view::npos) {
+            return false;
+        }
+        return property_forces_rebuild(segment.substr(0, colon));
+    };
+
+    for (std::size_t i = 0; i <= style.size(); ++i) {
+        const bool at_end = i == style.size();
+        const char ch = at_end ? ';' : style[i];
+        if (quote != '\0') {
+            if (ch == '\\' && i + 1 < style.size()) {
+                ++i;
+                continue;
+            }
+            if (ch == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+            continue;
+        }
+        if (ch == '(') {
+            ++paren_depth;
+            continue;
+        }
+        if (ch == ')' && paren_depth > 0) {
+            --paren_depth;
+            continue;
+        }
+        if (ch == ';' && paren_depth == 0) {
+            if (scan_segment(style.substr(segment_start, i - segment_start))) {
+                return true;
+            }
+            segment_start = i + 1;
+        }
+    }
+    return false;
+}
+
 std::optional<std::string> default_computed_style_property_value(
     std::string_view property,
     std::string_view tag)

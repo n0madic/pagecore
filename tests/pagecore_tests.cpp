@@ -2808,6 +2808,31 @@ void test_css_scan_parse_percentage()
     require(!parse_css_percentage("auto").has_value(), "keyword is not a percentage");
 }
 
+void test_css_declarations_require_tree_rebuild()
+{
+    using pagecore::css_declarations_require_tree_rebuild;
+
+    // Own-box metrics never force a rebuild.
+    require(!css_declarations_require_tree_rebuild("width:10px;height:20px"), "size changes are patchable");
+    require(!css_declarations_require_tree_rebuild("color:red;background:blue"), "color changes are patchable");
+    require(!css_declarations_require_tree_rebuild(""), "empty declarations are patchable");
+    require(!css_declarations_require_tree_rebuild("margin:5px;padding:3px"), "box spacing is patchable");
+
+    // Structure-affecting properties force a rebuild.
+    require(css_declarations_require_tree_rebuild("display:none"), "display forces a rebuild");
+    require(css_declarations_require_tree_rebuild("width:10px;position:absolute"), "position forces a rebuild");
+    require(css_declarations_require_tree_rebuild("float:left"), "float forces a rebuild");
+    require(css_declarations_require_tree_rebuild("direction:rtl"), "direction forces a rebuild");
+    require(css_declarations_require_tree_rebuild("list-style-type:none"), "list-style-* forces a rebuild");
+    require(css_declarations_require_tree_rebuild("content:'x'"), "content forces a rebuild");
+
+    // A property value that merely contains a keyword must not false-positive.
+    require(!css_declarations_require_tree_rebuild("background:url(display.png)"),
+            "a value mentioning 'display' must not be mistaken for the display property");
+    require(!css_declarations_require_tree_rebuild("font-family:'position sans'"),
+            "a quoted value must not be mistaken for a structure property");
+}
+
 void test_css_scan_attribute_selectors()
 {
     using pagecore::collect_css_attribute_selectors;
@@ -8173,15 +8198,31 @@ public:
         ++(*layout_calls_);
         inner_->layout();
     }
+    void set_font_environment(std::shared_ptr<const pagecore::FontEnvironment> font_environment) override
+    {
+        inner_->set_font_environment(std::move(font_environment));
+    }
     const pagecore::DisplayList& display_list() const override { return inner_->display_list(); }
     void compute_styles_only() override { inner_->compute_styles_only(); }
     std::optional<pagecore::ComputedStyle> computed_style(std::string_view node_key) override
     {
         return inner_->computed_style(node_key);
     }
+    std::optional<std::string> computed_style_property(std::string_view node_key, std::string_view property) override
+    {
+        return inner_->computed_style_property(node_key, property);
+    }
     std::optional<pagecore::ElementGeometry> element_geometry(std::string_view node_key) override
     {
         return inner_->element_geometry(node_key);
+    }
+    std::vector<AbsolutePercentWidthOverride> collect_absolute_percent_width_overrides() override
+    {
+        return inner_->collect_absolute_percent_width_overrides();
+    }
+    bool apply_inline_style_patches(const std::vector<InlineStylePatch>& patches) override
+    {
+        return inner_->apply_inline_style_patches(patches);
     }
 
 private:
@@ -9411,9 +9452,12 @@ void test_page_direct_dom_memoization()
     (void) page.display_list(options);
     require(*counting->builds == 2, "a viewport change must rebuild the styled document");
 
-    page.document().set_attribute(page.document().get_element_by_id("x"), "style", "width:70px;height:20px");
+    // A structural mutation (not a bare inline-style change, which Phase 8 patches
+    // in place) must rebuild the styled document.
+    page.document().append_child(
+        page.document().get_element_by_id("x"), page.document().create_element("span"));
     (void) page.display_list(options);
-    require(*counting->builds == 3, "a layout-affecting DOM mutation must rebuild the styled document");
+    require(*counting->builds == 3, "a structural DOM mutation must rebuild the styled document");
 }
 
 void test_page_direct_dom_geometry_and_computed_style_equivalence()
@@ -9463,6 +9507,263 @@ void test_page_direct_dom_geometry_and_computed_style_equivalence()
                 && serialized_geometry->border_box.x == direct_geometry->border_box.x
                 && serialized_geometry->border_box.y == direct_geometry->border_box.y,
             "border boxes must match across layout tree inputs");
+}
+
+// Build+layout counting harness: counts styled-document builds (engine
+// creations) and layout() calls sharing one litehtml factory underneath.
+struct PatchCounters {
+    std::shared_ptr<EngineBuildCountingFactory> factory;
+    std::shared_ptr<int> builds;
+    std::shared_ptr<int> layouts;
+};
+
+PatchCounters make_patch_counting_factory()
+{
+    auto layout_counting =
+        std::make_shared<LayoutCallCountingFactory>(pagecore::create_litehtml_layout_engine_factory());
+    auto build_counting = std::make_shared<EngineBuildCountingFactory>(layout_counting);
+    return PatchCounters{build_counting, build_counting->builds, layout_counting->layout_calls};
+}
+
+void test_page_inline_style_patch_avoids_full_rebuild()
+{
+    auto counters = make_patch_counting_factory();
+
+    pagecore::Page page;  // DirectDom by default
+    page.set_layout_engine_factory(counters.factory);
+    page.load_html(
+        "<html><body><div id='x' style='width:50px;height:20px;background:rgb(9,9,9)'>x</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(*counters.builds == 1, "the first render builds the styled document once");
+    const int layouts_after_first = *counters.layouts;
+
+    std::vector<pagecore::PerfEvent> events;
+    options.perf_trace = [&](const pagecore::PerfEvent& event) { events.push_back(event); };
+
+    page.document().set_attribute(
+        page.document().get_element_by_id("x"), "style", "width:120px;height:20px;background:rgb(9,9,9)");
+    const auto dl = page.display_list(options);
+
+    require(*counters.builds == 1, "an inline-style change must be patched in place, not rebuilt");
+    require(*counters.layouts > layouts_after_first, "the patched document must be laid out again");
+
+    const auto json = pagecore::display_list_to_json(dl);
+    require(json.find("\"width\":120") != std::string::npos,
+            "the display list must reflect the patched width");
+
+    const auto patched_event = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.name == "patch_inline_styles" && e.property == "outcome:patched";
+    });
+    require(patched_event, "the perf trace must record the patched outcome");
+    const auto reloaded = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.name == "load_dom" || e.name == "load_html";
+    });
+    require(!reloaded, "a patched render must not reload the document");
+}
+
+void test_page_inline_style_patch_display_list_matches_fresh_page()
+{
+    const char* html =
+        "<html><head><style>#x{color:rgb(0,0,0)}</style></head><body>"
+        "<div id='x' style='width:50px;height:20px;background:rgb(9,120,9)'>"
+        "<span id='c'>child</span></div>"
+        "<div id='y' style='width:30px;height:15px;background:rgb(120,9,9)'>y</div>"
+        "</body></html>";
+    const std::string url = "https://example.test/";
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 300, 1.0f};
+
+    // Patched: render, mutate two inline styles, render again (patched).
+    pagecore::Page patched;
+    patched.load_html(html, url);
+    (void) patched.display_list(options);
+    patched.document().set_attribute(
+        patched.document().get_element_by_id("x"), "style", "width:180px;height:44px;background:rgb(9,120,9)");
+    patched.document().set_attribute(
+        patched.document().get_element_by_id("y"), "style", "width:60px;height:15px;background:rgb(120,9,9)");
+    const auto patched_json = pagecore::display_list_to_json(patched.display_list(options));
+
+    // Fresh: apply the same mutations before the first render, forcing a build.
+    pagecore::Page fresh;
+    fresh.load_html(html, url);
+    fresh.document().set_attribute(
+        fresh.document().get_element_by_id("x"), "style", "width:180px;height:44px;background:rgb(9,120,9)");
+    fresh.document().set_attribute(
+        fresh.document().get_element_by_id("y"), "style", "width:60px;height:15px;background:rgb(120,9,9)");
+    const auto fresh_json = pagecore::display_list_to_json(fresh.display_list(options));
+
+    require(patched_json == fresh_json,
+            "a patched page's display list must match a freshly built page on the same DOM byte-for-byte");
+}
+
+void test_page_inline_style_patch_gating_fallbacks()
+{
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 300, 1.0f};
+
+    auto expect_rebuild = [&](const std::string& fixture,
+                              const std::function<void(pagecore::Page&)>& mutate,
+                              const char* why) {
+        auto counters = make_patch_counting_factory();
+        pagecore::Page page;
+        page.set_layout_engine_factory(counters.factory);
+        page.load_html(fixture, "https://example.test/");
+        (void) page.display_list(options);
+        require(*counters.builds == 1, "first render builds once");
+        mutate(page);
+        (void) page.display_list(options);
+        require(*counters.builds == 2, why);
+    };
+
+    // Structure-affecting inline property (display) must rebuild.
+    expect_rebuild(
+        "<html><body><div id='x' style='width:20px;height:20px'>x</div></body></html>",
+        [](pagecore::Page& page) {
+            page.document().set_attribute(page.document().get_element_by_id("x"), "style", "display:none");
+        },
+        "a display change must fall back to a full rebuild");
+
+    // Structural mutation (journal has a non-inline-style record) must rebuild.
+    expect_rebuild(
+        "<html><body><div id='x' style='width:20px;height:20px'>x</div></body></html>",
+        [](pagecore::Page& page) {
+            page.document().append_child(
+                page.document().get_element_by_id("x"), page.document().create_element("span"));
+        },
+        "a structural mutation must fall back to a full rebuild");
+
+    // A [style] attribute selector makes inline-style changes affect matching.
+    expect_rebuild(
+        "<html><head><style>div[style*='w']{outline:1px solid rgb(0,0,0)}</style></head>"
+        "<body><div id='x' style='width:20px;height:20px'>x</div></body></html>",
+        [](pagecore::Page& page) {
+            page.document().set_attribute(
+                page.document().get_element_by_id("x"), "style", "width:40px;height:20px");
+        },
+        "a [style] selector must force a rebuild on inline-style change");
+
+    // Overflowing the journal past its cap loses completeness -> rebuild.
+    expect_rebuild(
+        "<html><body><div id='x' style='width:0px;height:20px'>x</div></body></html>",
+        [](pagecore::Page& page) {
+            const pagecore::NodeId x = page.document().get_element_by_id("x");
+            for (int i = 0; i < 65; ++i) {
+                page.document().set_attribute(x, "style", "width:" + std::to_string(i) + "px;height:20px");
+            }
+        },
+        "an overflowed mutation journal must force a rebuild");
+
+    // A mixed style+class batch has a non-inline-style record -> rebuild.
+    expect_rebuild(
+        "<html><head><style>.big{height:40px}</style></head>"
+        "<body><div id='x' style='width:20px;height:20px'>x</div></body></html>",
+        [](pagecore::Page& page) {
+            page.document().set_attribute(
+                page.document().get_element_by_id("x"), "style", "width:40px;height:20px");
+            page.document().set_attribute(page.document().get_element_by_id("x"), "class", "big");
+        },
+        "a mixed style+class mutation must force a rebuild");
+}
+
+void test_page_inline_style_patch_computed_style_and_geometry()
+{
+    const char* html =
+        "<html><body><div id='x' style='width:50px;height:20px;padding:4px;color:rgb(0,0,0)'>x</div></body></html>";
+    const std::string url = "https://example.test/";
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 300, 1.0f};
+
+    pagecore::Page patched;
+    patched.load_html(html, url);
+    (void) patched.display_list(options);
+    patched.document().set_attribute(
+        patched.document().get_element_by_id("x"), "style", "width:130px;height:60px;padding:4px;color:rgb(10,20,30)");
+    (void) patched.display_list(options);
+
+    pagecore::Page fresh;
+    fresh.load_html(html, url);
+    fresh.document().set_attribute(
+        fresh.document().get_element_by_id("x"), "style", "width:130px;height:60px;padding:4px;color:rgb(10,20,30)");
+    (void) fresh.display_list(options);
+
+    const pagecore::NodeId patched_x = patched.document().get_element_by_id("x");
+    const pagecore::NodeId fresh_x = fresh.document().get_element_by_id("x");
+
+    for (const char* property : {"width", "height", "color", "padding-left"}) {
+        require(patched.computed_style_property(patched_x, property)
+                    == fresh.computed_style_property(fresh_x, property),
+                std::string("patched computed ") + property + " must match a fresh build");
+    }
+
+    const auto patched_geometry = patched.element_geometry(patched_x);
+    const auto fresh_geometry = fresh.element_geometry(fresh_x);
+    require(patched_geometry.has_value() && fresh_geometry.has_value(), "both pages must resolve geometry");
+    require(patched_geometry->border_box.width == fresh_geometry->border_box.width
+                && patched_geometry->border_box.height == fresh_geometry->border_box.height,
+            "patched geometry must match a fresh build");
+}
+
+void test_page_inline_style_patch_then_absolute_percent_second_pass()
+{
+    const char* html = R"HTML(
+<html><head><style>
+  body { margin:0; }
+  .wrap { position:relative; width:400px; height:100px; }
+  .cell { position:absolute; left:0; top:0; width:50%; box-sizing:border-box; }
+  .card { width:100%; height:40px; background:#fff; }
+</style></head><body>
+  <div class="wrap"><div class="cell" id="cell"><div class="card">c</div></div></div>
+  <div id="probe" style="width:20px;height:10px;background:rgb(3,3,3)">p</div>
+</body></html>
+)HTML";
+    const std::string url = "https://example.test/";
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{800, 200, 1.0f};
+
+    pagecore::Page patched;
+    patched.load_html(html, url);
+    (void) patched.display_list(options);
+    patched.document().set_attribute(
+        patched.document().get_element_by_id("probe"), "style", "width:70px;height:24px;background:rgb(3,3,3)");
+    const auto patched_json = pagecore::display_list_to_json(patched.display_list(options));
+
+    pagecore::Page fresh;
+    fresh.load_html(html, url);
+    fresh.document().set_attribute(
+        fresh.document().get_element_by_id("probe"), "style", "width:70px;height:24px;background:rgb(3,3,3)");
+    const auto fresh_json = pagecore::display_list_to_json(fresh.display_list(options));
+
+    require(patched_json == fresh_json,
+            "a patched page that still runs the abs-% second pass must match a fresh build byte-for-byte");
+}
+
+void test_page_inline_style_patch_serialized_mode_never_patches()
+{
+    auto counters = make_patch_counting_factory();
+
+    pagecore::LoadOptions load_options;
+    load_options.layout_tree_input = pagecore::LayoutTreeInput::SerializedHtml;
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(counters.factory);
+    page.load_html(
+        "<html><body><div id='x' style='width:50px;height:20px'>x</div></body></html>",
+        "https://example.test/");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+
+    (void) page.display_list(options);
+    require(*counters.builds == 1, "first render builds once");
+
+    page.document().set_attribute(page.document().get_element_by_id("x"), "style", "width:120px;height:20px");
+    (void) page.display_list(options);
+    require(*counters.builds == 2,
+            "the serialized layout input must always rebuild, never patch");
 }
 
 // Documented divergence of the direct-DOM path: DOM anomalies JavaScript can
@@ -9759,6 +10060,7 @@ int main()
         test_css_scan_url_target();
         test_css_scan_extract_urls();
         test_css_scan_parse_percentage();
+        test_css_declarations_require_tree_rebuild();
         test_css_scan_attribute_selectors();
         test_css_scan_default_computed_style();
         test_page_activity_tracker_counters_and_stability();
@@ -9949,6 +10251,12 @@ int main()
         test_page_direct_dom_geometry_and_computed_style_equivalence();
         test_page_direct_dom_preserves_js_created_nesting();
         test_page_serialized_layout_input_still_available();
+        test_page_inline_style_patch_avoids_full_rebuild();
+        test_page_inline_style_patch_display_list_matches_fresh_page();
+        test_page_inline_style_patch_gating_fallbacks();
+        test_page_inline_style_patch_computed_style_and_geometry();
+        test_page_inline_style_patch_then_absolute_percent_second_pass();
+        test_page_inline_style_patch_serialized_mode_never_patches();
         test_render_absolute_percent_correction_runs_second_pass();
         test_render_without_absolute_elements_skips_second_pass();
         test_render_reflects_settled_dom_regardless_of_read_history();

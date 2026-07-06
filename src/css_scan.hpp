@@ -41,6 +41,13 @@ std::optional<std::string> inline_style_property_value(
 // Parses a bare CSS percentage value (e.g. "50%"), stripping `!important`.
 std::optional<float> parse_css_percentage(std::string_view value);
 
+// True when an inline `style="..."` declaration list contains any property that
+// changes the layout tree structure rather than only an element's own box
+// metrics (display, position, float, content, direction, list-style*). Such a
+// change cannot be applied by an in-place restyle that reuses render items and
+// must force a full rebuild instead.
+bool css_declarations_require_tree_rebuild(std::string_view style);
+
 // Returns the UA default computed value for a CSS property on an element with
 // the given tag name, or nullopt when there is no simple tag-independent default.
 std::optional<std::string> default_computed_style_property_value(

@@ -96,6 +96,9 @@ struct Page::Impl {
     StyledDocumentCacheKey styled_document_key;
     bool styled_document_valid = false;
     bool styled_document_laid_out = false;
+    // Set when the current styled document was last advanced by an in-place
+    // inline-style patch rather than a rebuild. Observability only.
+    bool styled_document_patched = false;
     // getComputedStyle() has no viewport argument; it resolves against the
     // most recently used render viewport (or the engine default if the page
     // hasn't been rendered yet).
@@ -175,6 +178,7 @@ struct Page::Impl {
         geometry_forced_layout_us = 0;
         geometry_cache_forget_version = document.forget_version();
         last_known_geometry.clear();
+        styled_document_patched = false;
         computed_style_property_bounded_mode = false;
         computed_style_property_forced_rebuild_count = 0;
         computed_style_property_forced_rebuild_us = 0;
@@ -836,6 +840,105 @@ struct Page::Impl {
     // DisplayList and getComputedStyle(), without running layout() on it —
     // callers decide whether they need a full layout pass or just the
     // cascade (compute_styles_only()).
+    // Attempts to satisfy `key` by patching the current styled document's inline
+    // styles in place instead of rebuilding it. All of the following must hold,
+    // otherwise the caller falls back to a full rebuild:
+    //  1. DirectDom input and a valid current styled document.
+    //  2. `key` matches the current key in every field except the layout version,
+    //     and neither is the absolute-%-corrected second pass (which never patches).
+    //  3. the layout-mutation journal since the built version is complete,
+    //  4. and holds only inline-style mutations,
+    //  5. with "style" not referenced by any attribute selector,
+    //  6. and no old/new value carrying a structure-affecting property.
+    //  7. Every touched node is still connected; its patch is read from the
+    //     current DOM style value (multi-write coalescing is free, last wins).
+    //  8. The engine applies the whole batch in place.
+    bool try_patch_styled_document(
+        const RenderOptions& render_options,
+        const StyledDocumentCacheKey& key,
+        bool absolute_percent_corrected,
+        LayoutResourceMode resource_mode)
+    {
+        (void) resource_mode;
+
+        // Gate 1.
+        if (options.layout_tree_input != LayoutTreeInput::DirectDom
+            || !styled_document_valid || !styled_document) {
+            return false;
+        }
+        // Gate 2: pass-2 never patches; every other key field must already match.
+        if (absolute_percent_corrected
+            || key.absolute_percent_corrected
+            || styled_document_key.absolute_percent_corrected) {
+            return false;
+        }
+        StyledDocumentCacheKey version_normalized = styled_document_key;
+        version_normalized.layout_mutation_version = key.layout_mutation_version;
+        if (!(version_normalized == key)) {
+            return false;
+        }
+
+        // Gate 3: a complete journal of everything since the built version.
+        auto journal = document.layout_mutations_since(styled_document_key.layout_mutation_version);
+        if (!journal.complete || journal.records.empty()) {
+            return false;
+        }
+        // Gates 4 + 6.
+        for (const auto& record : journal.records) {
+            if (record.kind != LayoutMutationRecord::Kind::InlineStyle) {
+                return false;
+            }
+            if (css_declarations_require_tree_rebuild(record.old_value)
+                || css_declarations_require_tree_rebuild(record.new_value)) {
+                return false;
+            }
+        }
+        // Gate 5.
+        if (document.is_layout_sensitive_attribute("style")) {
+            return false;
+        }
+
+        // Gate 7: unique connected nodes (last-write-wins), current DOM value.
+        std::vector<NodeId> order;
+        std::unordered_set<NodeId> seen;
+        for (const auto& record : journal.records) {
+            if (seen.insert(record.node).second) {
+                order.push_back(record.node);
+            }
+        }
+        std::vector<LayoutEngine::InlineStylePatch> patches;
+        patches.reserve(order.size());
+        for (const NodeId node : order) {
+            if (!document.is_connected(node)) {
+                return false;
+            }
+            const auto style = document.get_attribute(node, "style");
+            if (style && css_declarations_require_tree_rebuild(*style)) {
+                return false;
+            }
+            patches.push_back(LayoutEngine::InlineStylePatch{std::to_string(node), style.value_or(std::string())});
+        }
+
+        // Gate 8: apply in place, timed and traced as the "patched" outcome.
+        bool applied = false;
+        {
+            PerfScope trace(
+                perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "patch_inline_styles", patches.size());
+            trace.event().property = "outcome:patched";
+            applied = styled_document->apply_inline_style_patches(patches);
+        }
+        if (!applied) {
+            return false;
+        }
+
+        // Promote the cached key's version and force a fresh layout() pass; every
+        // downstream consumer then behaves exactly as after a rebuild.
+        styled_document_key.layout_mutation_version = key.layout_mutation_version;
+        styled_document_laid_out = false;
+        styled_document_patched = true;
+        return true;
+    }
+
     LayoutEngine& ensure_styled_document(
         const RenderOptions& render_options,
         bool absolute_percent_corrected,
@@ -844,6 +947,10 @@ struct Page::Impl {
         StyledDocumentCacheKey key = styled_document_cache_key(render_options, absolute_percent_corrected, resource_mode);
 
         if (styled_document_valid && styled_document_key == key) {
+            return *styled_document;
+        }
+
+        if (try_patch_styled_document(render_options, key, absolute_percent_corrected, resource_mode)) {
             return *styled_document;
         }
 
@@ -887,6 +994,7 @@ struct Page::Impl {
         styled_document_key = std::move(key);
         styled_document_valid = true;
         styled_document_laid_out = false;
+        styled_document_patched = false;
         return *styled_document;
     }
 
