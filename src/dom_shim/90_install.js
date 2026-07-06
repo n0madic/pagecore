@@ -362,8 +362,79 @@
         ctx.customElementsRegistry = new CustomElementRegistry();
         global.CustomElementRegistry = CustomElementRegistry;
         global.customElements = ctx.customElementsRegistry;
+        // User-Agent Client Hints (navigator.userAgentData). Derived from the
+        // configured userAgent so the low-entropy hints stay consistent with
+        // navigator.userAgent. Sites such as Google unconditionally call
+        // getHighEntropyValues() and reject when the API is absent, so exposing a
+        // well-formed NavigatorUAData avoids an unhandled rejection and a degraded
+        // fallback path rather than falling back cleanly.
+        function createUserAgentData(userAgent) {
+          const ua = String(userAgent || '');
+          const mobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+          let platform = 'Unknown';
+          if (/Windows/i.test(ua)) platform = 'Windows';
+          else if (/Android/i.test(ua)) platform = 'Android';
+          else if (/iPhone|iPad|iPod|iOS/i.test(ua)) platform = 'iOS';
+          else if (/Mac OS X|Macintosh/i.test(ua)) platform = 'macOS';
+          else if (/CrOS/i.test(ua)) platform = 'Chrome OS';
+          else if (/Linux/i.test(ua)) platform = 'Linux';
+
+          const grease = { brand: 'Not_A Brand', version: '99' };
+          const chrome = /(?:Chrome|Chromium|CriOS)\/(\d+)(?:[.\d]*)/i.exec(ua);
+          let brands;
+          let uaFullVersion;
+          if (chrome) {
+            const major = chrome[1];
+            uaFullVersion = chrome[0].split('/')[1];
+            brands = [
+              { brand: 'Chromium', version: major },
+              { brand: 'Google Chrome', version: major },
+              grease
+            ];
+          } else {
+            const product = /^([^/\s]+)\/(\S+)/.exec(ua);
+            const name = product ? product[1] : 'PageCore';
+            uaFullVersion = product ? product[2] : '0';
+            brands = [{ brand: name, version: String(parseInt(uaFullVersion, 10) || 0) }, grease];
+          }
+          const fullVersionList = brands.map((b) =>
+            b === grease
+              ? { brand: grease.brand, version: grease.version + '.0.0.0' }
+              : { brand: b.brand, version: uaFullVersion });
+
+          const highEntropy = {
+            architecture: /arm|aarch64/i.test(ua) ? 'arm' : 'x86',
+            bitness: '64',
+            formFactors: [mobile ? 'Mobile' : 'Desktop'],
+            model: '',
+            platformVersion: '',
+            uaFullVersion,
+            fullVersionList,
+            wow64: false
+          };
+
+          return {
+            brands: brands.slice(),
+            mobile,
+            platform,
+            toJSON() {
+              return { brands: this.brands, mobile: this.mobile, platform: this.platform };
+            },
+            getHighEntropyValues(hints) {
+              const result = { brands: brands.slice(), mobile, platform };
+              const requested = Array.isArray(hints) ? hints : [];
+              for (const hint of requested) {
+                if (Object.prototype.hasOwnProperty.call(highEntropy, hint)) {
+                  result[hint] = highEntropy[hint];
+                }
+              }
+              return Promise.resolve(result);
+            }
+          };
+        }
         global.navigator = {
           userAgent: host.userAgent || 'PageCore/0.1',
+          userAgentData: createUserAgentData(host.userAgent || 'PageCore/0.1'),
           language: 'en-US',
           languages: ['en-US', 'en'],
           onLine: true,

@@ -437,6 +437,20 @@ void promise_rejection_tracker(
     if (reason_str != nullptr) {
         JS_FreeCString(ctx, reason_str);
     }
+    if (JS_IsObject(reason)) {
+        JSValue stack = JS_GetPropertyStr(ctx, reason, "stack");
+        if (!JS_IsUndefined(stack) && !JS_IsException(stack)) {
+            const char* stack_str = JS_ToCString(ctx, stack);
+            if (stack_str != nullptr && stack_str[0] != '\0') {
+                message += "\n";
+                message += stack_str;
+            }
+            if (stack_str != nullptr) {
+                JS_FreeCString(ctx, stack_str);
+            }
+        }
+        JS_FreeValue(ctx, stack);
+    }
     runtime->log_console("error", "Uncaught (in promise) " + message);
 }
 

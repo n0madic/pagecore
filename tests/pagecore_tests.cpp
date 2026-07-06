@@ -1202,6 +1202,53 @@ void test_browser_like_web_api_shims()
     require(title && *title == "Shim Title", "document.title should update the title element");
 }
 
+void test_navigator_user_agent_data()
+{
+    // Regression: navigator.userAgentData must exist and be well-formed. Sites
+    // such as Google's OneGoogle bar unconditionally read it and reject with an
+    // unhandled "Error: va" when getHighEntropyValues is missing, degrading the
+    // page. The low-entropy hints are derived from the configured userAgent so
+    // they stay consistent with navigator.userAgent.
+    pagecore::LoadOptions options;
+    options.user_agent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+    pagecore::Page page(options);
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const checks = [];
+    const uad = navigator.userAgentData;
+    // The exact condition Google's OneGoogle bar tests before rejecting with va.
+    const wouldReject = !uad
+      || typeof uad.getHighEntropyValues !== 'function'
+      || (uad.brands && typeof uad.brands.map !== 'function');
+    checks.push(!wouldReject);
+    checks.push(Array.isArray(uad.brands) && uad.brands.length > 0);
+    checks.push(uad.brands.some((b) => b.brand === 'Google Chrome' && b.version === '120'));
+    checks.push(typeof uad.mobile === 'boolean' && uad.mobile === false);
+    checks.push(uad.platform === 'macOS');
+    document.body.setAttribute('data-sync', checks.every(Boolean) ? 'ok' : 'bad');
+
+    uad.getHighEntropyValues(['platform', 'platformVersion', 'architecture', 'uaFullVersion'])
+      .then((values) => {
+        const ok = values
+          && values.platform === 'macOS'
+          && typeof values.architecture === 'string'
+          && typeof values.platformVersion === 'string'
+          && values.uaFullVersion === '120.0.0.0';
+        document.body.setAttribute('data-async', ok ? 'ok' : 'bad');
+      })
+      .catch(() => document.body.setAttribute('data-async', 'rejected'));
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-sync='ok'][data-async='ok']").has_value(),
+            "navigator.userAgentData must be well-formed and getHighEntropyValues must resolve");
+}
+
 void test_event_constructor_ignores_prototype_accessors()
 {
     pagecore::Page page;
@@ -5362,6 +5409,43 @@ void test_cairo_raster_opaque_image_roundtrip()
                     "opaque image pixels must round-trip exactly through premultiply/unpremultiply");
         }
     }
+}
+
+void test_cairo_raster_zero_area_background_paints_nothing()
+{
+    // Regression: a collapsed, zero-width element carrying a background sprite
+    // (its border box and clip box are zero-area, but the origin/tile box is a
+    // full sprite sheet) must paint nothing. Previously the empty boxes skipped
+    // installing a Cairo clip, and the tiling loop still emitted a single
+    // origin-box-sized tile, smearing the whole sprite across the page — the
+    // "icon soup" seen on google.com's collapsed search buttons.
+    const pagecore::Color sprite_color{200, 0, 0, 255};
+    auto sprite = std::make_shared<pagecore::DecodedImage>();
+    sprite->width = 2;
+    sprite->height = 2;
+    sprite->rgba = {
+        200, 0, 0, 255, 200, 0, 0, 255,
+        200, 0, 0, 255, 200, 0, 0, 255};
+
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{64, 64, 1.0f};
+
+    pagecore::ImageCommand command;
+    command.rect = pagecore::Rect{20, 20, 0.0f, 30.0f};  // zero-width border box
+    command.clip = pagecore::Rect{20, 20, 0.0f, 30.0f};  // zero-width clip box
+    command.tile = pagecore::Rect{20, 0, 40.0f, 60.0f};  // full sprite tile
+    command.repeat = pagecore::ImageRepeat::Repeat;
+    command.image = sprite;
+    display_list.commands.emplace_back(command);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list);
+
+    require(image.width == 64 && image.height == 64, "zero-area image render must keep the viewport size");
+    require(!image_has_pixel(image, sprite_color),
+            "a zero-area element's background sprite must not paint anywhere");
+    require(pixel_matches(image, 30, 30, pagecore::Color{255, 255, 255, 255}),
+            "the tile area of a collapsed element must stay the background color");
 }
 
 void test_litehtml_text_width_is_deterministic()
@@ -10509,6 +10593,7 @@ int main()
         test_run_until_idle_logs_throwing_event_loop_snapshot();
         test_event_loop_ordering_contract();
         test_browser_like_web_api_shims();
+        test_navigator_user_agent_data();
         test_event_constructor_ignores_prototype_accessors();
         test_document_lifecycle_ignores_ready_state_overrides();
         test_get_computed_style_reads_display_from_stylesheets();
@@ -10628,6 +10713,7 @@ int main()
         test_background_tiling_is_bounded();
         test_cairo_raster_shares_decoded_image_surface();
         test_cairo_raster_opaque_image_roundtrip();
+        test_cairo_raster_zero_area_background_paints_nothing();
         test_litehtml_text_width_is_deterministic();
         test_image_decoder_rejects_malformed_input();
         test_cairo_raster_and_io_error_paths();

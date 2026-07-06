@@ -635,6 +635,17 @@ void draw_decoded_image(cairo_t* cr, const ImageCommand& command, float scale, R
     const bool repeat_y = command.repeat == ImageRepeat::Repeat || command.repeat == ImageRepeat::RepeatY;
     IntRect area = empty(clip) ? bounds : clip;
 
+    // A zero-area paint region paints nothing. This matters for collapsed,
+    // zero-width/height elements that still carry a background sprite (e.g. an
+    // icon button laid out at width 0): both the empty border box and the empty
+    // clip box skip installing a Cairo clip above, so without this guard the
+    // tiling loop below still emits a single origin-box-sized tile and draws the
+    // whole sprite sheet unclipped across the page.
+    if (empty(bounds) || empty(area)) {
+        cairo_restore(cr);
+        return;
+    }
+
     // Clamp the tiling area to the current target/clip extents so a huge
     // element box with a tiny tile cannot generate millions of off-page tiles.
     double ext_x0 = 0.0;
