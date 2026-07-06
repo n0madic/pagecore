@@ -375,6 +375,16 @@
         };
         global.Intl = createIntlFallback(global.Intl);
         global.location = locationFromURL(host.baseURL || '');
+        Object.defineProperty(global, 'isSecureContext', {
+          configurable: true,
+          get() {
+            const protocol = (global.location && global.location.protocol || '').toLowerCase();
+            if (protocol === 'https:' || protocol === 'wss:' || protocol === 'file:') return true;
+            const hostname = (global.location && global.location.hostname || '').toLowerCase();
+            return hostname === 'localhost' || hostname === '127.0.0.1'
+              || hostname === '::1' || hostname.endsWith('.localhost');
+          }
+        });
         global.history = {
           length: 1,
           state: null,

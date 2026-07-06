@@ -562,6 +562,47 @@ test('dom HTMLScriptElement tracks dynamic async state', () => {
   assert.strictEqual('defer' in div, false);
 });
 
+test('dom HTMLAnchorElement exposes URL decomposition members', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const anchor = document.createElement('a');
+
+  // Relative href resolves against the document base URL
+  // (https://example.test/app/index.html).
+  anchor.setAttribute('href', '/emoji?q=smile#top');
+  assert.strictEqual(anchor.href, 'https://example.test/emoji?q=smile#top');
+  assert.strictEqual(anchor.protocol, 'https:');
+  assert.strictEqual(anchor.host, 'example.test');
+  assert.strictEqual(anchor.hostname, 'example.test');
+  assert.strictEqual(anchor.pathname, '/emoji');
+  assert.strictEqual(anchor.search, '?q=smile');
+  assert.strictEqual(anchor.hash, '#top');
+  assert.strictEqual(anchor.origin, 'https://example.test');
+
+  // Regression: AngularJS urlResolve() reads pathname.charAt(0); pathname must
+  // be a string starting with '/', never undefined (blank-page bug on
+  // emojicopy.com).
+  assert.strictEqual(anchor.pathname.charAt(0), '/');
+
+  // Missing href attribute yields empty strings / ':' rather than undefined.
+  const bare = document.createElement('a');
+  assert.strictEqual(bare.href, '');
+  assert.strictEqual(bare.protocol, ':');
+  assert.strictEqual(bare.pathname, '');
+  assert.doesNotThrow(() => bare.pathname.charAt(0));
+
+  // Setters round-trip through the href attribute.
+  anchor.hash = 'bottom';
+  assert.strictEqual(anchor.hash, '#bottom');
+  assert.strictEqual(anchor.getAttribute('href'), 'https://example.test/emoji?q=smile#bottom');
+
+  // <area> shares the same HTMLHyperlinkElementUtils behaviour.
+  const area = document.createElement('area');
+  area.href = 'https://cdn.example.test/a/b/c.png';
+  assert.strictEqual(area.pathname, '/a/b/c.png');
+  assert.strictEqual(area.protocol, 'https:');
+});
+
 test('dom MutationObserver uses explicit delivery hook', () => {
   const { dom, events } = installDomEnvironment();
   const { document } = dom;

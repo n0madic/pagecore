@@ -2944,8 +2944,61 @@
           }
           reportValidity() { return this.checkValidity(); }
         }
-        class HTMLAnchorElement extends HTMLElement {}
-        class HTMLAreaElement extends HTMLElement {}
+        // Implements the HTMLHyperlinkElementUtils URL decomposition members
+        // (protocol/host/pathname/...) shared by <a> and <area>. Libraries such
+        // as AngularJS parse URLs by assigning href to an anchor and reading
+        // these back; without them the getters return undefined and callers
+        // like urlResolve() throw on `pathname.charAt(0)`.
+        function resolveHyperlinkURL(element) {
+          const attr = element.getAttribute('href');
+          if (attr == null) return null;
+          const base = global.location && global.location.href
+            ? global.location.href
+            : (host.baseURL || undefined);
+          try {
+            return new global.URL(attr, base);
+          } catch (_error) {
+            return null;
+          }
+        }
+        function mutateHyperlinkURL(element, apply) {
+          const url = resolveHyperlinkURL(element);
+          if (!url) return;
+          apply(url);
+          element.setAttribute('href', url.href);
+        }
+        class HTMLHyperlinkElement extends HTMLElement {
+          get href() {
+            const url = resolveHyperlinkURL(this);
+            return url ? url.href : (this.getAttribute('href') || '');
+          }
+          set href(value) { this.setAttribute('href', String(value)); }
+          get origin() { const url = resolveHyperlinkURL(this); return url ? url.origin : ''; }
+          get protocol() { const url = resolveHyperlinkURL(this); return url ? url.protocol : ':'; }
+          set protocol(value) { mutateHyperlinkURL(this, (url) => { url.protocol = value; }); }
+          get username() { const url = resolveHyperlinkURL(this); return url ? url.username : ''; }
+          set username(value) { mutateHyperlinkURL(this, (url) => { url.username = value; }); }
+          get password() { const url = resolveHyperlinkURL(this); return url ? url.password : ''; }
+          set password(value) { mutateHyperlinkURL(this, (url) => { url.password = value; }); }
+          get host() { const url = resolveHyperlinkURL(this); return url ? url.host : ''; }
+          set host(value) { mutateHyperlinkURL(this, (url) => { url.host = value; }); }
+          get hostname() { const url = resolveHyperlinkURL(this); return url ? url.hostname : ''; }
+          set hostname(value) { mutateHyperlinkURL(this, (url) => { url.hostname = value; }); }
+          get port() { const url = resolveHyperlinkURL(this); return url ? url.port : ''; }
+          set port(value) { mutateHyperlinkURL(this, (url) => { url.port = value; }); }
+          get pathname() { const url = resolveHyperlinkURL(this); return url ? url.pathname : ''; }
+          set pathname(value) { mutateHyperlinkURL(this, (url) => { url.pathname = value; }); }
+          get search() { const url = resolveHyperlinkURL(this); return url ? url.search : ''; }
+          set search(value) { mutateHyperlinkURL(this, (url) => { url.search = value; }); }
+          get hash() { const url = resolveHyperlinkURL(this); return url ? url.hash : ''; }
+          set hash(value) { mutateHyperlinkURL(this, (url) => { url.hash = value; }); }
+          toString() { return this.href; }
+        }
+        class HTMLAnchorElement extends HTMLHyperlinkElement {
+          get text() { return this.textContent || ''; }
+          set text(value) { this.textContent = String(value ?? ''); }
+        }
+        class HTMLAreaElement extends HTMLHyperlinkElement {}
         class HTMLMediaElement extends HTMLElement {
           get muted() { return this.hasAttribute('muted'); }
           set muted(value) { this.toggleAttribute('muted', Boolean(value)); }
