@@ -789,29 +789,48 @@ public:
         std::string_view tag_name,
         const std::vector<DomDocument::Attribute>& attributes) override
     {
-        litehtml::string_map attrs;
-        for (const auto& attribute : attributes) {
-            attrs[attribute.name] = attribute.value;
-        }
-        std::string sid = std::to_string(id);
-        attrs["data-pc-sid"] = sid;
+        litehtml::element::ptr parent = stack_.empty() ? nullptr : stack_.back();
 
-        auto element = document_->create_element(std::string(tag_name).c_str(), attrs);
-        if (element) {
-            tagged_elements_.emplace(std::move(sid), element);
-            if (!stack_.empty()) {
-                // appendChild may refuse (e.g. el_style only accepts text);
-                // the gumbo path drops such children the same way.
-                (void) stack_.back()->appendChild(element);
-            } else if (!root_) {
-                // First document-level element becomes the root; anything else
-                // at document level (never produced by a real DOM) is dropped,
-                // matching gumbo whose output root is the single <html>.
-                root_ = element;
+        // Skip building anything under a dropped ancestor (a null on the stack):
+        // gumbo never materializes the subtree of a node it discards, so neither
+        // do we. This also keeps the parent->appendChild below from dereferencing
+        // a null parent.
+        litehtml::element::ptr element;
+        if (stack_.empty() || parent) {
+            litehtml::string_map attrs;
+            for (const auto& attribute : attributes) {
+                attrs[attribute.name] = attribute.value;
+            }
+            std::string sid = std::to_string(id);
+            attrs["data-pc-sid"] = sid;
+
+            element = document_->create_element(std::string(tag_name).c_str(), attrs);
+            if (element) {
+                bool attached = true;
+                if (parent) {
+                    // appendChild may refuse (e.g. el_style/el_script accept only
+                    // text). Gumbo drops such children entirely, so we must not
+                    // register a refused element in tagged_elements_ — otherwise
+                    // find_tagged_element would resolve an un-cascaded orphan the
+                    // serialized path never produces.
+                    attached = parent->appendChild(element);
+                } else if (!root_) {
+                    // First document-level element becomes the root; anything else
+                    // at document level (never produced by a real DOM) is dropped,
+                    // matching gumbo whose output root is the single <html>.
+                    root_ = element;
+                } else {
+                    attached = false;
+                }
+                if (attached) {
+                    tagged_elements_.emplace(std::move(sid), element);
+                } else {
+                    element = nullptr;  // dropped: mirror gumbo, drop its subtree too
+                }
             }
         }
-        // Push even a null/detached element so enter/leave stays balanced and
-        // its subtree hangs off it rather than a wrong ancestor.
+        // Push even a null element so enter/leave stays balanced and a dropped
+        // element's subtree is dropped rather than reparented onto an ancestor.
         stack_.push_back(element);
     }
 
@@ -927,7 +946,10 @@ public:
     bool load_dom(const DomLayoutRequest& request) override
     {
         if (request.document == nullptr) {
-            throw std::runtime_error("load_dom requires a DOM document");
+            // Honour the base-class contract: an unsupported/invalid request
+            // returns false so the caller falls back to load_html(), rather
+            // than throwing out of a call site that expects a bool.
+            return false;
         }
 
         html_.clear();

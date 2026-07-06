@@ -2831,6 +2831,31 @@ void test_css_declarations_require_tree_rebuild()
             "a value mentioning 'display' must not be mistaken for the display property");
     require(!css_declarations_require_tree_rebuild("font-family:'position sans'"),
             "a quoted value must not be mistaken for a structure property");
+
+    // A structural property obscured by a CSS comment must still be detected:
+    // litehtml strips comments before applying inline styles, so the gate must too.
+    require(css_declarations_require_tree_rebuild("color:red;/*x*/display:none"),
+            "a comment before a structural property must not hide it from the gate");
+    require(css_declarations_require_tree_rebuild("display/**/:none"),
+            "a comment between the property name and colon must not hide it");
+    require(!css_declarations_require_tree_rebuild("color:red/*display:none*/"),
+            "a structural keyword inside a comment must be ignored");
+    // A CSS escape in the name can hide a structural property; be conservative.
+    require(css_declarations_require_tree_rebuild("\\64 isplay:none"),
+            "an escaped property name must conservatively force a rebuild");
+
+    // inline_style_property_value stays consistent with the shared tokenizer.
+    require(pagecore::inline_style_property_value("width:10px;height:20px", "height")
+                == std::optional<std::string>("20px"),
+            "inline_style_property_value reads a declared property");
+    require(pagecore::inline_style_property_value("color:red;/*c*/width:12px", "width")
+                == std::optional<std::string>("12px"),
+            "inline_style_property_value skips comments between declarations");
+    require(pagecore::inline_style_property_value("width:5px !important", "width")
+                == std::optional<std::string>("5px"),
+            "inline_style_property_value strips !important");
+    require(!pagecore::inline_style_property_value("width:5px", "height").has_value(),
+            "inline_style_property_value returns nullopt for an absent property");
 }
 
 void test_css_scan_attribute_selectors()
@@ -9273,6 +9298,30 @@ void test_layout_engine_inline_style_patch_inherited_properties()
             "the child must inherit the parent's new font-size after the patch");
 }
 
+void test_layout_engine_load_dom_drops_refused_style_child()
+{
+    // A JS-created element child of <style> is refused by litehtml (el_style
+    // accepts only text). It must not be registered by NodeId, matching the
+    // gumbo/serialized path which never materializes it, so computed_style
+    // resolves nullopt rather than an un-cascaded orphan.
+    pagecore::Page page;
+    page.load_html("<html><head><style id='s'>.a{}</style></head><body></body></html>", "https://example.test/");
+    page.eval(
+        "var sp = document.createElement('span');"
+        "sp.id = 'orphan';"
+        "sp.textContent = 'x';"
+        "document.getElementById('s').appendChild(sp);");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{400, 300, 1.0f};
+    (void) page.display_list(options);
+
+    const pagecore::NodeId orphan = page.document().get_element_by_id("orphan");
+    require(orphan != pagecore::kInvalidNodeId, "the JS-created span must exist in the DOM");
+    require(!page.computed_style(orphan).has_value(),
+            "a style-refused element must not resolve a computed style (no un-cascaded orphan)");
+}
+
 void test_layout_engine_inline_style_patch_display_none_target_refuses()
 {
     const pagecore::Viewport viewport{400, 300, 1.0f};
@@ -9458,6 +9507,32 @@ void test_page_direct_dom_memoization()
         page.document().get_element_by_id("x"), page.document().create_element("span"));
     (void) page.display_list(options);
     require(*counting->builds == 3, "a structural DOM mutation must rebuild the styled document");
+}
+
+void test_page_direct_dom_fallback_emits_no_spurious_load_dom_event()
+{
+    // SlowGeometryEngine does not override load_dom, so under the DirectDom
+    // default the load falls back to load_html. Only the load_html event must
+    // be emitted — not a spurious zero-work load_dom event.
+    auto factory = std::make_shared<SlowGeometryFactory>();
+    pagecore::Page page;  // DirectDom default
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'>hi</div></body></html>", "https://example.test/");
+
+    std::vector<pagecore::PerfEvent> events;
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{320, 240, 1.0f};
+    options.perf_trace = [&](const pagecore::PerfEvent& e) { events.push_back(e); };
+    (void) page.display_list(options);
+
+    const bool emitted_load_dom = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.name == "load_dom";
+    });
+    const bool emitted_load_html = std::any_of(events.begin(), events.end(), [](const pagecore::PerfEvent& e) {
+        return e.name == "load_html";
+    });
+    require(!emitted_load_dom, "an engine without direct-DOM support must not emit a spurious load_dom event");
+    require(emitted_load_html, "the serialized fallback must emit a load_html event");
 }
 
 void test_page_direct_dom_geometry_and_computed_style_equivalence()
@@ -10243,11 +10318,13 @@ int main()
         test_layout_engine_inline_style_patch_matches_fresh_build();
         test_layout_engine_inline_style_patch_unknown_key_is_noop();
         test_layout_engine_inline_style_patch_inherited_properties();
+        test_layout_engine_load_dom_drops_refused_style_child();
         test_layout_engine_inline_style_patch_display_none_target_refuses();
         test_page_direct_dom_layout_display_list_parity();
         test_page_direct_dom_noscript_and_enable_js();
         test_page_direct_dom_absolute_percent_second_pass();
         test_page_direct_dom_memoization();
+        test_page_direct_dom_fallback_emits_no_spurious_load_dom_event();
         test_page_direct_dom_geometry_and_computed_style_equivalence();
         test_page_direct_dom_preserves_js_created_nesting();
         test_page_serialized_layout_input_still_available();

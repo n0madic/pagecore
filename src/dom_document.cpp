@@ -258,6 +258,28 @@ std::string append_css_declarations(std::string_view style, std::string_view ext
     return out;
 }
 
+// Resolves layout style overrides to the live element nodes they target, applying
+// the same validity filter (known node, element, non-empty extra style) that both
+// layout-view emitters (serialize_html_for_layout and visit_layout_tree) require,
+// so the two paths can never disagree on which overrides apply.
+std::unordered_map<lxb_dom_node_t*, const std::string*> collect_layout_style_overrides(
+    const std::unordered_map<NodeId, lxb_dom_node_t*>& id_to_node,
+    const std::vector<DomDocument::LayoutStyleOverride>& overrides)
+{
+    std::unordered_map<lxb_dom_node_t*, const std::string*> resolved;
+    for (const auto& override : overrides) {
+        const auto found = id_to_node.find(override.node);
+        if (found == id_to_node.end()
+            || found->second == nullptr
+            || found->second->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || override.extra_style.empty()) {
+            continue;
+        }
+        resolved[found->second] = &override.extra_style;
+    }
+    return resolved;
+}
+
 bool is_document_like_node(lxb_dom_node_t* node)
 {
     return node != nullptr
@@ -1215,28 +1237,56 @@ std::vector<DomDocument::Attribute> DomDocument::attributes(NodeId id) const
 
 namespace {
 
-// Builds an InlineStyle journal detail for a write to the "style" attribute of a
-// layout element (not a <style>/<link>/<base>, whose style writes are handled as
-// stylesheet mutations). Returns a Kind::Other detail otherwise. `old_value` is
-// read before the mutation; `new_value` empty with has_new_value=false marks a
-// removal.
-LayoutMutationRecord make_style_detail(
-    lxb_dom_element_t* element,
-    std::string_view lower_name,
-    std::string_view old_value,
-    bool had_old_value,
-    std::string_view new_value,
-    bool has_new_value)
+// ASCII case-insensitive equality, allocation-free (unlike ascii_lower).
+bool ascii_iequals(std::string_view a, std::string_view b)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reads an element attribute, distinguishing absent (nullopt) from present-but-
+// empty (empty string) — unlike to_string(), which collapses both.
+std::optional<std::string> element_attribute_value(lxb_dom_element_t* element, std::string_view name)
+{
+    size_t len = 0;
+    const auto* value = lxb_dom_element_get_attribute(
+        element,
+        reinterpret_cast<const lxb_char_t*>(name.data()),
+        name.size(),
+        &len);
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(reinterpret_cast<const char*>(value), len);
+}
+
+// A write to the "style" attribute of a layout element (not a <style>/<link>/
+// <base>, whose style writes are stylesheet mutations) is a targeted inline-style
+// change the layout patcher can apply without a rebuild.
+bool is_inline_style_write(lxb_dom_element_t* element, std::string_view name)
+{
+    return ascii_iequals(name, "style") && !is_stylesheet_element(lxb_dom_interface_node(element));
+}
+
+// Builds the InlineStyle journal detail from the pre-mutation and post-mutation
+// style values (post absent = the attribute was removed).
+LayoutMutationRecord make_inline_style_detail(
+    const std::optional<std::string>& old_style,
+    const std::optional<std::string>& new_style)
 {
     LayoutMutationRecord detail;
-    if (lower_name != "style" || is_stylesheet_element(lxb_dom_interface_node(element))) {
-        return detail;
-    }
     detail.kind = LayoutMutationRecord::Kind::InlineStyle;
-    detail.old_value = std::string(old_value);
-    detail.had_old_value = had_old_value;
-    detail.new_value = std::string(new_value);
-    detail.has_new_value = has_new_value;
+    detail.had_old_value = old_style.has_value();
+    detail.old_value = old_style.value_or(std::string());
+    detail.has_new_value = new_style.has_value();
+    detail.new_value = new_style.value_or(std::string());
     return detail;
 }
 
@@ -1245,24 +1295,12 @@ LayoutMutationRecord make_style_detail(
 void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_view value)
 {
     auto* element = impl_->require_element(id);
-    const std::string lower_name = ascii_lower(name);
+    const bool inline_style = is_inline_style_write(element, name);
 
     // Read the old style value before the write so the journal can reconstruct
     // exactly what changed for a targeted inline-style patch.
-    std::string old_style;
-    bool had_old_style = false;
-    if (lower_name == "style" && !is_stylesheet_element(lxb_dom_interface_node(element))) {
-        size_t old_len = 0;
-        const auto* old_value = lxb_dom_element_get_attribute(
-            element,
-            reinterpret_cast<const lxb_char_t*>("style"),
-            5,
-            &old_len);
-        if (old_value != nullptr) {
-            had_old_style = true;
-            old_style.assign(reinterpret_cast<const char*>(old_value), old_len);
-        }
-    }
+    const std::optional<std::string> old_style =
+        inline_style ? element_attribute_value(element, "style") : std::nullopt;
 
     auto* attr = lxb_dom_element_set_attribute(
         element,
@@ -1279,29 +1317,17 @@ void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_vi
         impl_->node_affects_layout(lxb_dom_interface_node(element)) && impl_->attribute_affects_layout(name),
         id,
         is_stylesheet_element(lxb_dom_interface_node(element)),
-        make_style_detail(element, lower_name, old_style, had_old_style, value, /*has_new_value=*/true));
+        inline_style ? make_inline_style_detail(old_style, std::string(value)) : LayoutMutationRecord{});
 }
 
 void DomDocument::remove_attribute(NodeId id, std::string_view name)
 {
     const bool had_attribute = has_attribute(id, name);
     auto* element = impl_->require_element(id);
-    const std::string lower_name = ascii_lower(name);
+    const bool inline_style = is_inline_style_write(element, name);
 
-    std::string old_style;
-    bool had_old_style = false;
-    if (had_attribute && lower_name == "style" && !is_stylesheet_element(lxb_dom_interface_node(element))) {
-        size_t old_len = 0;
-        const auto* old_value = lxb_dom_element_get_attribute(
-            element,
-            reinterpret_cast<const lxb_char_t*>("style"),
-            5,
-            &old_len);
-        if (old_value != nullptr) {
-            had_old_style = true;
-            old_style.assign(reinterpret_cast<const char*>(old_value), old_len);
-        }
-    }
+    const std::optional<std::string> old_style =
+        (had_attribute && inline_style) ? element_attribute_value(element, "style") : std::nullopt;
 
     const auto status = lxb_dom_element_remove_attribute(
         element,
@@ -1317,7 +1343,7 @@ void DomDocument::remove_attribute(NodeId id, std::string_view name)
             impl_->node_affects_layout(lxb_dom_interface_node(element)) && impl_->attribute_affects_layout(name),
             id,
             is_stylesheet_element(lxb_dom_interface_node(element)),
-            make_style_detail(element, lower_name, old_style, had_old_style, std::string_view(), /*has_new_value=*/false));
+            inline_style ? make_inline_style_detail(old_style, std::nullopt) : LayoutMutationRecord{});
     }
 }
 
@@ -1464,16 +1490,8 @@ std::string DomDocument::serialize_html_for_layout(
             set_layout_id_attribute(lxb_dom_interface_element(node), impl_->id_for(node), transient_restore);
         }
 
-        for (const auto& override : style_overrides) {
-            const auto found = impl_->id_to_node.find(override.node);
-            if (found == impl_->id_to_node.end()
-                || found->second == nullptr
-                || found->second->type != LXB_DOM_NODE_TYPE_ELEMENT
-                || override.extra_style.empty()) {
-                continue;
-            }
-
-            auto* element = lxb_dom_interface_element(found->second);
+        for (const auto& [node, extra_style] : collect_layout_style_overrides(impl_->id_to_node, style_overrides)) {
+            auto* element = lxb_dom_interface_element(node);
             size_t old_len = 0;
             const auto* old_style = lxb_dom_element_get_attribute(
                 element,
@@ -1482,7 +1500,7 @@ std::string DomDocument::serialize_html_for_layout(
                 &old_len);
             const std::string merged_style = append_css_declarations(
                 old_style == nullptr ? std::string_view() : std::string_view(reinterpret_cast<const char*>(old_style), old_len),
-                override.extra_style);
+                *extra_style);
             set_transient_attribute(element, "style", merged_style, transient_restore);
         }
 
@@ -1516,17 +1534,11 @@ void DomDocument::visit_layout_tree(
     bool omit_js_disabled_content,
     const std::vector<LayoutStyleOverride>& style_overrides) const
 {
-    std::unordered_map<lxb_dom_node_t*, const std::string*> override_styles;
-    for (const auto& override : style_overrides) {
-        const auto found = impl_->id_to_node.find(override.node);
-        if (found == impl_->id_to_node.end()
-            || found->second == nullptr
-            || found->second->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || override.extra_style.empty()) {
-            continue;
-        }
-        override_styles[found->second] = &override.extra_style;
+    if (impl_ == nullptr) {
+        return;
     }
+
+    const auto override_styles = collect_layout_style_overrides(impl_->id_to_node, style_overrides);
 
     // Iterative walk — recursion would overflow the native stack on deeply
     // nested DOM trees (attacker-controlled via HTML or JS).
@@ -1606,8 +1618,11 @@ void DomDocument::visit_layout_tree(
             stack.push_back(child_frame);
             break;
         }
-        case LXB_DOM_NODE_TYPE_TEXT:
-        case LXB_DOM_NODE_TYPE_CDATA_SECTION: {
+        case LXB_DOM_NODE_TYPE_TEXT: {
+            // Coalesce only adjacent plain text nodes. A CDATA section is inert
+            // (litehtml's gumbo path builds an el_cdata that never lays out), so
+            // it breaks the run and is skipped in the default case below, rather
+            // than being merged into visible layout text.
             std::string text = character_data(current);
             auto* scan = frame.next_child;
             while (scan != nullptr) {
@@ -1615,7 +1630,7 @@ void DomDocument::visit_layout_tree(
                     scan = scan->next;
                     continue;
                 }
-                if (is_text_content_descendant(scan)) {
+                if (scan->type == LXB_DOM_NODE_TYPE_TEXT) {
                     text += character_data(scan);
                     scan = scan->next;
                     continue;
@@ -1632,13 +1647,16 @@ void DomDocument::visit_layout_tree(
             visitor.comment(character_data(current));
             break;
         default:
-            break;  // doctype, processing instructions
+            break;  // doctype, processing instructions, inert CDATA sections
         }
     }
 }
 
 DomDocument::QuirksMode DomDocument::quirks_mode() const
 {
+    if (impl_ == nullptr) {
+        return QuirksMode::NoQuirks;
+    }
     switch (impl_->document->dom_document.compat_mode) {
     case LXB_DOM_DOCUMENT_CMODE_QUIRKS:
         return QuirksMode::Quirks;

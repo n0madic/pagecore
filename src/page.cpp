@@ -96,9 +96,6 @@ struct Page::Impl {
     StyledDocumentCacheKey styled_document_key;
     bool styled_document_valid = false;
     bool styled_document_laid_out = false;
-    // Set when the current styled document was last advanced by an in-place
-    // inline-style patch rather than a rebuild. Observability only.
-    bool styled_document_patched = false;
     // getComputedStyle() has no viewport argument; it resolves against the
     // most recently used render viewport (or the engine default if the page
     // hasn't been rendered yet).
@@ -178,7 +175,6 @@ struct Page::Impl {
         geometry_forced_layout_us = 0;
         geometry_cache_forget_version = document.forget_version();
         last_known_geometry.clear();
-        styled_document_patched = false;
         computed_style_property_bounded_mode = false;
         computed_style_property_forced_rebuild_count = 0;
         computed_style_property_forced_rebuild_us = 0;
@@ -388,15 +384,21 @@ struct Page::Impl {
             request.omit_js_disabled_content = options.enable_js;
             request.style_overrides = &style_overrides;
 
-            bool loaded = false;
-            {
-                PerfScope trace(perf_trace_for(render_options), PerfPhase::LitehtmlLoadHtml, "load_dom");
-                trace.event().property = "absolute_percent_corrected:"
+            // Time load_dom manually and emit the "load_dom" event only when it
+            // actually loaded the document. A PerfScope here would fire even on
+            // the fallback path, emitting a spurious "load_dom" alongside the
+            // real "load_html" for engines that don't support direct DOM input.
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool loaded = engine.load_dom(request);
+            if (loaded) {
+                PerfEvent event{PerfPhase::LitehtmlLoadHtml, "load_dom",
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0).count(),
+                    0};
+                event.property = "absolute_percent_corrected:"
                     + std::to_string(absolute_percent_corrected ? 1 : 0)
                     + ";style_overrides:" + std::to_string(style_overrides.size());
-                loaded = engine.load_dom(request);
-            }
-            if (loaded) {
+                emit_perf_trace(perf_trace_for(render_options), std::move(event));
                 return;
             }
         }
@@ -935,7 +937,6 @@ struct Page::Impl {
         // downstream consumer then behaves exactly as after a rebuild.
         styled_document_key.layout_mutation_version = key.layout_mutation_version;
         styled_document_laid_out = false;
-        styled_document_patched = true;
         return true;
     }
 
@@ -994,7 +995,6 @@ struct Page::Impl {
         styled_document_key = std::move(key);
         styled_document_valid = true;
         styled_document_laid_out = false;
-        styled_document_patched = false;
         return *styled_document;
     }
 

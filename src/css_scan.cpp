@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>
+#include <functional>
+#include <string>
 
 #include "util.hpp"
 
@@ -28,6 +30,100 @@ bool ends_with_important(std::string_view value)
         return false;
     }
     return ascii_lower(value.substr(value.size() - 10)) == "!important";
+}
+
+// Iterates the property/value pairs of an inline `style="..."` declaration list,
+// invoking `cb(name, value)` once per declaration. Both are trimmed of ASCII
+// whitespace. CSS comments (/* ... */) are stripped everywhere except inside
+// strings, quoting and parenthesis nesting are honoured for `;`/`:` boundaries,
+// and backslash escapes inside strings are passed through. This is the shared
+// primitive behind inline_style_property_value and css_declarations_require_tree_rebuild
+// so their tokenization can never drift, and so both agree with a spec CSS
+// tokenizer on comment/escape edge cases (litehtml strips comments before it
+// applies inline styles).
+void for_each_css_declaration(
+    std::string_view style,
+    const std::function<void(std::string_view name, std::string_view value)>& cb)
+{
+    std::string name;
+    std::string value;
+    bool in_value = false;  // seen the top-level ':' separating name from value
+    int paren_depth = 0;
+    char quote = '\0';
+    bool in_comment = false;
+
+    auto push = [&](char ch) {
+        if (in_value) {
+            value.push_back(ch);
+        } else {
+            name.push_back(ch);
+        }
+    };
+
+    auto flush = [&]() {
+        const std::string_view trimmed_name = trim_ascii(name);
+        if (in_value && !trimmed_name.empty()) {
+            cb(trimmed_name, trim_ascii(value));
+        }
+        name.clear();
+        value.clear();
+        in_value = false;
+        paren_depth = 0;
+        quote = '\0';
+    };
+
+    for (std::size_t i = 0; i < style.size(); ++i) {
+        const char ch = style[i];
+        if (in_comment) {
+            if (ch == '*' && i + 1 < style.size() && style[i + 1] == '/') {
+                in_comment = false;
+                ++i;
+            }
+            continue;
+        }
+        if (quote != '\0') {
+            push(ch);
+            if (ch == '\\' && i + 1 < style.size()) {
+                push(style[i + 1]);
+                ++i;
+            } else if (ch == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (ch == '/' && i + 1 < style.size() && style[i + 1] == '*') {
+            in_comment = true;
+            ++i;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+            push(ch);
+            continue;
+        }
+        if (ch == '(') {
+            ++paren_depth;
+            push(ch);
+            continue;
+        }
+        if (ch == ')') {
+            if (paren_depth > 0) {
+                --paren_depth;
+            }
+            push(ch);
+            continue;
+        }
+        if (ch == ':' && !in_value && paren_depth == 0) {
+            in_value = true;  // the colon itself is not part of either side
+            continue;
+        }
+        if (ch == ';' && paren_depth == 0) {
+            flush();
+            continue;
+        }
+        push(ch);
+    }
+    flush();  // the trailing declaration (no closing ';')
 }
 
 bool is_css_attribute_name_char(unsigned char ch)
@@ -114,98 +210,20 @@ std::optional<std::string> inline_style_property_value(std::string_view style, s
         return std::nullopt;
     }
 
-    std::size_t segment_start = 0;
-    int paren_depth = 0;
-    char quote = '\0';
-
-    auto parse_segment = [&](std::string_view segment) -> std::optional<std::string> {
-        segment = trim_ascii(segment);
-        if (segment.empty()) {
-            return std::nullopt;
+    std::optional<std::string> result;
+    for_each_css_declaration(style, [&](std::string_view name, std::string_view value) {
+        // First matching declaration wins, mirroring the previous scanner.
+        if (result || ascii_lower(name) != wanted) {
+            return;
         }
-
-        std::size_t colon = std::string_view::npos;
-        int local_paren_depth = 0;
-        char local_quote = '\0';
-        for (std::size_t i = 0; i < segment.size(); ++i) {
-            const char ch = segment[i];
-            if (local_quote != '\0') {
-                if (ch == '\\' && i + 1 < segment.size()) {
-                    ++i;
-                    continue;
-                }
-                if (ch == local_quote) {
-                    local_quote = '\0';
-                }
-                continue;
-            }
-            if (ch == '"' || ch == '\'') {
-                local_quote = ch;
-                continue;
-            }
-            if (ch == '(') {
-                ++local_paren_depth;
-                continue;
-            }
-            if (ch == ')' && local_paren_depth > 0) {
-                --local_paren_depth;
-                continue;
-            }
-            if (ch == ':' && local_paren_depth == 0) {
-                colon = i;
-                break;
-            }
+        std::string parsed(value);
+        if (ends_with_important(parsed)) {
+            parsed.erase(parsed.size() - 10);
+            parsed = std::string(trim_ascii(parsed));
         }
-        if (colon == std::string_view::npos) {
-            return std::nullopt;
-        }
-
-        if (ascii_lower(trim_ascii(segment.substr(0, colon))) != wanted) {
-            return std::nullopt;
-        }
-
-        std::string value(trim_ascii(segment.substr(colon + 1)));
-        if (ends_with_important(value)) {
-            value.erase(value.size() - 10);
-            value = std::string(trim_ascii(value));
-        }
-        return value;
-    };
-
-    for (std::size_t i = 0; i <= style.size(); ++i) {
-        const bool at_end = i == style.size();
-        const char ch = at_end ? ';' : style[i];
-        if (quote != '\0') {
-            if (ch == '\\' && i + 1 < style.size()) {
-                ++i;
-                continue;
-            }
-            if (ch == quote) {
-                quote = '\0';
-            }
-            continue;
-        }
-        if (ch == '"' || ch == '\'') {
-            quote = ch;
-            continue;
-        }
-        if (ch == '(') {
-            ++paren_depth;
-            continue;
-        }
-        if (ch == ')' && paren_depth > 0) {
-            --paren_depth;
-            continue;
-        }
-        if ((at_end || ch == ';') && paren_depth == 0) {
-            if (auto value = parse_segment(style.substr(segment_start, i - segment_start))) {
-                return value;
-            }
-            segment_start = i + 1;
-        }
-    }
-
-    return std::nullopt;
+        result = std::move(parsed);
+    });
+    return result;
 }
 
 std::optional<float> parse_css_percentage(std::string_view value)
@@ -236,61 +254,30 @@ std::optional<float> parse_css_percentage(std::string_view value)
 
 bool css_declarations_require_tree_rebuild(std::string_view style)
 {
-    auto property_forces_rebuild = [](std::string_view name) {
-        const std::string lower = ascii_lower(trim_ascii(name));
-        return lower == "display"
+    bool rebuild = false;
+    for_each_css_declaration(style, [&](std::string_view name, std::string_view value) {
+        (void) value;
+        if (rebuild) {
+            return;
+        }
+        // A CSS escape in the property name (e.g. "\64 isplay") can hide a
+        // structural property from a plain name comparison; we can't reliably
+        // decode it here, so treat any escaped name conservatively as a rebuild.
+        if (name.find('\\') != std::string_view::npos) {
+            rebuild = true;
+            return;
+        }
+        const std::string lower = ascii_lower(name);
+        if (lower == "display"
             || lower == "position"
             || lower == "float"
             || lower == "content"
             || lower == "direction"
-            || lower.rfind("list-style", 0) == 0;
-    };
-
-    std::size_t segment_start = 0;
-    int paren_depth = 0;
-    char quote = '\0';
-
-    auto scan_segment = [&](std::string_view segment) {
-        const std::size_t colon = segment.find(':');
-        if (colon == std::string_view::npos) {
-            return false;
+            || lower.rfind("list-style", 0) == 0) {
+            rebuild = true;
         }
-        return property_forces_rebuild(segment.substr(0, colon));
-    };
-
-    for (std::size_t i = 0; i <= style.size(); ++i) {
-        const bool at_end = i == style.size();
-        const char ch = at_end ? ';' : style[i];
-        if (quote != '\0') {
-            if (ch == '\\' && i + 1 < style.size()) {
-                ++i;
-                continue;
-            }
-            if (ch == quote) {
-                quote = '\0';
-            }
-            continue;
-        }
-        if (ch == '"' || ch == '\'') {
-            quote = ch;
-            continue;
-        }
-        if (ch == '(') {
-            ++paren_depth;
-            continue;
-        }
-        if (ch == ')' && paren_depth > 0) {
-            --paren_depth;
-            continue;
-        }
-        if (ch == ';' && paren_depth == 0) {
-            if (scan_segment(style.substr(segment_start, i - segment_start))) {
-                return true;
-            }
-            segment_start = i + 1;
-        }
-    }
-    return false;
+    });
+    return rebuild;
 }
 
 std::optional<std::string> default_computed_style_property_value(
