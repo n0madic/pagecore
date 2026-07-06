@@ -642,10 +642,22 @@ void DomDocument::Impl::mark_layout_dirty_from(lxb_dom_node_t* anchor)
     }
 }
 
+void DomDocument::Impl::record_layout_mutation(LayoutMutationRecord record)
+{
+    layout_journal.push_back(std::move(record));
+    if (layout_journal.size() > kLayoutJournalCap) {
+        // Evicting the oldest record means versions up to and including it can no
+        // longer be answered completely; advance the base to its version.
+        layout_journal_base = layout_journal.front().layout_mutation_version;
+        layout_journal.pop_front();
+    }
+}
+
 void DomDocument::Impl::mark_mutated(
     bool affects_layout,
     NodeId layout_node,
-    bool affects_stylesheets)
+    bool affects_stylesheets,
+    LayoutMutationRecord detail)
 {
     ++mutation_version;
     if (affects_layout) {
@@ -661,6 +673,11 @@ void DomDocument::Impl::mark_mutated(
                 dirty_epochs[layout_node].self_version = layout_mutation_version;
             }
         }
+        // Exactly one journal record per layout bump. Callers fill kind/value
+        // fields for InlineStyle; node and version are stamped here.
+        detail.layout_mutation_version = layout_mutation_version;
+        detail.node = layout_node;
+        record_layout_mutation(std::move(detail));
     }
 }
 
@@ -882,6 +899,9 @@ void DomDocument::parse(std::string_view html)
     impl_->forget_version = carried_forget_version + 1;
     impl_->scripting_enabled = carried_scripting_enabled;
     lxb_html_document_scripting_set(impl_->document, carried_scripting_enabled);
+    // The fresh Impl starts with an empty journal; align its base with the
+    // carried layout version so pre-parse versions read as incomplete.
+    impl_->layout_journal_base = impl_->layout_mutation_version;
 
     const auto status = lxb_html_document_parse(
         impl_->document,
@@ -1112,6 +1132,35 @@ void DomDocument::set_layout_sensitive_attributes(std::vector<std::string> attri
     }
 }
 
+LayoutMutationJournal DomDocument::layout_mutations_since(std::uint64_t since_version) const
+{
+    LayoutMutationJournal journal;
+    if (impl_ == nullptr) {
+        return journal;
+    }
+    // Complete iff the retained window covers everything after since_version:
+    // records span (layout_journal_base, layout_mutation_version].
+    journal.complete = since_version >= impl_->layout_journal_base;
+    for (const auto& record : impl_->layout_journal) {
+        if (record.layout_mutation_version > since_version) {
+            journal.records.push_back(record);
+        }
+    }
+    return journal;
+}
+
+bool DomDocument::is_layout_sensitive_attribute(std::string_view name) const
+{
+    if (impl_ == nullptr) {
+        return false;
+    }
+    if (impl_->layout_sensitive_attribute_wildcard) {
+        return true;
+    }
+    return impl_->layout_sensitive_attributes.find(ascii_lower(name))
+        != impl_->layout_sensitive_attributes.end();
+}
+
 std::uint64_t DomDocument::forget_version() const
 {
     return impl_ == nullptr ? 0 : impl_->forget_version;
@@ -1164,9 +1213,57 @@ std::vector<DomDocument::Attribute> DomDocument::attributes(NodeId id) const
     return out;
 }
 
+namespace {
+
+// Builds an InlineStyle journal detail for a write to the "style" attribute of a
+// layout element (not a <style>/<link>/<base>, whose style writes are handled as
+// stylesheet mutations). Returns a Kind::Other detail otherwise. `old_value` is
+// read before the mutation; `new_value` empty with has_new_value=false marks a
+// removal.
+LayoutMutationRecord make_style_detail(
+    lxb_dom_element_t* element,
+    std::string_view lower_name,
+    std::string_view old_value,
+    bool had_old_value,
+    std::string_view new_value,
+    bool has_new_value)
+{
+    LayoutMutationRecord detail;
+    if (lower_name != "style" || is_stylesheet_element(lxb_dom_interface_node(element))) {
+        return detail;
+    }
+    detail.kind = LayoutMutationRecord::Kind::InlineStyle;
+    detail.old_value = std::string(old_value);
+    detail.had_old_value = had_old_value;
+    detail.new_value = std::string(new_value);
+    detail.has_new_value = has_new_value;
+    return detail;
+}
+
+} // namespace
+
 void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_view value)
 {
     auto* element = impl_->require_element(id);
+    const std::string lower_name = ascii_lower(name);
+
+    // Read the old style value before the write so the journal can reconstruct
+    // exactly what changed for a targeted inline-style patch.
+    std::string old_style;
+    bool had_old_style = false;
+    if (lower_name == "style" && !is_stylesheet_element(lxb_dom_interface_node(element))) {
+        size_t old_len = 0;
+        const auto* old_value = lxb_dom_element_get_attribute(
+            element,
+            reinterpret_cast<const lxb_char_t*>("style"),
+            5,
+            &old_len);
+        if (old_value != nullptr) {
+            had_old_style = true;
+            old_style.assign(reinterpret_cast<const char*>(old_value), old_len);
+        }
+    }
+
     auto* attr = lxb_dom_element_set_attribute(
         element,
         reinterpret_cast<const lxb_char_t*>(name.data()),
@@ -1181,13 +1278,31 @@ void DomDocument::set_attribute(NodeId id, std::string_view name, std::string_vi
     impl_->mark_mutated(
         impl_->node_affects_layout(lxb_dom_interface_node(element)) && impl_->attribute_affects_layout(name),
         id,
-        is_stylesheet_element(lxb_dom_interface_node(element)));
+        is_stylesheet_element(lxb_dom_interface_node(element)),
+        make_style_detail(element, lower_name, old_style, had_old_style, value, /*has_new_value=*/true));
 }
 
 void DomDocument::remove_attribute(NodeId id, std::string_view name)
 {
     const bool had_attribute = has_attribute(id, name);
     auto* element = impl_->require_element(id);
+    const std::string lower_name = ascii_lower(name);
+
+    std::string old_style;
+    bool had_old_style = false;
+    if (had_attribute && lower_name == "style" && !is_stylesheet_element(lxb_dom_interface_node(element))) {
+        size_t old_len = 0;
+        const auto* old_value = lxb_dom_element_get_attribute(
+            element,
+            reinterpret_cast<const lxb_char_t*>("style"),
+            5,
+            &old_len);
+        if (old_value != nullptr) {
+            had_old_style = true;
+            old_style.assign(reinterpret_cast<const char*>(old_value), old_len);
+        }
+    }
+
     const auto status = lxb_dom_element_remove_attribute(
         element,
         reinterpret_cast<const lxb_char_t*>(name.data()),
@@ -1201,7 +1316,8 @@ void DomDocument::remove_attribute(NodeId id, std::string_view name)
         impl_->mark_mutated(
             impl_->node_affects_layout(lxb_dom_interface_node(element)) && impl_->attribute_affects_layout(name),
             id,
-            is_stylesheet_element(lxb_dom_interface_node(element)));
+            is_stylesheet_element(lxb_dom_interface_node(element)),
+            make_style_detail(element, lower_name, old_style, had_old_style, std::string_view(), /*has_new_value=*/false));
     }
 }
 

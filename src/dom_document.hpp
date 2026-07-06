@@ -47,6 +47,17 @@ struct DomDocument::Impl {
     std::unordered_set<std::string> layout_sensitive_attributes;
     bool layout_sensitive_attribute_wildcard = false;
 
+    // Bounded ring of layout-affecting mutations, one record per
+    // layout_mutation_version bump. `layout_journal_base` is the highest version
+    // for which no record is retained: records cover exactly
+    // (layout_journal_base, layout_mutation_version]. Overflow past the cap
+    // evicts the oldest record and advances the base, so queries older than the
+    // base report incomplete. Reset on parse().
+    static constexpr std::size_t kLayoutJournalCap = 64;
+    std::deque<LayoutMutationRecord> layout_journal;
+    std::uint64_t layout_journal_base = 1;
+    void record_layout_mutation(LayoutMutationRecord record);
+
     // Bumped whenever a mutation changes the CSS rules the cascade sees.
     std::uint64_t stylesheet_generation = 1;
     // Per-node self/subtree layout dirty epochs.
@@ -92,7 +103,8 @@ struct DomDocument::Impl {
     void mark_mutated(
         bool affects_layout = true,
         NodeId layout_node = kInvalidNodeId,
-        bool affects_stylesheets = false);
+        bool affects_stylesheets = false,
+        LayoutMutationRecord detail = {});
     // Marks `anchor` self-dirty and every node on anchor->root subtree-dirty at
     // the current layout_mutation_version. Called after mark_mutated so the
     // version is already bumped.

@@ -12,6 +12,31 @@ using NodeId = std::uint32_t;
 
 inline constexpr NodeId kInvalidNodeId = 0;
 
+// One layout-affecting DOM mutation, recorded in the ring buffer read back by
+// layout_mutations_since(). Exactly one record exists per layout_mutation_version
+// bump. Only InlineStyle records carry the old/new style attribute values;
+// every other layout mutation is Kind::Other with just the version and node.
+struct LayoutMutationRecord {
+    enum class Kind { InlineStyle, Other };
+    Kind kind = Kind::Other;
+    std::uint64_t layout_mutation_version = 0;  // the version after this mutation's bump
+    NodeId node = kInvalidNodeId;
+    std::string old_value;  // InlineStyle only: style attribute before the write
+    std::string new_value;  // InlineStyle only: style attribute after the write ("" = removed)
+    bool had_old_value = false;
+    bool has_new_value = false;
+};
+
+// The layout mutations that happened after a caller's known version. `complete`
+// is false when the ring buffer has evicted records the caller would need
+// (i.e. `since_version` predates the retained window), in which case `records`
+// holds only the still-retained suffix and the caller must fall back to a full
+// rebuild.
+struct LayoutMutationJournal {
+    bool complete = false;
+    std::vector<LayoutMutationRecord> records;
+};
+
 class DomDocument {
 public:
     struct Impl;
@@ -114,6 +139,18 @@ public:
     std::uint64_t subtree_dirty_layout_version(NodeId id) const;
 
     void set_layout_sensitive_attributes(std::vector<std::string> attribute_names, bool wildcard = false);
+
+    // The layout-affecting mutations recorded after `since_version` (exclusive).
+    // Used to decide whether a batch of DOM changes can be applied to an
+    // already-built layout document incrementally instead of rebuilding it.
+    LayoutMutationJournal layout_mutations_since(std::uint64_t since_version) const;
+
+    // True when `name` is referenced by an attribute selector in the current
+    // stylesheets (i.e. registered via set_layout_sensitive_attributes or the
+    // wildcard). An inline-style change is only safe to patch in isolation when
+    // "style" is NOT layout-sensitive, since a [style...] selector could make it
+    // change other elements' matches.
+    bool is_layout_sensitive_attribute(std::string_view name) const;
     // Monotonic counter bumped only when a node id is invalidated (forgotten via
     // innerHTML replacement) or the document is reparsed. Wrapper layers use it
     // to know when a cached id may have become stale.

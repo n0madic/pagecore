@@ -5288,6 +5288,142 @@ void test_dom_layout_mutation_version_ignores_service_attributes()
         "script text mutations must not invalidate layout/style cache");
 }
 
+void test_dom_layout_mutation_journal_records_inline_style()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='x' style='color:red'></div></body></html>");
+    const pagecore::NodeId x = doc.get_element_by_id("x");
+
+    const auto base = doc.layout_mutation_version();
+    doc.set_attribute(x, "style", "color:blue;width:10px");
+
+    auto journal = doc.layout_mutations_since(base);
+    require(journal.complete, "journal must be complete for a recent version");
+    require(journal.records.size() == 1, "one inline-style write must produce one record");
+    const auto& record = journal.records.front();
+    require(record.kind == pagecore::LayoutMutationRecord::Kind::InlineStyle, "record kind must be InlineStyle");
+    require(record.node == x, "record must carry the mutated node");
+    require(record.layout_mutation_version == doc.layout_mutation_version(),
+            "record version must equal the post-mutation layout version");
+    require(record.had_old_value && record.old_value == "color:red", "record must capture the pre-mutation style");
+    require(record.has_new_value && record.new_value == "color:blue;width:10px",
+            "record must capture the post-mutation style");
+
+    // Removing the attribute records a value-less InlineStyle entry.
+    const auto after_set = doc.layout_mutation_version();
+    doc.remove_attribute(x, "style");
+    auto removal = doc.layout_mutations_since(after_set);
+    require(removal.records.size() == 1, "removing style must record one entry");
+    require(removal.records.front().kind == pagecore::LayoutMutationRecord::Kind::InlineStyle,
+            "style removal must be InlineStyle");
+    require(removal.records.front().had_old_value && removal.records.front().old_value == "color:blue;width:10px",
+            "style removal must capture the old value");
+    require(!removal.records.front().has_new_value, "style removal must have no new value");
+}
+
+void test_dom_layout_mutation_journal_records_inline_style_from_js()
+{
+    pagecore::Page page;
+    page.load_html("<html><body><div id='x' style='color:red'>hi</div></body></html>", "https://example.test/");
+    const pagecore::NodeId x = page.document().get_element_by_id("x");
+
+    const auto base = page.document().layout_mutation_version();
+    page.eval("document.getElementById('x').style.width = '25px'");
+
+    auto journal = page.document().layout_mutations_since(base);
+    require(journal.complete, "journal must be complete after a JS inline-style write");
+    require(!journal.records.empty(), "a JS inline-style write must be journaled");
+    const auto& record = journal.records.back();
+    require(record.kind == pagecore::LayoutMutationRecord::Kind::InlineStyle,
+            "el.style.width writes through setAttribute('style',...) and must journal as InlineStyle");
+    require(record.node == x, "record must carry the mutated node");
+    require(record.has_new_value && record.new_value.find("width") != std::string::npos,
+            "record must capture the new style text containing the width");
+}
+
+void test_dom_layout_mutation_journal_other_kinds()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='x'>hi</div></body></html>");
+    const pagecore::NodeId x = doc.get_element_by_id("x");
+
+    const auto base = doc.layout_mutation_version();
+    doc.set_attribute(x, "class", "wide");                 // not style → Other
+    doc.append_child(x, doc.create_element("span"));        // structural → Other
+
+    auto journal = doc.layout_mutations_since(base);
+    require(journal.complete, "journal must be complete");
+    require(journal.records.size() == 2, "two layout mutations must produce two records");
+    for (const auto& record : journal.records) {
+        require(record.kind == pagecore::LayoutMutationRecord::Kind::Other,
+                "non-inline-style layout mutations must be Kind::Other");
+        require(!record.had_old_value && !record.has_new_value,
+                "Other records must not carry style values");
+    }
+}
+
+void test_dom_layout_mutation_journal_ignores_non_layout_mutations()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='x'></div></body></html>");
+    const pagecore::NodeId x = doc.get_element_by_id("x");
+
+    const auto base = doc.layout_mutation_version();
+    doc.set_attribute(x, "data-state", "ready");   // service attribute: no layout bump
+    doc.set_attribute(x, "aria-label", "Ready");   // service attribute: no layout bump
+
+    auto journal = doc.layout_mutations_since(base);
+    require(journal.complete, "journal must be complete");
+    require(journal.records.empty(), "service-attribute writes must not be journaled");
+    require(doc.layout_mutation_version() == base, "service-attribute writes must not bump the layout version");
+}
+
+void test_dom_layout_mutation_journal_ring_completeness()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='x' style='width:0px'></div></body></html>");
+    const pagecore::NodeId x = doc.get_element_by_id("x");
+
+    const auto base = doc.layout_mutation_version();
+
+    // 65 layout mutations overflow the 64-entry ring by one.
+    for (int i = 0; i < 65; ++i) {
+        doc.set_attribute(x, "style", "width:" + std::to_string(i) + "px");
+    }
+
+    // A query from the original base can no longer be answered completely.
+    auto from_base = doc.layout_mutations_since(base);
+    require(!from_base.complete, "a query older than the retained window must report incomplete");
+    require(from_base.records.size() == 64, "the ring must retain exactly its capacity of records");
+
+    // A query from within the retained window is complete.
+    const auto recent = doc.layout_mutation_version() - 3;
+    auto from_recent = doc.layout_mutations_since(recent);
+    require(from_recent.complete, "a query within the retained window must be complete");
+    require(from_recent.records.size() == 3, "exactly the three most recent records must be returned");
+    require(from_recent.records.back().new_value == "width:64px", "the last record must reflect the final write");
+}
+
+void test_dom_is_layout_sensitive_attribute()
+{
+    pagecore::DomDocument doc;
+    doc.parse("<html><body><div id='x'></div></body></html>");
+
+    require(!doc.is_layout_sensitive_attribute("style"),
+            "style must not be layout-sensitive without a matching attribute selector");
+
+    doc.set_layout_sensitive_attributes({"style", "data-role"});
+    require(doc.is_layout_sensitive_attribute("style"),
+            "style becomes layout-sensitive once a [style...] selector is registered");
+    require(doc.is_layout_sensitive_attribute("STYLE"), "attribute-name matching must be ASCII case-insensitive");
+    require(doc.is_layout_sensitive_attribute("data-role"), "registered selector attributes must be layout-sensitive");
+    require(!doc.is_layout_sensitive_attribute("class"), "unregistered attributes must not be layout-sensitive");
+
+    doc.set_layout_sensitive_attributes({}, /*wildcard=*/true);
+    require(doc.is_layout_sensitive_attribute("style"), "the wildcard makes every attribute layout-sensitive");
+    require(doc.is_layout_sensitive_attribute("anything"), "the wildcard makes every attribute layout-sensitive");
+}
+
 struct RecordingLayoutTreeVisitor : pagecore::DomDocument::LayoutTreeVisitor {
     struct Event {
         std::string kind;  // "enter", "leave", "text", "raw_text", "comment"
@@ -9551,6 +9687,12 @@ int main()
         test_deep_dom_traversal_is_iterative();
         test_deep_clone_assigns_fresh_subtree_ids();
         test_dom_layout_mutation_version_ignores_service_attributes();
+        test_dom_layout_mutation_journal_records_inline_style();
+        test_dom_layout_mutation_journal_records_inline_style_from_js();
+        test_dom_layout_mutation_journal_other_kinds();
+        test_dom_layout_mutation_journal_ignores_non_layout_mutations();
+        test_dom_layout_mutation_journal_ring_completeness();
+        test_dom_is_layout_sensitive_attribute();
         test_dom_visit_layout_tree_structure_and_attributes();
         test_dom_visit_layout_tree_omits_noscript_and_head_text();
         test_dom_visit_layout_tree_merges_style_overrides();
