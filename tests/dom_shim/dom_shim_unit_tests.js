@@ -245,6 +245,26 @@ function makeDomBridge() {
     insertBefore,
     removeChild: remove,
     cloneNode: cloneSubtree,
+    // Mirrors DomDocument::attach_shadow_root: a real node, really appended
+    // into the host, so the shim's shadow-hiding/traversal logic (exercised
+    // here, not by the C++ engine) sees a genuine parent/child relationship.
+    attachShadowRoot: (hostId) => {
+      const containerId = createNode(1, 'pc-shadowroot');
+      append(hostId, containerId);
+      return containerId;
+    },
+    // A non-zero box for any connected node, null otherwise — enough for the
+    // shim to prove getBoundingClientRect() sees a real, connected node
+    // rather than the zero-geometry a JS-only fragment would give it.
+    elementGeometry: (id) => {
+      if (!nodes.has(id)) return null;
+      for (let current = id; current != null; current = nodes.get(current).parent) {
+        if (current === documentId) {
+          return { borderX: 5, borderY: 10, borderWidth: 120, borderHeight: 40, paddingX: 5, paddingY: 10, paddingWidth: 120, paddingHeight: 40 };
+        }
+      }
+      return null;
+    },
     getElementById: (idValue) => querySelectorAll(documentId, `[id="${idValue}"]`)[0] || 0,
     querySelectorAll,
     querySelector: (id, selector) => querySelectorAll(id, selector)[0] || 0,
@@ -867,6 +887,33 @@ test('dom nextSibling/previousSibling traverse DocumentFragment children', () =>
   assert.strictEqual(c.nextSibling, null);
   assert.strictEqual(c.previousSibling, b);
   assert.strictEqual(a.previousSibling, null);
+});
+
+test('dom attachShadow builds a real connected node the host hides', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const host = document.createElement('shadow-host');
+  document.body.appendChild(host);
+
+  const root = host.attachShadow({ mode: 'open' });
+  const child = document.createElement('span');
+  root.appendChild(child);
+
+  assert.ok(root instanceof dom.ShadowRoot);
+  assert.strictEqual(root.host, host);
+  assert.strictEqual(child.parentNode, root);
+  assert.strictEqual(child.getRootNode(), root);
+
+  // A real, connected bridge node: offsetWidth/offsetHeight (backed by the
+  // same elementGeometry() bridge call as getBoundingClientRect()) resolve
+  // non-zero, unlike the always-zero geometry a JS-only fragment child would give.
+  assert.ok(child.offsetWidth > 0 && child.offsetHeight > 0,
+    `expected non-zero geometry, got ${child.offsetWidth}x${child.offsetHeight}`);
+
+  // The shadow container is a real bridge child of host, but must never leak
+  // into the host's own light-DOM traversal.
+  assert.strictEqual(host.childNodes.length, 0);
+  assert.strictEqual(host.children.length, 0);
 });
 
 test('web URLSearchParams sort uses UTF-16 code-unit order', () => {

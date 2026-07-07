@@ -1949,13 +1949,15 @@ void test_shadow_root_and_element_internals_shims()
           this.shadowRoot === root &&
           root.querySelector('#inside') === child &&
           root.adoptedStyleSheets[0] === sheet &&
-          // Shadow DOM is a JS-only simulation here (its nodes are never
-          // attached to the real lexbor tree litehtml renders from), so
-          // getComputedStyle() can't resolve rule-based styles for it —
-          // same known limitation as adoptedStyleSheets on the document.
-          getComputedStyle(child).color === '' &&
+          // Shadow content is real litehtml-rendered DOM (see
+          // attach_shadow_root), so getComputedStyle() resolves a real value
+          // here — just not the adoptedStyleSheets rule, which (like on the
+          // document) never reaches the cascade.
+          getComputedStyle(child).color === 'rgb(0, 0, 0)' &&
           child.innerText === 'Shadow text' &&
           child.checkVisibility() === true &&
+          // No positioned ancestor inside the shadow tree, so offsetParent
+          // escalates to the host — same fallback real browsers use.
           child.offsetParent === this &&
           slot.assignedNodes().length === 0 &&
           slot.assignedElements().length === 0 &&
@@ -2015,6 +2017,52 @@ void test_shadow_root_builds_tree_from_inner_html()
     require(
         page.outer_html("#host[data-slider='ok']").has_value(),
         "shadowRoot.innerHTML should parse a template into a queryable shadow tree");
+}
+
+void test_shadow_dom_hides_markers_and_container_from_js()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <shadow-host id="host"></shadow-host>
+  <script>
+    customElements.define('shadow-host', class extends HTMLElement {
+      connectedCallback () {
+        const root = this.attachShadow({ mode: 'open' });
+        const child = document.createElement('span');
+        child.textContent = 'shadow text';
+        root.appendChild(child);
+
+        const style = getComputedStyle(child);
+
+        this.setAttribute('data-check',
+          this.outerHTML.indexOf('data-pc-shadow') === -1 &&
+          this.outerHTML.indexOf('pc-shadowroot') === -1 &&
+          this.innerHTML.indexOf('data-pc-shadow') === -1 &&
+          this.innerHTML.indexOf('pc-shadowroot') === -1 &&
+          !this.hasAttribute('data-pc-shadow-host') &&
+          this.getAttribute('data-pc-shadow-host') === null &&
+          this.getAttributeNames().every((name) => !name.startsWith('data-pc-shadow')) &&
+          // Only the two marker attributes are hidden from query selectors;
+          // reaching into shadow content itself is still allowed (no full
+          // encapsulation — see attach_shadow_root's documented scope).
+          document.querySelector('[data-pc-shadow-root]') === null &&
+          document.querySelector('[data-pc-shadow-host]') === null &&
+          document.querySelector('span').textContent === 'shadow text' &&
+          style.display !== ''
+            ? 'ok'
+            : 'bad');
+      }
+    });
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("#host[data-check='ok']").has_value(),
+        "shadow bookkeeping markers and the container must stay invisible to "
+        "outerHTML/innerHTML/getAttribute*/querySelector, while getComputedStyle "
+        "still resolves real values for shadow content");
 }
 
 void test_custom_elements_with_private_fields_construct_instances()
@@ -7576,6 +7624,42 @@ void test_tiny_tiled_background_does_not_explode()
             "(the tile-count cap prevents a CPU DoS)");
 }
 
+void test_shadow_dom_paints_real_content_and_hides_light_dom()
+{
+    // Shadow content is a real Lexbor subtree (see DomDocument::attach_shadow_root),
+    // so it must reach litehtml's layout/paint pipeline exactly like ordinary DOM —
+    // and, with no <slot>, the host's light-DOM child must never be laid out at all.
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <color-host id="host" style="display:block;width:40px;height:30px"></color-host>
+  <script>
+    customElements.define('color-host', class extends HTMLElement {
+      connectedCallback () {
+        const root = this.attachShadow({ mode: 'open' });
+        const shadowBlock = document.createElement('div');
+        shadowBlock.setAttribute('style', 'width:40px;height:30px;background-color:rgb(10,20,30)');
+        root.appendChild(shadowBlock);
+
+        const lightChild = document.createElement('div');
+        lightChild.setAttribute('style', 'width:40px;height:30px;background-color:rgb(200,50,60)');
+        this.appendChild(lightChild);
+      }
+    });
+  </script>
+</body></html>
+)HTML");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{60, 50, 1.0f};
+    const auto image = page.render(options);
+
+    require(pixel_matches(image, 10, 10, pagecore::Color{10, 20, 30, 255}),
+            "shadow-tree content should paint through the real lexbor/litehtml pipeline");
+    require(!image_has_pixel(image, pagecore::Color{200, 50, 60, 255}),
+            "host's light-DOM child has no slot to be distributed into and must not render");
+}
+
 void test_page_render_uses_web_font_formats()
 {
     const auto fallback_image = [] {
@@ -10866,6 +10950,7 @@ int main()
         test_custom_elements_registry_shim();
         test_shadow_root_and_element_internals_shims();
         test_shadow_root_builds_tree_from_inner_html();
+        test_shadow_dom_hides_markers_and_container_from_js();
         test_custom_elements_with_private_fields_construct_instances();
         test_external_script_via_resource_loader();
         test_current_script_and_reflected_url_attributes();
@@ -11026,6 +11111,7 @@ int main()
         test_render_prefetches_css_background_images();
         test_page_render_uses_cairo_raster_backend();
         test_tiny_tiled_background_does_not_explode();
+        test_shadow_dom_paints_real_content_and_hides_light_dom();
         test_page_render_uses_web_font_formats();
         test_page_render_decodes_and_draws_png_images();
         test_page_render_decodes_and_draws_data_url_images();

@@ -177,6 +177,12 @@ void collect_subtree(lxb_dom_node_t* node, std::vector<lxb_dom_node_t*>& out)
 }
 
 constexpr std::string_view kLayoutIdAttribute = "data-pc-sid";
+// Shadow DOM bookkeeping markers (see DomDocument::attach_shadow_root). Both
+// are real, persistent attributes (unlike kLayoutIdAttribute, which is
+// transient) — they are hidden from the litehtml cascade, query selectors,
+// and serialization by the code below rather than by never existing.
+constexpr std::string_view kShadowRootAttribute = "data-pc-shadow-root";
+constexpr std::string_view kShadowHostAttribute = "data-pc-shadow-host";
 
 struct TransientAttributeRestore {
     lxb_dom_element_t* element = nullptr;
@@ -223,6 +229,37 @@ void set_layout_id_attribute(lxb_dom_element_t* element, NodeId id, std::vector<
 {
     const std::string value = std::to_string(id);
     set_transient_attribute(element, kLayoutIdAttribute, value, restore);
+}
+
+// Like set_transient_attribute, but for callers that need the attribute gone
+// (e.g. hiding kShadowHostAttribute from a serialization) rather than set to a
+// new value. A no-op, recording nothing, when the attribute is already absent.
+void remove_transient_attribute(
+    lxb_dom_element_t* element,
+    std::string_view name,
+    std::vector<TransientAttributeRestore>& restore)
+{
+    size_t old_len = 0;
+    const auto* old_value = lxb_dom_element_get_attribute(
+        element,
+        reinterpret_cast<const lxb_char_t*>(name.data()),
+        name.size(),
+        &old_len);
+    if (old_value == nullptr) {
+        return;
+    }
+
+    restore.push_back(TransientAttributeRestore{
+        element,
+        std::string(name),
+        true,
+        to_string(old_value, old_len),
+    });
+
+    lxb_dom_element_remove_attribute(
+        element,
+        reinterpret_cast<const lxb_char_t*>(name.data()),
+        name.size());
 }
 
 void restore_transient_attributes(std::vector<TransientAttributeRestore>& restore)
@@ -384,6 +421,64 @@ void restore_detached_layout_nodes(std::vector<DetachedLayoutNode>& detached)
     detached.clear();
 }
 
+// Finds every shadow container (kShadowRootAttribute) and shadow host
+// (kShadowHostAttribute) in `root`'s subtree (root included), at any nesting
+// depth, so a serialization or query pass over `root` can hide all of it in
+// one pass. A node is at most one of the two (attach_shadow_root never marks
+// the same element as both), so the branches are mutually exclusive.
+void collect_shadow_hide_targets(
+    lxb_dom_node_t* root,
+    std::vector<lxb_dom_node_t*>& containers,
+    std::vector<lxb_dom_element_t*>& hosts)
+{
+    std::vector<lxb_dom_node_t*> nodes;
+    collect_subtree(root, nodes);
+    for (auto* node : nodes) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+            continue;
+        }
+        auto* element = lxb_dom_interface_element(node);
+        if (lxb_dom_element_has_attribute(
+                element,
+                reinterpret_cast<const lxb_char_t*>(kShadowRootAttribute.data()),
+                kShadowRootAttribute.size())) {
+            containers.push_back(node);
+        } else if (lxb_dom_element_has_attribute(
+                element,
+                reinterpret_cast<const lxb_char_t*>(kShadowHostAttribute.data()),
+                kShadowHostAttribute.size())) {
+            hosts.push_back(element);
+        }
+    }
+}
+
+// Bundles the transient state a shadow-hiding pass needs to undo itself.
+struct ShadowHideScope {
+    std::vector<TransientAttributeRestore> transient_restore;
+    std::vector<lxb_dom_node_t*> detach_targets;
+    std::vector<DetachedLayoutNode> detached;
+};
+
+// Detaches every shadow container and strips every host marker in `root`'s
+// subtree, so a serialization starting at (or passing through) `root` sees
+// neither shadow content nor shadow bookkeeping. Pair with
+// restore_shadow_subtree() once the serialization completes (success or not).
+void hide_shadow_subtree(lxb_dom_node_t* root, ShadowHideScope& scope)
+{
+    std::vector<lxb_dom_element_t*> hosts;
+    collect_shadow_hide_targets(root, scope.detach_targets, hosts);
+    for (auto* host_element : hosts) {
+        remove_transient_attribute(host_element, kShadowHostAttribute, scope.transient_restore);
+    }
+    detach_layout_nodes(scope.detach_targets, scope.detached);
+}
+
+void restore_shadow_subtree(ShadowHideScope& scope)
+{
+    restore_detached_layout_nodes(scope.detached);
+    restore_transient_attributes(scope.transient_restore);
+}
+
 struct SelectorResults {
     const DomDocument::Impl* impl;
     std::vector<NodeId> ids;
@@ -508,11 +603,29 @@ std::vector<NodeId> DomDocument::Impl::run_selector(lxb_dom_node_t* root, std::s
 
     auto* list = compiled_selector(selector);
 
+    // Shadow content stays findable (cross-boundary querySelector is in scope
+    // — see attach_shadow_root); only the two bookkeeping markers themselves
+    // must not match [data-pc-shadow-*] selectors during this query.
+    std::vector<TransientAttributeRestore> shadow_marker_restore;
+    if (has_shadow_roots) {
+        std::vector<lxb_dom_node_t*> nodes;
+        collect_subtree(root, nodes);
+        for (auto* node : nodes) {
+            if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+                continue;
+            }
+            auto* element = lxb_dom_interface_element(node);
+            remove_transient_attribute(element, kShadowRootAttribute, shadow_marker_restore);
+            remove_transient_attribute(element, kShadowHostAttribute, shadow_marker_restore);
+        }
+    }
+
     SelectorResults results{this, {}, first_only};
     lxb_selectors_opt_set(selectors, static_cast<lxb_selectors_opt_t>(
         LXB_SELECTORS_OPT_MATCH_ROOT | LXB_SELECTORS_OPT_MATCH_FIRST));
 
     const lxb_status_t status = lxb_selectors_find(selectors, root, list, selector_callback, &results);
+    restore_transient_attributes(shadow_marker_restore);
     if (status != LXB_STATUS_OK) {
         throw std::runtime_error("CSS selector lookup failed");
     }
@@ -1016,6 +1129,18 @@ NodeId DomDocument::create_comment(std::string_view text)
     return impl_->id_for(lxb_dom_interface_node(node));
 }
 
+NodeId DomDocument::attach_shadow_root(NodeId host)
+{
+    impl_->require_element(host);
+
+    const NodeId container = create_element("pc-shadowroot");
+    set_attribute(container, kShadowRootAttribute, "");
+    set_attribute(host, kShadowHostAttribute, "");
+    append_child(host, container);
+    impl_->has_shadow_roots = true;
+    return container;
+}
+
 int DomDocument::node_type(NodeId id) const
 {
     return static_cast<int>(impl_->require_node(id)->type);
@@ -1407,12 +1532,27 @@ std::string DomDocument::inner_html(NodeId id) const
 {
     std::string out;
     auto* node = impl_->require_node(id);
-    for (auto* child = node->first_child; child != nullptr; child = child->next) {
-        const auto status = lxb_html_serialize_tree_cb(child, append_serialized, &out);
-        if (status != LXB_STATUS_OK) {
-            throw std::runtime_error("failed to serialize DOM innerHTML");
-        }
+
+    // Shadow content is host-encapsulated: hide any shadow container and host
+    // marker anywhere in this subtree before an author reads innerHTML back.
+    ShadowHideScope shadow_scope;
+    if (impl_->has_shadow_roots) {
+        hide_shadow_subtree(node, shadow_scope);
     }
+
+    try {
+        for (auto* child = node->first_child; child != nullptr; child = child->next) {
+            const auto status = lxb_html_serialize_tree_cb(child, append_serialized, &out);
+            if (status != LXB_STATUS_OK) {
+                throw std::runtime_error("failed to serialize DOM innerHTML");
+            }
+        }
+    } catch (...) {
+        restore_shadow_subtree(shadow_scope);
+        throw;
+    }
+
+    restore_shadow_subtree(shadow_scope);
     return out;
 }
 
@@ -1460,7 +1600,22 @@ void DomDocument::set_inner_html(NodeId id, std::string_view html)
 std::string DomDocument::outer_html(NodeId id) const
 {
     std::string out;
-    const auto status = lxb_html_serialize_tree_cb(impl_->require_node(id), append_serialized, &out);
+    auto* node = impl_->require_node(id);
+
+    ShadowHideScope shadow_scope;
+    if (impl_->has_shadow_roots) {
+        hide_shadow_subtree(node, shadow_scope);
+    }
+
+    lxb_status_t status = LXB_STATUS_OK;
+    try {
+        status = lxb_html_serialize_tree_cb(node, append_serialized, &out);
+    } catch (...) {
+        restore_shadow_subtree(shadow_scope);
+        throw;
+    }
+
+    restore_shadow_subtree(shadow_scope);
     if (status != LXB_STATUS_OK) {
         throw std::runtime_error("failed to serialize DOM outerHTML");
     }
@@ -1470,11 +1625,24 @@ std::string DomDocument::outer_html(NodeId id) const
 std::string DomDocument::serialize_html() const
 {
     std::string out;
-    const auto status = lxb_html_serialize_tree_cb(
-        lxb_dom_interface_node(impl_->document),
-        append_serialized,
-        &out);
 
+    ShadowHideScope shadow_scope;
+    if (impl_->has_shadow_roots) {
+        hide_shadow_subtree(lxb_dom_interface_node(impl_->document), shadow_scope);
+    }
+
+    lxb_status_t status = LXB_STATUS_OK;
+    try {
+        status = lxb_html_serialize_tree_cb(
+            lxb_dom_interface_node(impl_->document),
+            append_serialized,
+            &out);
+    } catch (...) {
+        restore_shadow_subtree(shadow_scope);
+        throw;
+    }
+
+    restore_shadow_subtree(shadow_scope);
     if (status != LXB_STATUS_OK) {
         throw std::runtime_error("failed to serialize HTML document");
     }
@@ -1591,15 +1759,36 @@ void DomDocument::visit_layout_tree(
             auto* element = lxb_dom_interface_element(current);
 
             std::vector<Attribute> attrs;
+            bool is_shadow_host = false;
+            bool is_shadow_container = false;
             for (auto* attr = lxb_dom_element_first_attribute(element);
                  attr != nullptr;
                  attr = lxb_dom_element_next_attribute(attr)) {
                 size_t name_len = 0;
                 const auto* name = lxb_dom_attr_qualified_name(attr, &name_len);
+                const std::string_view name_view(reinterpret_cast<const char*>(name), name_len);
+                // Shadow DOM bookkeeping markers (see attach_shadow_root) are
+                // never exposed to the litehtml cascade.
+                if (name_view == kShadowHostAttribute) {
+                    is_shadow_host = true;
+                    continue;
+                }
+                if (name_view == kShadowRootAttribute) {
+                    is_shadow_container = true;
+                    continue;
+                }
                 size_t value_len = 0;
                 const auto* value = lxb_dom_attr_value(attr, &value_len);
                 attrs.push_back(Attribute{to_string(name, name_len), to_string(value, value_len)});
             }
+
+            // A shadow container reached directly — never happens via the host
+            // redirect below, which jumps straight to its children — is
+            // orphaned; treat it like an inert <template> subtree.
+            if (is_shadow_container) {
+                break;
+            }
+
             const auto override_it = override_styles.find(current);
             if (override_it != override_styles.end()) {
                 bool merged = false;
@@ -1626,6 +1815,21 @@ void DomDocument::visit_layout_tree(
             child_frame.element = current;
             child_frame.raw_text = parent_raw || is_html_tag(current, LXB_TAG_SCRIPT);
             child_frame.next_child = current->first_child;
+            if (is_shadow_host) {
+                // Redirect descent into the shadow container's children: the
+                // container itself and the host's light-DOM children (no slot
+                // distribution) are never emitted.
+                for (auto* child = current->first_child; child != nullptr; child = child->next) {
+                    if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
+                        && lxb_dom_element_has_attribute(
+                            lxb_dom_interface_element(child),
+                            reinterpret_cast<const lxb_char_t*>(kShadowRootAttribute.data()),
+                            kShadowRootAttribute.size())) {
+                        child_frame.next_child = child->first_child;
+                        break;
+                    }
+                }
+            }
             stack.push_back(child_frame);
             break;
         }

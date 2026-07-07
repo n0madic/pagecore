@@ -715,6 +715,14 @@ JSValue bridge_create_comment(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue bridge_attach_shadow_root(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("attachShadowRoot requires host node id");
+        return js_id(ctx, js.document().attach_shadow_root(to_node_id(ctx, argv[0])));
+    });
+}
+
 JSValue bridge_node_type(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -1349,6 +1357,7 @@ void JsRuntime::install()
     set_function(context_, dom, "createElement", bridge_create_element, 1);
     set_function(context_, dom, "createTextNode", bridge_create_text_node, 1);
     set_function(context_, dom, "createComment", bridge_create_comment, 1);
+    set_function(context_, dom, "attachShadowRoot", bridge_attach_shadow_root, 1);
     set_function(context_, dom, "nodeType", bridge_node_type, 1);
     set_function(context_, dom, "nodeName", bridge_node_name, 1);
     set_function(context_, dom, "tagName", bridge_tag_name, 1);

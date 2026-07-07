@@ -46,6 +46,11 @@ struct DomDocument::Impl {
     bool scripting_enabled = true;
     std::unordered_set<std::string> layout_sensitive_attributes;
     bool layout_sensitive_attribute_wildcard = false;
+    // True once attach_shadow_root() has run at least once. Gates the
+    // transient marker-hiding passes in serialize_html/outer_html/inner_html
+    // and run_selector so pages without shadow DOM pay no extra cost. Only
+    // ever set, never cleared (see DomDocument::attach_shadow_root).
+    bool has_shadow_roots = false;
 
     // Bounded ring of layout-affecting mutations, one record per
     // layout_mutation_version bump. `layout_journal_base` is the highest version

@@ -94,6 +94,15 @@ public:
     NodeId create_text_node(std::string_view text);
     NodeId create_comment(std::string_view text);
 
+    // Creates a real lexbor element (tag "pc-shadowroot") as a child of `host`,
+    // tagged with the internal data-pc-shadow-root/data-pc-shadow-host markers
+    // so litehtml's cascade never sees them while visit_layout_tree() renders
+    // the container's children in the host's place. The container's NodeId
+    // doubles as the JS ShadowRoot wrapper's node identity. Does not check for
+    // a pre-existing shadow root — callers (the attachShadow() bridge op)
+    // enforce the one-shadow-root-per-host rule.
+    NodeId attach_shadow_root(NodeId host);
+
     int node_type(NodeId id) const;
     std::string node_name(NodeId id) const;
     std::string tag_name(NodeId id) const;

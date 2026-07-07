@@ -350,9 +350,11 @@
           get previousSibling() {
             const parent = this.parentNode;
             if (!parent) return null;
-            // A node parented in a DocumentFragment/ShadowRoot has no bridge-backed
-            // parent (it isn't a Lexbor node), so walk the fragment's own childNodes
+            // A node parented in a DocumentFragment has no bridge-backed parent
+            // (it isn't a Lexbor node), so walk the fragment's own childNodes
             // array instead of liveChildNodeList(), which would call parent._liveId().
+            // Shadow-tree nodes are real Lexbor children of the container (see
+            // ShadowRoot below), so they always take the liveChildNodeList() path.
             const nodes = this.__fragmentParent ? parent.childNodes : liveChildNodeList(parent);
             const index = nodes.findIndex((node) => node === this || node.__id === this.__id);
             return index > 0 ? nodes[index - 1] : null;
@@ -365,10 +367,7 @@
             return index >= 0 && index + 1 < nodes.length ? nodes[index + 1] : null;
           }
           get isConnected() {
-            if (this.__fragmentParent) {
-              if (this.__fragmentParent instanceof ShadowRoot) return this.__fragmentParent.host.isConnected;
-              return Boolean(this.__fragmentParent.isConnected);
-            }
+            if (this.__fragmentParent) return Boolean(this.__fragmentParent.isConnected);
             return bridge.isConnected(this.__id);
           }
           get textContent() { return bridge.textContent(this._liveId()); }
@@ -511,7 +510,7 @@
               this.removeChild(replacedChild);
               return replacedChild;
             }
-            // Detach an incoming node from a DocumentFragment/ShadowRoot first, as
+            // Detach an incoming node from a DocumentFragment first, as
             // insertBefore/appendChild do; otherwise it stays linked in both the
             // fragment's childNodes and the live tree.
             if (child && child.__fragmentParent) child.__fragmentParent.removeChild(child);
@@ -1090,15 +1089,10 @@
           }
         }
 
-        class ShadowRoot extends DocumentFragment {
-          constructor(host, init = {}) {
-            super();
-            this.nodeName = '#shadow-root';
-            this.host = host;
-            this.mode = init && init.mode === 'closed' ? 'closed' : 'open';
-            this.delegatesFocus = Boolean(init && init.delegatesFocus);
-          }
-        }
+        // ShadowRoot is declared after Element (below) since it extends it —
+        // see the class for why. Forward references to the name here (in
+        // isConnected/getRootNode/resolveOffsetParent) only run once the whole
+        // module has finished evaluating, so the later declaration is fine.
 
         class ElementInternals {
           constructor(target) {
@@ -1291,6 +1285,14 @@
           return value instanceof DocumentFragment;
         }
 
+        // Internal bookkeeping attributes attach_shadow_root() puts on real
+        // Lexbor nodes (see pagecore/dom.hpp) so litehtml and query selectors
+        // can hide shadow structure without a JS-visible attribute existing.
+        // The JS attribute-read surface must hide them too.
+        function isShadowMarkerAttributeName(name) {
+          return name === 'data-pc-shadow-root' || name === 'data-pc-shadow-host';
+        }
+
         function parseHTMLFragment(html) {
           const container = document.createElement('div');
           container.innerHTML = String(html ?? '');
@@ -1335,7 +1337,9 @@
           }
 
           _attrs() {
-            return bridge.attributes(this.element._liveId()).map((attr) => new Attr(this.element, attr.name));
+            return bridge.attributes(this.element._liveId())
+              .filter((attr) => !isShadowMarkerAttributeName(attr.name))
+              .map((attr) => new Attr(this.element, attr.name));
           }
 
           get length() { return this._attrs().length; }
@@ -2651,7 +2655,13 @@
           }
           attachShadow(init = {}) {
             if (this.__shadowRoot) throw new DOMException('Shadow root already attached.', 'NotSupportedError');
-            const root = new ShadowRoot(this, init);
+            // Creates a real Lexbor element (see attach_shadow_root()) and
+            // registers its wrapper before anything else can observe the id, so
+            // wrapNode(containerId) always resolves to this exact ShadowRoot
+            // instance rather than a plain materialized Element.
+            const containerId = bridge.attachShadowRoot(this._liveId());
+            const root = new ShadowRoot(containerId, this, init);
+            wrapperCache.set(containerId, root);
             defineValue(this, '__shadowRoot', root);
             return root;
           }
@@ -2660,11 +2670,21 @@
           }
 
           getAttribute(name) {
-            const value = bridge.getAttribute(this._liveId(), String(name));
+            const attributeName = String(name);
+            if (isShadowMarkerAttributeName(attributeName)) return null;
+            const value = bridge.getAttribute(this._liveId(), attributeName);
             return value === null ? null : value;
           }
-          hasAttribute(name) { return bridge.hasAttribute(this._liveId(), String(name)); }
-          getAttributeNames() { return bridge.attributes(this._liveId()).map((attr) => attr.name); }
+          hasAttribute(name) {
+            const attributeName = String(name);
+            if (isShadowMarkerAttributeName(attributeName)) return false;
+            return bridge.hasAttribute(this._liveId(), attributeName);
+          }
+          getAttributeNames() {
+            return bridge.attributes(this._liveId())
+              .map((attr) => attr.name)
+              .filter((name) => !isShadowMarkerAttributeName(name));
+          }
           setAttribute(name, value) {
             const attributeName = String(name);
             const oldValue = this.getAttribute(attributeName);
@@ -2910,6 +2930,40 @@
           set scrollTop(_value) {}
           get scrollLeft() { return 0; }
           set scrollLeft(_value) {}
+        }
+
+        // A thin wrapper over the real shadow-container element attach_shadow_root()
+        // creates: __id is the container's NodeId, so every Element method
+        // (childNodes, appendChild, querySelector, innerHTML, ...) operates on
+        // real Lexbor content litehtml lays out and paints. Only identity-facing
+        // bits (nodeType/nodeName/parentNode) are overridden to read like a
+        // #shadow-root rather than the <pc-shadowroot> element it wraps.
+        class ShadowRoot extends Element {
+          constructor(containerId, host, init = {}) {
+            super(containerId);
+            this.host = host;
+            this.mode = init && init.mode === 'closed' ? 'closed' : 'open';
+            this.delegatesFocus = Boolean(init && init.delegatesFocus);
+            this._adoptedStyleSheets = [];
+          }
+
+          get nodeType() { return 11; }
+          get nodeName() { return '#shadow-root'; }
+          // Stops parentNode/parentElement/getRootNode ancestor walks at the
+          // shadow boundary — light-DOM code walking up from the host never
+          // sees into the shadow tree, and shadow content's getRootNode()
+          // resolves to this ShadowRoot rather than the outer document.
+          get parentNode() { return null; }
+
+          get adoptedStyleSheets() { return this._adoptedStyleSheets.slice(); }
+          set adoptedStyleSheets(value) {
+            if (!Array.isArray(value)) throw new TypeError('adoptedStyleSheets must be an array');
+            for (const sheet of value) {
+              if (!(sheet instanceof CSSStyleSheet)) throw new TypeError('adoptedStyleSheets entries must be CSSStyleSheet');
+            }
+            this._adoptedStyleSheets = value.slice();
+            cssomVersion++;
+          }
         }
 
         class HTMLElement extends Element {
@@ -3762,12 +3816,20 @@
           return entry;
         }
 
+        // A host's shadow container is a real Lexbor child (see
+        // attach_shadow_root()) but must stay out of the host's own light-DOM
+        // traversal — encapsulation, and it's already reachable as node.__shadowRoot.
+        function excludingShadowContainer(node, descriptors) {
+          const containerId = node.__shadowRoot ? node.__shadowRoot.__id : null;
+          return containerId === null ? descriptors : descriptors.filter((descriptor) => descriptor.id !== containerId);
+        }
+
         // Internal: returns the SHARED cached childNodes list (callers must not
         // mutate it). The public childNodes getter hands out a copy.
         function liveChildNodeList(node) {
           const entry = traversalEntry(node);
           if (entry.childNodes === null) {
-            entry.childNodes = wrapDescribedList(bridge.childNodesDescribed(node._liveId()));
+            entry.childNodes = wrapDescribedList(excludingShadowContainer(node, bridge.childNodesDescribed(node._liveId())));
           }
           return entry.childNodes;
         }
@@ -3775,7 +3837,7 @@
         function liveChildElementList(node) {
           const entry = traversalEntry(node);
           if (entry.children === null) {
-            entry.children = wrapDescribedList(bridge.childrenDescribed(node._liveId()));
+            entry.children = wrapDescribedList(excludingShadowContainer(node, bridge.childrenDescribed(node._liveId())));
           }
           return entry.children;
         }
