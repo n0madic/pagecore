@@ -401,6 +401,14 @@ std::uint8_t unpremultiply(std::uint8_t value, std::uint8_t alpha)
     return static_cast<std::uint8_t>(std::clamp((static_cast<int>(value) * 255 + alpha / 2) / alpha, 0, 255));
 }
 
+std::uint8_t float_channel_to_u8(float value)
+{
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+}
+
 constexpr std::size_t kRgbaChannels = 4;
 constexpr std::size_t kMaxDecodedImageBytes = 128ull * 1024ull * 1024ull;
 constexpr std::size_t kMaxDecodedImagePixels = kMaxDecodedImageBytes / kRgbaChannels;
@@ -569,23 +577,50 @@ std::shared_ptr<const DecodedImage> surface_to_decoded_image(cairo_surface_t* su
     const cairo_format_t format = cairo_image_surface_get_format(surface);
     const int stride = cairo_image_surface_get_stride(surface);
     const auto* pixels = cairo_image_surface_get_data(surface);
+
+    // Cairo's PNG loader preserves 16-bit-per-channel source images as
+    // floating-point surfaces (RGB96F/RGBA128F, premultiplied like the 8-bit
+    // formats) instead of downsampling to ARGB32/RGB24, so both pixel layouts
+    // must be handled here.
+    const bool is_float_format = format == CAIRO_FORMAT_RGBA128F || format == CAIRO_FORMAT_RGB96F;
+    if (!is_float_format && format != CAIRO_FORMAT_ARGB32 && format != CAIRO_FORMAT_RGB24) {
+        throw std::runtime_error(std::string(operation) + ": unsupported pixel format");
+    }
+
     for (int y = 0; y < image->height; ++y) {
         const auto* row = pixels + static_cast<std::ptrdiff_t>(y) * stride;
         for (int x = 0; x < image->width; ++x) {
-            std::uint32_t native_argb = 0;
-            std::memcpy(&native_argb, row + static_cast<std::ptrdiff_t>(x) * 4, sizeof(native_argb));
+            std::uint8_t premult_red = 0;
+            std::uint8_t premult_green = 0;
+            std::uint8_t premult_blue = 0;
+            std::uint8_t alpha = 255;
 
-            const auto alpha = format == CAIRO_FORMAT_RGB24
-                ? static_cast<std::uint8_t>(255)
-                : static_cast<std::uint8_t>((native_argb >> 24) & 0xff);
-            const auto red = static_cast<std::uint8_t>((native_argb >> 16) & 0xff);
-            const auto green = static_cast<std::uint8_t>((native_argb >> 8) & 0xff);
-            const auto blue = static_cast<std::uint8_t>(native_argb & 0xff);
+            if (is_float_format) {
+                const bool has_alpha = format == CAIRO_FORMAT_RGBA128F;
+                float channels[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                std::memcpy(
+                    channels,
+                    row + static_cast<std::ptrdiff_t>(x) * (has_alpha ? 16 : 12),
+                    has_alpha ? 16 : 12);
+                premult_red = float_channel_to_u8(channels[0]);
+                premult_green = float_channel_to_u8(channels[1]);
+                premult_blue = float_channel_to_u8(channels[2]);
+                alpha = has_alpha ? float_channel_to_u8(channels[3]) : static_cast<std::uint8_t>(255);
+            } else {
+                std::uint32_t native_argb = 0;
+                std::memcpy(&native_argb, row + static_cast<std::ptrdiff_t>(x) * 4, sizeof(native_argb));
+                alpha = format == CAIRO_FORMAT_RGB24
+                    ? static_cast<std::uint8_t>(255)
+                    : static_cast<std::uint8_t>((native_argb >> 24) & 0xff);
+                premult_red = static_cast<std::uint8_t>((native_argb >> 16) & 0xff);
+                premult_green = static_cast<std::uint8_t>((native_argb >> 8) & 0xff);
+                premult_blue = static_cast<std::uint8_t>(native_argb & 0xff);
+            }
 
             auto* out = &image->rgba[(static_cast<std::size_t>(y) * image->width + x) * 4];
-            out[0] = unpremultiply(red, alpha);
-            out[1] = unpremultiply(green, alpha);
-            out[2] = unpremultiply(blue, alpha);
+            out[0] = unpremultiply(premult_red, alpha);
+            out[1] = unpremultiply(premult_green, alpha);
+            out[2] = unpremultiply(premult_blue, alpha);
             out[3] = alpha;
         }
     }

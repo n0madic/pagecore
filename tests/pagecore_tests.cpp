@@ -493,6 +493,25 @@ std::string gif_body()
     return std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes));
 }
 
+// A hand-crafted 2x2, 16-bit-per-channel RGBA PNG (color type 6, bit depth
+// 16), solid color 0xea7527ff at full 16-bit precision (0xea75/0xffff,
+// 0x7527/0xffff, 0x2710/0xffff, opaque). Cairo's PNG loader preserves such
+// >8-bit sources as floating-point surfaces (CAIRO_FORMAT_RGBA128F) instead
+// of downsampling to ARGB32, which the decoder must also handle correctly.
+std::string png_body_16bit()
+{
+    const unsigned char bytes[] = {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+        0x10, 0x06, 0x00, 0x00, 0x00, 0x22, 0x26, 0xd1, 0x67, 0x00, 0x00, 0x00,
+        0x16, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x78, 0x95, 0x50, 0x6a,
+        0xa0, 0x2e, 0xf0, 0xff, 0x3f, 0x8c, 0x66, 0x40, 0x17, 0x00, 0x00, 0x14,
+        0xd5, 0x10, 0x91, 0xa0, 0x80, 0xa7, 0x40, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+    return std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+}
+
 std::string svg_body(pagecore::Color color = pagecore::Color{240, 20, 30, 255})
 {
     return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"3\" viewBox=\"0 0 4 3\">"
@@ -5296,6 +5315,20 @@ void test_png_decoder_rgba()
     require(decoded->rgba.size() == 3 * 2 * 4, "PNG decoder should emit RGBA pixels");
     require(decoded->rgba[0] == 31 && decoded->rgba[1] == 63 && decoded->rgba[2] == 127 && decoded->rgba[3] == 255,
             "PNG decoder should preserve pixel color");
+}
+
+void test_png_decoder_handles_16_bit_channels()
+{
+    // Cairo's PNG loader returns a floating-point surface (RGBA128F/RGB96F,
+    // 4/3 x float32 per pixel) for >8-bit source PNGs instead of downsampling
+    // to ARGB32, which previously desynchronized the decoder's fixed 4-bytes-
+    // per-pixel read and produced garbage output.
+    const auto decoded = pagecore::decode_image_rgba(png_body_16bit());
+
+    require(decoded != nullptr, "PNG decoder should return an image for 16-bit-per-channel input");
+    require(decoded->width == 2 && decoded->height == 2, "PNG decoder should preserve 16-bit PNG dimensions");
+    require(color_close(decoded->rgba, pagecore::Color{233, 117, 39, 255}, 2),
+            "PNG decoder should downsample 16-bit channels to the correct 8-bit color");
 }
 
 void test_jpeg_decoder_rgba()
@@ -11112,6 +11145,7 @@ int main()
         test_png_encoder_rgba();
 #if defined(PAGECORE_ENABLE_RENDERING)
         test_png_decoder_rgba();
+        test_png_decoder_handles_16_bit_channels();
         test_jpeg_decoder_rgba();
 #if PAGECORE_ENABLE_WEBP
         test_webp_decoder_rgba();
