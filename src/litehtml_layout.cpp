@@ -610,16 +610,40 @@ public:
 
     void draw_radial_gradient(
         litehtml::uint_ptr,
-        const litehtml::background_layer&,
-        const litehtml::background_layer::radial_gradient&) override
+        const litehtml::background_layer& layer,
+        const litehtml::background_layer::radial_gradient& gradient) override
     {
+        if (display_list_ == nullptr || gradient.color_points.empty()) {
+            return;
+        }
+
+        display_list_->commands.emplace_back(RadialGradientCommand{
+            rect_from(layer.border_box),
+            rect_from(layer.clip_box),
+            Point{gradient.position.x, gradient.position.y},
+            Point{gradient.radius.x, gradient.radius.y},
+            gradient_stops_from(gradient.color_points),
+            border_radii_from(layer.border_radius),
+        });
     }
 
     void draw_conic_gradient(
         litehtml::uint_ptr,
-        const litehtml::background_layer&,
-        const litehtml::background_layer::conic_gradient&) override
+        const litehtml::background_layer& layer,
+        const litehtml::background_layer::conic_gradient& gradient) override
     {
+        if (display_list_ == nullptr || gradient.color_points.empty()) {
+            return;
+        }
+
+        display_list_->commands.emplace_back(ConicGradientCommand{
+            rect_from(layer.border_box),
+            rect_from(layer.clip_box),
+            Point{gradient.position.x, gradient.position.y},
+            gradient.angle,
+            gradient_stops_from(gradient.color_points),
+            border_radii_from(layer.border_radius),
+        });
     }
 
     void draw_borders(

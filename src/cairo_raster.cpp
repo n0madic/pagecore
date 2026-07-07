@@ -793,6 +793,152 @@ void draw_linear_gradient(cairo_t* cr, const LinearGradientCommand& command, flo
     cairo_restore(cr);
 }
 
+std::uint8_t lerp_channel(std::uint8_t a, std::uint8_t b, double f)
+{
+    return static_cast<std::uint8_t>(std::lround(a + (b - a) * f));
+}
+
+// stops assumed ascending by offset (litehtml emits sorted, clamped to [0,1]); non-empty.
+Color sample_gradient_stops(const std::vector<GradientStop>& stops, double t)
+{
+    if (t <= stops.front().offset) {
+        return stops.front().color;
+    }
+    if (t >= stops.back().offset) {
+        return stops.back().color;
+    }
+    for (std::size_t k = 1; k < stops.size(); ++k) {
+        const auto& a = stops[k - 1];
+        const auto& b = stops[k];
+        if (t <= b.offset) {
+            const double span = static_cast<double>(b.offset) - a.offset;
+            const double f = span > 0.0 ? (t - a.offset) / span : 0.0;
+            return Color{
+                lerp_channel(a.color.r, b.color.r, f),
+                lerp_channel(a.color.g, b.color.g, f),
+                lerp_channel(a.color.b, b.color.b, f),
+                lerp_channel(a.color.a, b.color.a, f)};
+        }
+    }
+    return stops.back().color;
+}
+
+void draw_radial_gradient(cairo_t* cr, const RadialGradientCommand& command, float scale)
+{
+    if (command.stops.empty()) {
+        return;
+    }
+
+    const IntRect bounds = scale_rect(command.rect, scale);
+    if (empty(bounds)) {
+        return;
+    }
+
+    const double cx = static_cast<double>(command.center.x) * scale;
+    const double cy = static_cast<double>(command.center.y) * scale;
+    const double rx = static_cast<double>(command.radius.x) * scale;
+    const double ry = static_cast<double>(command.radius.y) * scale;
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(rx) || !std::isfinite(ry)
+        || rx <= 0.0 || ry <= 0.0) {
+        return; // degenerate radius -> nothing paintable
+    }
+
+    cairo_pattern_t* raw_pattern = cairo_pattern_create_radial(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+    check_status(cairo_pattern_status(raw_pattern), "create Cairo radial gradient");
+    std::unique_ptr<cairo_pattern_t, decltype(&cairo_pattern_destroy)> pattern(raw_pattern, cairo_pattern_destroy);
+
+    cairo_matrix_t matrix; // pattern-space = (user - center) / (rx, ry)
+    cairo_matrix_init_scale(&matrix, 1.0 / rx, 1.0 / ry);
+    cairo_matrix_translate(&matrix, -cx, -cy);
+    cairo_pattern_set_matrix(pattern.get(), &matrix);
+
+    for (const auto& stop : command.stops) {
+        const double offset = std::clamp(static_cast<double>(stop.offset), 0.0, 1.0);
+        cairo_pattern_add_color_stop_rgba(
+            pattern.get(),
+            offset,
+            static_cast<double>(stop.color.r) / 255.0,
+            static_cast<double>(stop.color.g) / 255.0,
+            static_cast<double>(stop.color.b) / 255.0,
+            static_cast<double>(stop.color.a) / 255.0);
+    }
+    check_status(cairo_pattern_status(pattern.get()), "configure Cairo radial gradient");
+
+    cairo_save(cr);
+    clip_rounded_rect(cr, bounds, command.radii, scale);
+    const IntRect clip = scale_rect(command.clip, scale);
+    if (!empty(clip)) {
+        cairo_rectangle(cr, clip.x, clip.y, clip.width, clip.height);
+        cairo_clip(cr);
+    }
+
+    cairo_set_source(cr, pattern.get());
+    cairo_rectangle(cr, bounds.x, bounds.y, bounds.width, bounds.height);
+    cairo_fill(cr);
+    cairo_restore(cr);
+}
+
+void draw_conic_gradient(cairo_t* cr, const ConicGradientCommand& command, float scale)
+{
+    if (command.stops.empty()) {
+        return;
+    }
+
+    const IntRect bounds = scale_rect(command.rect, scale);
+    if (empty(bounds)) {
+        return;
+    }
+
+    const double cx = static_cast<double>(command.center.x) * scale;
+    const double cy = static_cast<double>(command.center.y) * scale;
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(command.angle)) {
+        return;
+    }
+
+    cairo_surface_t* raw_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, bounds.width, bounds.height);
+    check_status(cairo_surface_status(raw_surface), "create Cairo conic surface");
+    std::unique_ptr<cairo_surface_t, decltype(&cairo_surface_destroy)> surface(raw_surface, cairo_surface_destroy);
+
+    cairo_surface_flush(surface.get());
+    unsigned char* data = cairo_image_surface_get_data(surface.get());
+    const int stride = cairo_image_surface_get_stride(surface.get());
+    const double from = static_cast<double>(command.angle);
+    constexpr double pi = 3.14159265358979323846;
+
+    for (int j = 0; j < bounds.height; ++j) {
+        auto* row = reinterpret_cast<std::uint32_t*>(data + static_cast<std::ptrdiff_t>(j) * stride);
+        const double py = static_cast<double>(bounds.y) + j + 0.5;
+        for (int i = 0; i < bounds.width; ++i) {
+            const double dx = static_cast<double>(bounds.x) + i + 0.5 - cx;
+            const double dy = py - cy;
+            const double deg = std::atan2(dx, -dy) * 180.0 / pi; // 0 at top, clockwise
+            double t = std::fmod((deg - from) / 360.0, 1.0);
+            if (t < 0.0) {
+                t += 1.0;
+            }
+            const Color c = sample_gradient_stops(command.stops, t);
+            const std::uint32_t a = c.a;
+            row[i] = (a << 24)
+                | ((static_cast<std::uint32_t>(c.r) * a / 255) << 16)
+                | ((static_cast<std::uint32_t>(c.g) * a / 255) << 8)
+                | (static_cast<std::uint32_t>(c.b) * a / 255); // premultiplied ARGB32
+        }
+    }
+    cairo_surface_mark_dirty(surface.get());
+
+    cairo_save(cr);
+    clip_rounded_rect(cr, bounds, command.radii, scale);
+    const IntRect clip = scale_rect(command.clip, scale);
+    if (!empty(clip)) {
+        cairo_rectangle(cr, clip.x, clip.y, clip.width, clip.height);
+        cairo_clip(cr);
+    }
+
+    cairo_set_source_surface(cr, surface.get(), bounds.x, bounds.y);
+    cairo_paint(cr);
+    cairo_restore(cr);
+}
+
 void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color background, float scale);
 
 void draw_command(cairo_t* cr, const SolidFillCommand& command, float scale, int&, RenderState&)
@@ -818,6 +964,16 @@ void draw_command(cairo_t* cr, const ImageCommand& command, float scale, int&, R
 void draw_command(cairo_t* cr, const LinearGradientCommand& command, float scale, int&, RenderState&)
 {
     draw_linear_gradient(cr, command, scale);
+}
+
+void draw_command(cairo_t* cr, const RadialGradientCommand& command, float scale, int&, RenderState&)
+{
+    draw_radial_gradient(cr, command, scale);
+}
+
+void draw_command(cairo_t* cr, const ConicGradientCommand& command, float scale, int&, RenderState&)
+{
+    draw_conic_gradient(cr, command, scale);
 }
 
 void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& clip_depth, RenderState&)

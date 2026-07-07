@@ -225,6 +225,19 @@ a {
   background-repeat: no-repeat;
 }
 
+.bg-radial {
+  background-color: #2b2f3a;
+  background-image: radial-gradient(circle closest-side, rgb(233, 196, 106), rgb(38, 70, 83));
+  background-repeat: no-repeat;
+}
+
+.bg-conic {
+  background-color: #2b2f3a;
+  background-image: conic-gradient(from 0deg,
+    rgb(231, 111, 81), rgb(42, 157, 143), rgb(38, 70, 83), rgb(231, 111, 81));
+  background-repeat: no-repeat;
+}
+
 ul,
 ol {
   margin: 6px 0 8px 22px;

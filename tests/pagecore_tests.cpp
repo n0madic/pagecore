@@ -7944,6 +7944,109 @@ void test_page_render_linear_gradient_background()
             "linear gradient should draw the last color near the end");
 }
 
+void test_page_render_radial_gradient_background()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <body style="margin:0">
+    <div id="box" style="
+      width: 100px;
+      height: 100px;
+      background-image: radial-gradient(circle closest-side, rgb(240, 20, 30), rgb(20, 30, 240));
+    "></div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 120, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_gradient = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* gradient = std::get_if<pagecore::RadialGradientCommand>(&command)) {
+            has_gradient = has_gradient || (gradient->stops.size() >= 2 && static_cast<int>(gradient->rect.width) == 100);
+        }
+    }
+    require(has_gradient, "display list should carry radial gradient backgrounds");
+
+    const auto rendered = page.render(options);
+    require(pixel_close(rendered, 50, 50, pagecore::Color{240, 20, 30, 255}, 30),
+            "radial gradient should draw the first color at the center");
+    require(pixel_close(rendered, 95, 95, pagecore::Color{20, 30, 240, 255}, 30),
+            "radial gradient should draw the last color past the radius");
+}
+
+void test_page_render_conic_gradient_background()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <body style="margin:0">
+    <div id="box" style="
+      width: 100px;
+      height: 100px;
+      background-image: conic-gradient(rgb(240, 20, 30) 0deg 90deg, rgb(20, 30, 240) 90deg 360deg);
+    "></div>
+  </body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 120, 1.0f};
+
+    const auto display_list = page.display_list(options);
+    bool has_gradient = false;
+    for (const auto& command : display_list.commands) {
+        if (const auto* gradient = std::get_if<pagecore::ConicGradientCommand>(&command)) {
+            has_gradient = has_gradient || (gradient->stops.size() >= 2 && static_cast<int>(gradient->rect.width) == 100);
+        }
+    }
+    require(has_gradient, "display list should carry conic gradient backgrounds");
+
+    const auto rendered = page.render(options);
+    require(pixel_close(rendered, 75, 25, pagecore::Color{240, 20, 30, 255}, 20),
+            "conic gradient should draw the first color in the top-right wedge");
+    require(pixel_close(rendered, 25, 75, pagecore::Color{20, 30, 240, 255}, 20),
+            "conic gradient should draw the second color in the bottom-left wedge");
+}
+
+void test_conic_radial_gradient_raster_robustness()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{32, 32, 1.0f};
+    const float nan_value = std::numeric_limits<float>::quiet_NaN();
+    const float inf_value = std::numeric_limits<float>::infinity();
+
+    pagecore::RadialGradientCommand radial;
+    radial.rect = pagecore::Rect{0, 0, 32, 32};
+    radial.center = pagecore::Point{nan_value, 0};
+    radial.radius = pagecore::Point{0, 0};
+    radial.stops.push_back(pagecore::GradientStop{0.0f, pagecore::Color{0, 0, 0, 255}});
+    radial.stops.push_back(pagecore::GradientStop{1.0f, pagecore::Color{255, 255, 255, 255}});
+    display_list.commands.emplace_back(radial);
+
+    pagecore::ConicGradientCommand conic;
+    conic.rect = pagecore::Rect{0, 0, 32, 32};
+    conic.center = pagecore::Point{inf_value, 0};
+    conic.angle = 0.0f;
+    conic.stops.push_back(pagecore::GradientStop{0.0f, pagecore::Color{0, 0, 0, 255}});
+    conic.stops.push_back(pagecore::GradientStop{1.0f, pagecore::Color{255, 255, 255, 255}});
+    display_list.commands.emplace_back(conic);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list); // must not crash or invoke UB
+    require(image.width == 32 && image.height == 32,
+            "raster must survive degenerate radius / non-finite center without UB");
+
+    const std::string json = pagecore::display_list_to_json(display_list);
+    require(json.find("nan") == std::string::npos
+                && json.find("inf") == std::string::npos
+                && json.find("NaN") == std::string::npos,
+            "display-list JSON must not emit non-finite tokens for radial/conic gradients");
+}
+
 void test_page_render_clips_background_to_border_radius()
 {
     pagecore::Page page;
@@ -10937,6 +11040,9 @@ int main()
 #endif
         test_page_render_background_image_size_position_and_repeat();
         test_page_render_linear_gradient_background();
+        test_page_render_radial_gradient_background();
+        test_page_render_conic_gradient_background();
+        test_conic_radial_gradient_raster_robustness();
         test_page_render_clips_background_to_border_radius();
         test_page_render_clips_background_image_to_border_radius();
         test_page_render_hides_noscript_when_javascript_is_enabled();

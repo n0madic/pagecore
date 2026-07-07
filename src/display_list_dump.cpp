@@ -240,6 +240,58 @@ void write_command(std::ostream& out, const LinearGradientCommand& command)
     out << '}';
 }
 
+void write_command(std::ostream& out, const RadialGradientCommand& command)
+{
+    out << "{\"type\":\"radialGradient\",\"rect\":";
+    write_rect(out, command.rect);
+    out << ",\"clip\":";
+    write_rect(out, command.clip);
+    out << ",\"center\":";
+    write_point(out, command.center);
+    out << ",\"radius\":";
+    write_point(out, command.radius);
+    out << ",\"stops\":[";
+    for (std::size_t index = 0; index < command.stops.size(); ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << "{\"offset\":";
+        write_number(out, command.stops[index].offset);
+        out << ",\"color\":";
+        write_color(out, command.stops[index].color);
+        out << '}';
+    }
+    out << "],\"radii\":";
+    write_radii(out, command.radii);
+    out << '}';
+}
+
+void write_command(std::ostream& out, const ConicGradientCommand& command)
+{
+    out << "{\"type\":\"conicGradient\",\"rect\":";
+    write_rect(out, command.rect);
+    out << ",\"clip\":";
+    write_rect(out, command.clip);
+    out << ",\"center\":";
+    write_point(out, command.center);
+    out << ",\"angle\":";
+    write_number(out, command.angle);
+    out << ",\"stops\":[";
+    for (std::size_t index = 0; index < command.stops.size(); ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << "{\"offset\":";
+        write_number(out, command.stops[index].offset);
+        out << ",\"color\":";
+        write_color(out, command.stops[index].color);
+        out << '}';
+    }
+    out << "],\"radii\":";
+    write_radii(out, command.radii);
+    out << '}';
+}
+
 void write_command(std::ostream& out, const ClipCommand& command)
 {
     out << "{\"type\":\"clip\",\"push\":" << (command.push ? "true" : "false") << ",\"rect\":";

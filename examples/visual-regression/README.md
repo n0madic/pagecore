@@ -22,7 +22,7 @@ Covered surfaces:
 - solid fills, borders, rounded clipping and overflow clipping
 - `<img>` decoding for PNG, JPEG and WebP
 - CSS background images using PNG, JPEG and WebP with sizing, repeat and positioning
-- CSS linear gradients through the backend-neutral display list
+- CSS linear, radial and conic gradients through the backend-neutral display list
 
 Image sources:
 

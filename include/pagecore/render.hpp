@@ -156,6 +156,24 @@ struct LinearGradientCommand {
     BorderRadii radii;
 };
 
+struct RadialGradientCommand {
+    Rect rect;
+    Rect clip;
+    Point center;
+    Point radius;   // elliptical semi-axes: rx = radius.x, ry = radius.y
+    std::vector<GradientStop> stops;
+    BorderRadii radii;
+};
+
+struct ConicGradientCommand {
+    Rect rect;
+    Rect clip;
+    Point center;
+    float angle = 0.0f;   // from-angle, degrees, 0 at top, clockwise
+    std::vector<GradientStop> stops;
+    BorderRadii radii;
+};
+
 struct ClipCommand {
     Rect rect;
     bool push = true;
@@ -168,6 +186,8 @@ using DisplayCommand = std::variant<
     BorderCommand,
     ImageCommand,
     LinearGradientCommand,
+    RadialGradientCommand,
+    ConicGradientCommand,
     ClipCommand>;
 
 struct DisplayList {
