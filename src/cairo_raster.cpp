@@ -15,6 +15,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -89,6 +90,12 @@ ScaledRadii scale_radii(BorderRadii radii, float scale)
 bool empty(IntRect rect)
 {
     return rect.width <= 0 || rect.height <= 0;
+}
+
+bool intersects(IntRect a, IntRect b)
+{
+    return a.x < b.x + b.width && b.x < a.x + a.width
+        && a.y < b.y + b.height && b.y < a.y + a.height;
 }
 
 bool empty(ScaledRadii radii)
@@ -826,16 +833,43 @@ void draw_command(cairo_t* cr, const ClipCommand& command, float scale, int& cli
     }
 }
 
+// A leaf command never paints outside its own rect, so one whose device-space
+// rect misses the canvas contributes nothing and can be skipped. ClipCommand
+// mutates the cairo save/restore stack (paired push/pop) and must always run,
+// or clip_depth desyncs and corrupts every later command — so it is never culled.
+template <typename Cmd>
+bool cull_leaf(const Cmd& command, IntRect canvas, float scale)
+{
+    if constexpr (std::is_same_v<Cmd, ClipCommand>) {
+        return false;
+    } else {
+        return !intersects(scale_rect(command.rect, scale), canvas);
+    }
+}
+
 void draw_display_list(cairo_t* cr, const DisplayList& display_list, Color background, float scale)
 {
     set_source(cr, background);
     cairo_paint(cr);
+
+    // Cull rect = the device-pixel canvas, derived from the same viewport+scale
+    // as the raster/PDF surface. A culled command is one cairo would clip away
+    // anyway, so the output stays byte-identical. In --full-page the viewport
+    // height is already expanded to the content height, so nothing is lost.
+    const bool cull = !display_list.disable_viewport_culling;
+    const IntRect canvas{
+        0, 0,
+        std::max(1, to_pixel_ceil(static_cast<double>(display_list.viewport.width) * scale)),
+        std::max(1, to_pixel_ceil(static_cast<double>(display_list.viewport.height) * scale))};
 
     RenderState state(display_list.font_environment);
     int clip_depth = 0;
     for (const auto& command : display_list.commands) {
         std::visit(
             [&](const auto& typed) {
+                if (cull && cull_leaf(typed, canvas, scale)) {
+                    return;
+                }
                 draw_command(cr, typed, scale, clip_depth, state);
             },
             command);

@@ -176,6 +176,11 @@ struct DisplayList {
     int content_height = 0;
     std::shared_ptr<const FontEnvironment> font_environment;
     std::vector<DisplayCommand> commands;
+    // Debug toggle: when true, draw_display_list skips the offscreen-command
+    // cull and replays every command. Culling is byte-identical to no culling
+    // (a culled command lands entirely outside the surface cairo clips to), so
+    // this exists only to prove that equivalence and compare against a reference.
+    bool disable_viewport_culling = false;
 
     void clear()
     {

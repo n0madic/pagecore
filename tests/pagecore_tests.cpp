@@ -5021,6 +5021,118 @@ void test_cairo_pdf_writer_emits_pdf_file()
     in.read(header, sizeof(header));
     require(in.gcount() == 4 && std::string(header, sizeof(header)) == "%PDF", "PDF writer should emit a PDF header");
 }
+
+void test_viewport_culling_is_byte_identical()
+{
+    auto build_display_list = []() {
+        pagecore::DisplayList display_list;
+        display_list.viewport = pagecore::Viewport{100, 60, 1.0f};
+        display_list.commands.emplace_back(pagecore::SolidFillCommand{
+            pagecore::Rect{10, 10, 20, 20},
+            pagecore::Color{10, 20, 30, 255},
+            false,
+        });
+        // Below-the-fold leaves, entirely outside the 100x60 canvas.
+        display_list.commands.emplace_back(pagecore::ClipCommand{
+            pagecore::Rect{0, 5000, 100, 40},
+            true,
+        });
+        display_list.commands.emplace_back(pagecore::SolidFillCommand{
+            pagecore::Rect{0, 5000, 100, 40},
+            pagecore::Color{200, 0, 0, 255},
+            false,
+        });
+        display_list.commands.emplace_back(pagecore::TextCommand{
+            "below fold",
+            pagecore::Rect{0, 5010, 100, 20},
+            pagecore::Color{0, 0, 0, 255},
+            pagecore::Font{"sans-serif", 14.0f, 400, false},
+        });
+        display_list.commands.emplace_back(pagecore::ClipCommand{
+            pagecore::Rect{0, 5000, 100, 40},
+            false,
+        });
+        display_list.commands.emplace_back(pagecore::SolidFillCommand{
+            pagecore::Rect{0, 5100, 100, 20},
+            pagecore::Color{0, 200, 0, 255},
+            false,
+        });
+        return display_list;
+    };
+
+    pagecore::DisplayList culled = build_display_list();
+    pagecore::DisplayList uncculled = build_display_list();
+    uncculled.disable_viewport_culling = true;
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto culled_image = raster->render(culled);
+    const auto uncculled_image = raster->render(uncculled);
+
+    require(pixel_matches(culled_image, 10, 10, pagecore::Color{10, 20, 30, 255}),
+            "visible solid fill should still render within the viewport");
+    require(culled_image.width == uncculled_image.width && culled_image.height == uncculled_image.height,
+            "culling must not change canvas dimensions");
+    require(culled_image.rgba == uncculled_image.rgba,
+            "culling below-the-fold commands must be byte-identical to rendering every command, "
+            "including a clip push/pop pair around a culled leaf");
+}
+
+void test_viewport_culling_preserves_expanded_viewport_content()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{100, 100, 1.0f};
+    const pagecore::Color fill_color{40, 120, 200, 255};
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{0, 2000, 100, 40},
+        fill_color,
+        false,
+    });
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+
+    const auto small_image = raster->render(display_list);
+    require(small_image.width == 100 && small_image.height == 100,
+            "small viewport canvas should match its own dimensions when the fill is culled");
+
+    // Simulate --full-page inflating the viewport height to the content height:
+    // the same below-the-fold command must now land on the canvas and paint.
+    display_list.viewport.height = 3000;
+    const auto expanded_image = raster->render(display_list);
+    require(expanded_image.width == 100 && expanded_image.height == 3000,
+            "expanded viewport canvas should grow to the new height");
+    require(pixel_matches(expanded_image, 10, 2000, fill_color),
+            "below-the-fold content must survive when the viewport expands to cover it, as --full-page does");
+    require(pixel_matches(expanded_image, 10, 2039, fill_color),
+            "below-the-fold content must survive across its full rect when the viewport expands");
+}
+
+void test_write_pdf_full_page_keeps_below_fold_content()
+{
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{100, 2500, 1.0f};
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{0, 0, 100, 2500},
+        pagecore::Color{255, 255, 255, 255},
+        true,
+    });
+    display_list.commands.emplace_back(pagecore::SolidFillCommand{
+        pagecore::Rect{0, 2000, 100, 40},
+        pagecore::Color{40, 120, 200, 255},
+        false,
+    });
+
+    const std::filesystem::path output = std::filesystem::path(PAGECORE_BINARY_DIR) / "pagecore_pdf_full_page_below_fold_test.pdf";
+    pagecore::write_pdf(display_list, output.string());
+
+    std::ifstream in(output, std::ios::binary);
+    require(static_cast<bool>(in), "PDF writer should create an output file for a full-page-sized viewport");
+    char header[4] = {};
+    in.read(header, sizeof(header));
+    require(in.gcount() == 4 && std::string(header, sizeof(header)) == "%PDF",
+            "PDF writer should emit a PDF header even when the viewport covers below-the-fold content");
+    in.seekg(0, std::ios::end);
+    require(in.tellg() > 0, "PDF writer should emit a non-empty file for below-the-fold content");
+}
 #endif
 
 void test_display_list_json_dump()
@@ -10727,6 +10839,9 @@ int main()
         test_cairo_raster_rounded_border_uses_inner_curve();
         test_cairo_raster_rounded_border_supports_uneven_widths();
         test_cairo_pdf_writer_emits_pdf_file();
+        test_viewport_culling_is_byte_identical();
+        test_viewport_culling_preserves_expanded_viewport_content();
+        test_write_pdf_full_page_keeps_below_fold_content();
 #endif
         test_display_list_json_dump();
         test_png_encoder_rgba();
