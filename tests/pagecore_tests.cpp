@@ -513,6 +513,19 @@ bool color_close(const std::vector<std::uint8_t>& rgba, pagecore::Color color, i
         && std::abs(static_cast<int>(rgba[3]) - color.a) <= tolerance;
 }
 
+bool pixel_close(const std::vector<std::uint8_t>& rgba, int width, int x, int y, pagecore::Color color, int tolerance)
+{
+    const std::size_t offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 4;
+    if (offset + 4 > rgba.size()) {
+        return false;
+    }
+
+    return std::abs(static_cast<int>(rgba[offset]) - color.r) <= tolerance
+        && std::abs(static_cast<int>(rgba[offset + 1]) - color.g) <= tolerance
+        && std::abs(static_cast<int>(rgba[offset + 2]) - color.b) <= tolerance
+        && std::abs(static_cast<int>(rgba[offset + 3]) - color.a) <= tolerance;
+}
+
 std::uint32_t read_be32(const std::vector<std::uint8_t>& bytes, std::size_t offset)
 {
     require(offset + 4 <= bytes.size(), "unexpected end of binary data");
@@ -5467,7 +5480,71 @@ void test_svg_decoder_rejects_huge_dimensions()
                 R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="100000"></svg>)SVG");
         },
         "too large",
-        "SVG decoder should enforce the decode byte budget before allocating the cairo surface");
+        "SVG decoder should enforce the decode byte budget before rendering the document");
+}
+
+void test_svg_decoder_renders_gradients()
+{
+    const auto linear = pagecore::decode_image_rgba(
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4" viewBox="0 0 8 4">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff0000"/>
+      <stop offset="1" stop-color="#0000ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="8" height="4" fill="url(#g)"/>
+</svg>)SVG");
+    require(linear->width == 8 && linear->height == 4, "linearGradient SVG should use intrinsic dimensions");
+    require(pixel_close(linear->rgba, linear->width, 0, 2, pagecore::Color{255, 0, 0, 255}, 30),
+            "linearGradient decoder should shade the start stop near the gradient origin");
+    require(pixel_close(linear->rgba, linear->width, 7, 2, pagecore::Color{0, 0, 255, 255}, 30),
+            "linearGradient decoder should shade the end stop near the gradient terminus");
+
+    const auto radial = pagecore::decode_image_rgba(
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10">
+  <defs>
+    <radialGradient id="g" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#00ff00"/>
+      <stop offset="1" stop-color="#ff00ff"/>
+    </radialGradient>
+  </defs>
+  <rect width="10" height="10" fill="url(#g)"/>
+</svg>)SVG");
+    require(radial->width == 10 && radial->height == 10, "radialGradient SVG should use intrinsic dimensions");
+    require(pixel_close(radial->rgba, radial->width, 5, 5, pagecore::Color{0, 255, 0, 255}, 45),
+            "radialGradient decoder should shade the start stop near the gradient center");
+    require(pixel_close(radial->rgba, radial->width, 0, 0, pagecore::Color{255, 0, 255, 255}, 20),
+            "radialGradient decoder should shade the end stop near the gradient edge");
+}
+
+void test_svg_decoder_renders_use_and_defs_reference()
+{
+    const auto decoded = pagecore::decode_image_rgba(
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="6" height="6" viewBox="0 0 6 6">
+  <defs><rect id="r" width="6" height="6" fill="#123456"/></defs>
+  <use href="#r"/>
+</svg>)SVG");
+    require(decoded->width == 6 && decoded->height == 6, "<use>/<defs> SVG should use intrinsic dimensions");
+    require(pixel_close(decoded->rgba, decoded->width, 3, 3, pagecore::Color{18, 52, 86, 255}, 0),
+            "<use> decoder should rasterize the <defs>-only shape it references");
+}
+
+void test_svg_decoder_renders_nested_clip_path()
+{
+    const auto decoded = pagecore::decode_image_rgba(
+        R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10">
+  <clipPath id="outer">
+    <clipPath id="inner"><circle cx="5" cy="5" r="5"/></clipPath>
+    <rect x="2" y="2" width="6" height="6"/>
+  </clipPath>
+  <rect width="10" height="10" fill="#654321" clip-path="url(#outer)"/>
+</svg>)SVG");
+    require(decoded->width == 10 && decoded->height == 10, "nested clipPath SVG should use intrinsic dimensions");
+    require(pixel_close(decoded->rgba, decoded->width, 5, 5, pagecore::Color{101, 67, 33, 255}, 0),
+            "nested clipPath decoder should paint fill inside the clip region");
+    require(pixel_close(decoded->rgba, decoded->width, 0, 0, pagecore::Color{0, 0, 0, 0}, 0),
+            "nested clipPath decoder should leave pixels outside the clip region transparent");
 }
 #endif
 
@@ -11050,6 +11127,9 @@ int main()
         test_svg_decoder_rgba();
         test_svg_path_parser_terminates_on_malformed_input();
         test_svg_decoder_rejects_huge_dimensions();
+        test_svg_decoder_renders_gradients();
+        test_svg_decoder_renders_use_and_defs_reference();
+        test_svg_decoder_renders_nested_clip_path();
 #endif
         test_cairo_raster_handles_nonfinite_coordinates();
         test_background_tiling_is_bounded();

@@ -89,7 +89,7 @@ positive.
 | `requestIdleCallback` | Implemented as a timer callback with `didTimeout:false` and `timeRemaining() === 0`. | Source-level behavior in `src/dom_shim/40_web.js` |
 | `performance` | `performance.now()` is tied to the shim timer clock; `timeOrigin` is set. Marks, measures, and entries are no-op/empty. | Source-level behavior in `src/dom_shim/90_install.js` |
 | `Intl` fallback | Missing Intl constructors are filled with simple fallbacks for common library compatibility. Locale formatting is not browser/ICU-complete. | `pagecore_dom_shim_unit_tests` |
-| SVG DOM constructors | Common `SVG*Element` constructors exist for `createElementNS()`/`instanceof` compatibility. SVG rasterization support is handled separately by the C++ image decoder and can be disabled at build time. | `test_create_element_ns_and_template_content_clone`, image decoder/render tests |
+| SVG DOM constructors | Common `SVG*Element` constructors exist for `createElementNS()`/`instanceof` compatibility. SVG rasterization is handled separately by the C++ image decoder via [lunasvg](https://github.com/sammycage/lunasvg), covering nearly all of SVG 1.1/1.2 Tiny (shapes, paths, `linearGradient`/`radialGradient`, `pattern`, `clipPath`, `mask`, `marker`, `<use>`/`<defs>`/`<symbol>`, `<style>` CSS, embedded `<image>`, partial `<text>`/`<tspan>`; no animation/filters/scripts), and can be disabled at build time. | `test_create_element_ns_and_template_content_clone`, image decoder/render tests |
 
 ## Absent
 

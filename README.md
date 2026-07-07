@@ -22,8 +22,9 @@ layout geometry, without shipping a full browser.
   Cairo/PangoCairo with real font selection, shaping, and anti-aliased text.
   Supports background images (size/position/repeat), linear gradients,
   `border-radius`, and `@font-face` web fonts (WOFF/WOFF2).
-- **Images.** PNG, JPEG, WebP, GIF, and a built-in SVG subset decode into the
-  render; decoders are pluggable and individually optional.
+- **Images.** PNG, JPEG, WebP, GIF, and SVG (via lunasvg, covering nearly all of
+  SVG 1.1/1.2 Tiny — gradients, patterns, clipping, masking, `<use>`/`<defs>`)
+  decode into the render; decoders are pluggable and individually optional.
 - **Style and layout read-back.** `getComputedStyle()`,
   `getBoundingClientRect()`, `offsetWidth`/`offsetHeight`, and related geometry
   are backed by the same engine that produces the render, so scripts see
@@ -79,18 +80,23 @@ Rendering (enabled by default):
 - `cairo`, `pangocairo`, `pangoft2`, `fontconfig`, `libbrotlidec`
 - `libturbojpeg` and `giflib` for the default image decoder
 - `libwebp` and `libwebpdecoder` for WebP (default on)
+- [lunasvg](https://github.com/sammycage/lunasvg) (with its vendored
+  [plutovg](https://github.com/sammycage/plutovg) backend) for SVG rasterization
+  (default on) — fetched and built via CMake, no extra host toolchain required
 
 CMake resolves these through pkg-config and links static archives when a `.a` is
 available, falling back to shared libraries otherwise. Dependencies fetched from
-GitHub (Lexbor, QuickJS-NG, litehtml, woff2) are pinned to specific commits; if
-the build host cannot reach GitHub, pre-clone them and point CMake at the copies:
+GitHub (Lexbor, QuickJS-NG, litehtml, woff2, lunasvg) are pinned to specific
+commits; if the build host cannot reach GitHub, pre-clone them and point CMake at
+the copies:
 
 ```sh
 cmake -S . -B build \
   -DFETCHCONTENT_SOURCE_DIR_LEXBOR=/path/to/lexbor \
   -DFETCHCONTENT_SOURCE_DIR_QUICKJS_NG=/path/to/quickjs \
   -DFETCHCONTENT_SOURCE_DIR_LITEHTML=/path/to/litehtml \
-  -DFETCHCONTENT_SOURCE_DIR_WOFF2=/path/to/woff2
+  -DFETCHCONTENT_SOURCE_DIR_WOFF2=/path/to/woff2 \
+  -DFETCHCONTENT_SOURCE_DIR_LUNASVG=/path/to/lunasvg
 ```
 
 ### Build options
@@ -101,7 +107,7 @@ cmake -S . -B build \
 | `PAGECORE_BUILD_TOOLS` | `ON` | Build the `pagecore_cli` tool. |
 | `PAGECORE_IMAGE_DECODER` | `system` | `system` (Cairo/TurboJPEG/giflib) or `stb` (vendored, no TurboJPEG/giflib dependency). |
 | `PAGECORE_ENABLE_WEBP` | `ON` | WebP decoding (requires libwebp). |
-| `PAGECORE_ENABLE_SVG` | `ON` | Built-in SVG subset. |
+| `PAGECORE_ENABLE_SVG` | `ON` | SVG rasterization via lunasvg. |
 | `PAGECORE_OPTIMIZE_SIZE` | `OFF` | Dead-code elimination, LTO, and binary stripping for release builds. |
 | `PAGECORE_MINIFY_DOM_SHIM` | `OFF` | Embed a minified DOM shim (needs `terser` or `esbuild`). |
 | `PAGECORE_INSTALL` | `ON` | Generate install/export rules (see note below). |

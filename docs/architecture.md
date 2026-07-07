@@ -346,10 +346,11 @@ backend implements `RasterBackend` over the same `DisplayList` contract.
   `ResourceLoader`, decode into backend-neutral RGBA on `ImageCommand`, and are
   drawn by Cairo. The default `PAGECORE_IMAGE_DECODER=system` backend uses Cairo's
   stream decoder for PNG, TurboJPEG for JPEG, libwebp for WebP, giflib first-frame
-  decoding for GIF, and a built-in Cairo-based SVG subset. `PAGECORE_IMAGE_DECODER=stb`
-  switches PNG/JPEG/GIF to the vendored `third_party/stb/stb_image.h`. WebP and SVG
-  are independently optional (`PAGECORE_ENABLE_WEBP`, `PAGECORE_ENABLE_SVG`); decode
-  failures or disabled formats remain non-fatal placeholders.
+  decoding for GIF, and [lunasvg](https://github.com/sammycage/lunasvg) for SVG.
+  `PAGECORE_IMAGE_DECODER=stb` switches PNG/JPEG/GIF to the vendored
+  `third_party/stb/stb_image.h`. WebP and SVG are independently optional
+  (`PAGECORE_ENABLE_WEBP`, `PAGECORE_ENABLE_SVG`); decode failures or disabled
+  formats remain non-fatal placeholders.
 - **Backgrounds.** `background-size`, `background-position`, and
   `background-repeat` are resolved into backend-neutral image tile metadata, then
   rasterized by Cairo with clipping and repeat behavior.

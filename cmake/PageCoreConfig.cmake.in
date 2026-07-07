@@ -5,6 +5,7 @@ find_dependency(CURL)
 find_dependency(ZLIB)
 
 set(PAGECORE_ENABLE_RENDERING @PAGECORE_ENABLE_RENDERING@)
+set(PAGECORE_ENABLE_SVG @PAGECORE_ENABLE_SVG@)
 
 function(_pagecore_import_static_dependency target file_name)
     if(TARGET "${target}")
@@ -39,6 +40,14 @@ if(PAGECORE_ENABLE_RENDERING)
                 INTERFACE_LINK_LIBRARIES PageCore::gumbo
             )
         endif()
+    endif()
+
+    if(PAGECORE_ENABLE_SVG)
+        _pagecore_import_static_dependency(PageCore::lunasvg "@PAGECORE_LUNASVG_STATIC_FILE@")
+        _pagecore_import_static_dependency(PageCore::plutovg "@PAGECORE_PLUTOVG_STATIC_FILE@")
+        set_property(TARGET PageCore::lunasvg APPEND PROPERTY
+            INTERFACE_LINK_LIBRARIES PageCore::plutovg
+        )
     endif()
 endif()
 
