@@ -1335,6 +1335,44 @@ void test_get_computed_style_reads_display_from_stylesheets()
         "getComputedStyle stylesheet lookup should request linked CSS as a stylesheet resource");
 }
 
+// Regression test: litehtml used to discard the entire contents of any
+// unrecognized at-rule, including `@layer`, rather than just ignoring the
+// (unimplemented) cascade-layer ordering semantics. Since Tailwind/PostCSS
+// wrap effectively their whole generated stylesheet in `@layer` blocks, this
+// silently dropped all layout-relevant CSS on real-world pages.
+void test_layer_at_rule_rules_are_applied()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html>
+  <head>
+    <style>
+      @layer base, components;
+      @layer base {
+        .box { display: none; }
+      }
+      @layer components {
+        .box { color: rgb(0, 128, 128); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="box"></div>
+    <script>
+      const box = document.querySelector('.box');
+      const style = getComputedStyle(box);
+      document.body.setAttribute('data-layer',
+        style.display === 'none' && style.color === 'rgb(0, 128, 128)' ? 'ok' : 'bad');
+    </script>
+  </body>
+</html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-layer='ok']").has_value(),
+        "rules inside @layer blocks should still apply instead of being discarded");
+}
+
 void test_cssom_stylesheets_rules_declarations_and_cascade()
 {
     auto loader = std::make_shared<RecordingResourceLoader>();
@@ -10597,6 +10635,7 @@ int main()
         test_event_constructor_ignores_prototype_accessors();
         test_document_lifecycle_ignores_ready_state_overrides();
         test_get_computed_style_reads_display_from_stylesheets();
+        test_layer_at_rule_rules_are_applied();
         test_cssom_stylesheets_rules_declarations_and_cascade();
         test_cssom_dynamic_sheets_media_disabled_and_adopted();
         test_page_computed_style_cpp_api();

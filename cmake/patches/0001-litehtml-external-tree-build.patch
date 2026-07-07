@@ -132,3 +132,32 @@ index 86ae5968..56ec97d6 100644
      }
  
      // https://html.spec.whatwg.org/multipage/parsing.html#change-the-encoding
+diff --git a/src/stylesheet.cpp b/src/stylesheet.cpp
+index 0c0b3503..7d60a15c 100644
+--- a/src/stylesheet.cpp
++++ b/src/stylesheet.cpp
+@@ -73,6 +73,24 @@ namespace litehtml
+                     break;
+                 }
+ 
++            // https://www.w3.org/TR/css-cascade-5/#at-layer
++            // Cascade layers aren't implemented, so `@layer <name-list>;` (which only
++            // declares layer order) is a no-op, and `@layer [<name>]? { <stylesheet> }`
++            // has its rules unwrapped in place rather than being discarded wholesale by
++            // the default case below. Without this, unlayered stylesheets emitted by
++            // Tailwind/PostCSS (which wrap effectively their entire output in @layer
++            // blocks) would have all of their rules silently dropped.
++            case _layer_:
++                {
++                    if(rule->block.type != CURLY_BLOCK)
++                    {
++                        break;
++                    }
++                    parse_css_stylesheet(rule->block.value, baseurl, doc, media, false);
++                    import_allowed = false;
++                    break;
++                }
++
+             default:
+                 css_parse_error("unrecognized rule @" + rule->name);
+             }

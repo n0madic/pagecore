@@ -480,6 +480,10 @@ int main(int argc, char** argv)
             throw std::runtime_error("choose exactly one input source: --url, --file, --html, or --stdin");
         }
 
+        load_options.console_log = [](std::string_view severity, std::string_view message) {
+            std::cerr << "console." << severity << ": " << message << "\n";
+        };
+
         pagecore::Page page(load_options);
         if (!url.empty()) {
             page.load_url(url);
