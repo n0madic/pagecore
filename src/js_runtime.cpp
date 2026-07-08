@@ -844,6 +844,14 @@ JSValue bridge_forget_version(JSContext* ctx, JSValue, int, JSValue*)
     });
 }
 
+JSValue bridge_compat_mode(JSContext* ctx, JSValue, int, JSValue*)
+{
+    return bridge_call(ctx, [ctx](JsRuntime& js) {
+        const auto mode = js.document().quirks_mode();
+        return js_string(ctx, mode == DomDocument::QuirksMode::Quirks ? "BackCompat" : "CSS1Compat");
+    });
+}
+
 JSValue bridge_computed_style(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -1373,6 +1381,7 @@ void JsRuntime::install()
     set_function(context_, dom, "mutationVersion", bridge_mutation_version, 0);
     set_function(context_, dom, "layoutMutationVersion", bridge_layout_mutation_version, 0);
     set_function(context_, dom, "forgetVersion", bridge_forget_version, 0);
+    set_function(context_, dom, "compatMode", bridge_compat_mode, 0);
     set_function(context_, dom, "computedStyle", bridge_computed_style, 1);
     set_function(context_, dom, "computedStyleProperty", bridge_computed_style_property, 2);
     set_function(context_, dom, "elementGeometry", bridge_element_geometry, 1);

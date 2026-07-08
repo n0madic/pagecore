@@ -6517,6 +6517,28 @@ void test_dom_quirks_mode_from_doctype()
             "a transitional doctype must parse in limited-quirks mode");
 }
 
+void test_document_compat_mode_reflects_dom_quirks_mode()
+{
+    pagecore::Page no_quirks;
+    no_quirks.load_html("<!DOCTYPE html><html><body></body></html>", "https://example.test/index.html");
+    require(no_quirks.eval("document.compatMode") == "CSS1Compat",
+            "document.compatMode should be CSS1Compat in no-quirks mode");
+
+    pagecore::Page quirks;
+    quirks.load_html("<html><body></body></html>", "https://example.test/index.html");
+    require(quirks.eval("document.compatMode") == "BackCompat",
+            "document.compatMode should be BackCompat in quirks mode");
+
+    pagecore::Page limited;
+    limited.load_html(
+        "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" "
+        "\"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">"
+        "<html><body></body></html>",
+        "https://example.test/index.html");
+    require(limited.eval("document.compatMode") == "CSS1Compat",
+            "document.compatMode should be CSS1Compat in limited-quirks mode");
+}
+
 void test_layout_input_digest_superset_invariants()
 {
     pagecore::DomDocument doc;
@@ -11333,6 +11355,7 @@ int main()
         test_dom_visit_layout_tree_skips_template_subtrees();
         test_dom_visit_layout_tree_does_not_mutate();
         test_dom_quirks_mode_from_doctype();
+        test_document_compat_mode_reflects_dom_quirks_mode();
         test_layout_input_digest_superset_invariants();
         test_subtree_dirty_epoch_tracks_descendant_mutations();
         test_query_selector_cache_returns_all_and_first();

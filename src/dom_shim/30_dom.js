@@ -3689,7 +3689,7 @@
           get characterSet() { return 'UTF-8'; }
           get charset() { return 'UTF-8'; }
           get contentType() { return 'text/html'; }
-          get compatMode() { return 'CSS1Compat'; }
+          get compatMode() { return bridge.compatMode(); }
           get hidden() { return false; }
           get visibilityState() { return 'visible'; }
           get currentScript() { return this._currentScript || null; }
