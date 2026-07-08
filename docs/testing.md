@@ -45,16 +45,57 @@ ctest --test-dir build -R pagecore_wpt_extended --output-on-failure
 `tests/wpt/pagecore-wpt-extended.json` is empty by default and has no default
 `root` — pass `--root` explicitly (the `pagecore_wpt_extended` CTest target
 does this via `PAGECORE_WPT_ROOT`) when invoking the runner manually against
-it. Add explicit manifest entries before enabling the target in CI. The v1
-runner supports manifest-listed `.html`, `.window.js`, and window-variant
-`.any.js` tests. It does not implement WPT's full manifest discovery, workers,
-service workers, Python handlers, websockets, HTTPS certificates, the full
-wptserve feature set, or cross-origin/multi-origin requests — every test is
-served from the single synthetic origin `https://web-platform.test`, so tests
-that reference alternate hosts (`www1.web-platform.test` and similar) will
-fail to resolve those sub-resources. This keeps the runner deterministic and
-avoids weakening PageCore's default resource security model for local
-loopback servers.
+it.
+
+Generate a broad exploratory manifest from selected upstream directories with
+the manifest generator:
+
+```sh
+node tools/generate_wpt_manifest.js \
+  --root /path/to/wpt \
+  --prefix url/ \
+  --prefix dom/nodes/ \
+  --prefix css/cssom-view/ \
+  --output /tmp/pagecore-wpt-generated.json
+```
+
+Then run it directly:
+
+```sh
+node tools/run_wpt_subset.js \
+  --case-runner build/pagecore_wpt_case \
+  --manifest /tmp/pagecore-wpt-generated.json \
+  --root /path/to/wpt
+```
+
+Or wire it into the opt-in CTest target:
+
+```sh
+cmake -S . -B build \
+  -DPAGECORE_ENABLE_WPT_EXTENDED=ON \
+  -DPAGECORE_WPT_ROOT=/path/to/wpt \
+  -DPAGECORE_WPT_EXTENDED_MANIFEST=/tmp/pagecore-wpt-generated.json
+cmake --build build
+ctest --test-dir build -R pagecore_wpt_extended --output-on-failure
+```
+
+Generated entries use `expected.subtests: "all-pass"`, which means the harness
+must report `OK` and every reported subtest must pass, without manually listing
+each subtest name. Curated manifests can still use explicit per-subtest
+expectations to lock known failures and detect unexpected passes.
+
+The v1 runner supports manifest-listed `.html`, `.window.js`, and
+window-variant `.any.js` tests. The generator filters out common unsupported WPT
+infrastructure such as workers, service workers, Python handlers, wptserve
+template substitutions, iframe navigation, JavaScript URL navigation, persistent
+network APIs, and cross-origin helpers. It does not implement WPT's full
+manifest discovery, workers, service workers, Python handlers, websockets,
+HTTPS certificates, the full wptserve feature set, or cross-origin/multi-origin
+requests — every test is served from the single synthetic origin
+`https://web-platform.test`, so tests that reference alternate hosts
+(`www1.web-platform.test` and similar) will fail to resolve those sub-resources.
+This keeps the runner deterministic and avoids weakening PageCore's default
+resource security model for local loopback servers.
 
 ## Display-List Reftests
 

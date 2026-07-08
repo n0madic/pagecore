@@ -633,6 +633,12 @@ if(PAGECORE_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/run_wpt_subset_unit_tests.js"
         )
         add_test(
+            NAME pagecore_wpt_manifest_generator_unit_tests
+            COMMAND
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/generate_wpt_manifest_unit_tests.js"
+        )
+        add_test(
             NAME pagecore_display_list_tooling_unit_tests
             COMMAND
                 "${PAGECORE_NODE_EXECUTABLE}"

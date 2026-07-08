@@ -1127,7 +1127,9 @@
             set(callback) {
               delete global.add_completion_callback;
               global.add_completion_callback = callback;
-              if (typeof callback === 'function') callback(global.__pagecore_wpt_oncomplete);
+              if (typeof callback === 'function') {
+                global.queueMicrotask(() => callback(global.__pagecore_wpt_oncomplete));
+              }
             }
           });
 

@@ -19,6 +19,7 @@ function usage() {
     '        "url": "/dom/example.window.html?variant",',
     '        "requiresRendering": false,',
     '        "expected": { "harness": "OK", "subtests": { "subtest name": "PASS" } }',
+    '        "expected": { "harness": "OK", "subtests": "all-pass" }',
     '      }',
     '    ]',
     '  }'
@@ -134,6 +135,16 @@ function compareExpected(test, actual) {
 
   for (const name of duplicates) {
     failures.push(`${label}: duplicate subtest name "${name}" recorded more than once (results for it are ambiguous)`);
+  }
+
+  if (expectedSubtests === 'all-pass') {
+    for (const subtest of actual.subtests || []) {
+      if (subtest.status !== 'PASS') {
+        const message = subtest.message ? ` | ${String(subtest.message).replace(/\s+/g, ' ').trim()}` : '';
+        failures.push(`${label}: "${subtest.name}" expected PASS, got ${subtest.status}${message}`);
+      }
+    }
+    return failures;
   }
 
   for (const [name, expectedStatus] of Object.entries(expectedSubtests)) {

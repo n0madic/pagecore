@@ -16,6 +16,16 @@ The extended manifest is intentionally empty by default and has no default
 `root`; pass `--root` explicitly when invoking `tools/run_wpt_subset.js`
 against it manually (CTest does this via `PAGECORE_WPT_ROOT`). Add
 manifest-listed tests with exact expected statuses before enabling it in CI.
+For exploratory upstream subsets, generate a local manifest first:
+
+```sh
+node tools/generate_wpt_manifest.js \
+  --root /path/to/wpt \
+  --prefix url/ \
+  --prefix dom/nodes/ \
+  --prefix css/cssom-view/ \
+  --output /tmp/pagecore-wpt-generated.json
+```
 
 All tests are served from the single synthetic origin
 `https://web-platform.test` — cross-origin/multi-origin tests (references to

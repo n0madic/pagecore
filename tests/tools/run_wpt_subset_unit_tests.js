@@ -47,6 +47,22 @@ test('compareExpected reports a duplicate subtest name instead of silently keepi
   assert.ok(failures.some((line) => /duplicate subtest name "x"/.test(line)), `expected a duplicate-subtest failure, got: ${JSON.stringify(failures)}`);
 });
 
+test('compareExpected can require every reported subtest to pass without listing names', () => {
+  const failures = compareExpected(
+    { name: 'generated-baseline', expected: { harness: 'OK', subtests: 'all-pass' } },
+    { harness: 'OK', subtests: [{ name: 'a', status: 'PASS' }, { name: 'b', status: 'FAIL', message: 'boom' }] }
+  );
+  assert.deepStrictEqual(failures, ['generated-baseline: "b" expected PASS, got FAIL | boom']);
+});
+
+test('compareExpected accepts generated all-pass manifests when all reported subtests pass', () => {
+  const failures = compareExpected(
+    { name: 'generated-baseline', expected: { harness: 'OK', subtests: 'all-pass' } },
+    { harness: 'OK', subtests: [{ name: 'a', status: 'PASS' }, { name: 'b', status: 'PASS' }] }
+  );
+  assert.deepStrictEqual(failures, []);
+});
+
 test('actualSubtestMap surfaces which names were duplicated', () => {
   const { byName, duplicates } = actualSubtestMap({ subtests: [{ name: 'a', status: 'PASS' }, { name: 'a', status: 'FAIL' }, { name: 'b', status: 'PASS' }] });
   assert.deepStrictEqual([...duplicates], ['a']);

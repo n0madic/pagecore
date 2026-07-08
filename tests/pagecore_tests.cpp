@@ -1904,6 +1904,44 @@ void test_event_options_bubbling_and_wpt_driver_shim()
     require(button.has_value(), "event options, bubbling path and WPT test_driver click shim should work");
 }
 
+void test_wpt_completion_callback_registration_waits_for_harness_initialization()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    (function(globalScope) {
+      function add_completion_callback(callback) {
+        tests.all_done_callbacks.push(callback);
+      }
+
+      globalScope.add_completion_callback = add_completion_callback;
+
+      var tests = {
+        all_done_callbacks: [],
+        status: { status: 0, message: null }
+      };
+
+      globalScope.__pagecore_wpt_registered_callback_count = tests.all_done_callbacks.length;
+      setTimeout(function() {
+        globalScope.__pagecore_wpt_registered_callback_count = tests.all_done_callbacks.length;
+        tests.all_done_callbacks.forEach(function(callback) {
+          callback([{ name: 'deferred upstream registration', status: 0 }], tests.status);
+        });
+      }, 0);
+    })(window);
+  </script>
+</body></html>
+)HTML", "https://web-platform.test/upstream-harness-order.html");
+
+    require(
+        page.eval("String(globalThis.__pagecore_wpt_registered_callback_count)") == "1",
+        "WPT hook should register after an upstream-style harness initializes its internal tests object");
+    require(
+        page.eval("globalThis.__pagecore_wpt_json || ''").find("\"deferred upstream registration\"") != std::string::npos,
+        "WPT hook should receive completion from an upstream-style harness");
+}
+
 void test_custom_elements_registry_shim()
 {
     pagecore::Page page;
@@ -11047,6 +11085,7 @@ int main()
         test_comment_nodes_wrap_for_sibling_traversal();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
+        test_wpt_completion_callback_registration_waits_for_harness_initialization();
         test_custom_elements_registry_shim();
         test_shadow_root_and_element_internals_shims();
         test_shadow_root_builds_tree_from_inner_html();
