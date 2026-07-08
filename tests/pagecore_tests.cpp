@@ -1224,6 +1224,91 @@ void test_browser_like_web_api_shims()
     require(title && *title == "Shim Title", "document.title should update the title element");
 }
 
+void test_media_query_list_event_target_shims()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const checks = [];
+    const mql = matchMedia('(min-width: 1px)');
+
+    checks.push(typeof MediaQueryList === 'function');
+    checks.push(typeof MediaQueryListEvent === 'function');
+    checks.push(mql instanceof MediaQueryList);
+    checks.push(mql instanceof EventTarget);
+    checks.push(Object.prototype.toString.call(mql) === '[object MediaQueryList]');
+    checks.push(mql.media === '(min-width: 1px)');
+    checks.push(mql.matches === true);
+    checks.push(matchMedia('(max-width: 10px)').matches === false);
+    checks.push(matchMedia('not print').matches === true);
+    checks.push(matchMedia('').media === '');
+    checks.push(matchMedia('').matches === true);
+    checks.push(matchMedia('::').media === 'not all');
+    checks.push(matchMedia('::').matches === false);
+    checks.push(matchMedia('all and (min-width: 1px)').media === '(min-width: 1px)');
+    checks.push(matchMedia('all and (min-width: 1px)').matches === true);
+
+    const event = new MediaQueryListEvent('change', {
+      media: mql.media,
+      matches: true,
+      bubbles: true,
+      cancelable: true
+    });
+    checks.push(event instanceof MediaQueryListEvent);
+    checks.push(event instanceof Event);
+    checks.push(Object.prototype.toString.call(event) === '[object MediaQueryListEvent]');
+    checks.push(event.type === 'change');
+    checks.push(event.media === mql.media);
+    checks.push(event.matches === true);
+    checks.push(event.bubbles === true);
+    checks.push(event.cancelable === true);
+
+    const seen = [];
+    let legacyCount = 0;
+    function listener(received) {
+      seen.push(`event:${received === event}:${this === mql}:${received.matches}`);
+    }
+    const objectListener = {
+      handleEvent(received) {
+        seen.push(`object:${received.media}`);
+      }
+    };
+    function legacyListener(received) {
+      legacyCount += received instanceof MediaQueryListEvent ? 1 : 10;
+    }
+
+    mql.addEventListener('change', listener);
+    mql.addEventListener('change', objectListener);
+    mql.addEventListener('change', (received) => received.preventDefault(), { once: true });
+    mql.addListener(legacyListener);
+    mql.onchange = (received) => {
+      seen.push(`onchange:${received.matches}`);
+    };
+
+    checks.push(mql.dispatchEvent(event) === false);
+    checks.push(seen.includes('event:true:true:true'));
+    checks.push(seen.includes('object:(min-width: 1px)'));
+    checks.push(seen.includes('onchange:true'));
+    checks.push(legacyCount === 1);
+
+    mql.removeListener(legacyListener);
+    mql.dispatchEvent(new MediaQueryListEvent('change', {
+      media: mql.media,
+      matches: false
+    }));
+    checks.push(legacyCount === 1);
+
+    document.body.setAttribute('data-media-query-list', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-media-query-list='ok']").has_value(),
+        "MediaQueryList and MediaQueryListEvent should expose minimal EventTarget-compatible browser APIs");
+}
+
 void test_navigator_user_agent_data()
 {
     // Regression: navigator.userAgentData must exist and be well-formed. Sites
@@ -11203,6 +11288,7 @@ int main()
         test_run_until_idle_logs_throwing_event_loop_snapshot();
         test_event_loop_ordering_contract();
         test_browser_like_web_api_shims();
+        test_media_query_list_event_target_shims();
         test_navigator_user_agent_data();
         test_event_constructor_ignores_prototype_accessors();
         test_document_lifecycle_ignores_ready_state_overrides();

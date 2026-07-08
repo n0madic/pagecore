@@ -166,6 +166,8 @@
         XMLSerializer,
         DOMParser,
         locationFromURL,
+        MediaQueryList,
+        MediaQueryListEvent,
         makeMediaQueryList,
         getRandomValues,
         randomUUID,
@@ -359,6 +361,8 @@
         global.CSSStyleDeclaration = CSSStyleDeclaration;
         global.XMLSerializer = XMLSerializer;
         global.DOMParser = DOMParser;
+        global.MediaQueryList = MediaQueryList;
+        global.MediaQueryListEvent = MediaQueryListEvent;
         global.CSS = Object.assign(global.CSS || {}, CSS);
         global.btoa = btoa;
         global.atob = atob;

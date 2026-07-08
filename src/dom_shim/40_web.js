@@ -1077,18 +1077,169 @@
           return location;
         }
 
+        function cssLengthToPx(value) {
+          const text = String(value || '').trim().toLowerCase();
+          const match = /^(-?(?:\d+|\d*\.\d+))(px|em|rem)?$/.exec(text);
+          if (!match) return NaN;
+          const number = Number(match[1]);
+          if (!Number.isFinite(number)) return NaN;
+          return match[2] === 'em' || match[2] === 'rem' ? number * 16 : number;
+        }
+
+        function viewportValueForFeature(feature) {
+          try {
+            if (feature === 'width') return Number(global.innerWidth);
+            if (feature === 'height') return Number(global.innerHeight);
+          } catch (_viewportError) {
+          }
+          return NaN;
+        }
+
+        function evaluateMediaFeature(feature, value) {
+          const normalized = String(feature || '').trim().toLowerCase();
+          const lengthMatch = /^(min-|max-)?(width|height)$/.exec(normalized);
+          if (lengthMatch) {
+            const viewportValue = viewportValueForFeature(lengthMatch[2]);
+            const expected = cssLengthToPx(value);
+            if (!Number.isFinite(viewportValue) || !Number.isFinite(expected)) return false;
+            if (lengthMatch[1] === 'min-') return viewportValue >= expected;
+            if (lengthMatch[1] === 'max-') return viewportValue <= expected;
+            return viewportValue === expected;
+          }
+
+          const ratioMatch = /^(min-|max-)?aspect-ratio$/.exec(normalized);
+          if (ratioMatch) {
+            const ratio = /^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/.exec(String(value || ''));
+            if (!ratio) return false;
+            const width = viewportValueForFeature('width');
+            const height = viewportValueForFeature('height');
+            const expected = Number(ratio[1]) / Number(ratio[2]);
+            const actual = height > 0 ? width / height : NaN;
+            if (!Number.isFinite(actual) || !Number.isFinite(expected)) return false;
+            if (ratioMatch[1] === 'min-') return actual >= expected;
+            if (ratioMatch[1] === 'max-') return actual <= expected;
+            return actual === expected;
+          }
+
+          return false;
+        }
+
+        function mediaQueryParts(query) {
+          return String(query).split(',').map((part) => part.trim()).filter((part) => part.length > 0);
+        }
+
+        function isRecognizedMediaQueryItem(query) {
+          let rest = String(query || '').trim().toLowerCase();
+          if (!rest) return true;
+          if (rest.startsWith('not ')) {
+            rest = rest.slice(4).trim();
+          } else if (rest.startsWith('only ')) {
+            rest = rest.slice(5).trim();
+          }
+
+          const parts = rest.split(/\s+and\s+/).map((part) => part.trim()).filter(Boolean);
+          if (parts.length === 0) return false;
+          let mediaTypeCount = 0;
+          for (let index = 0; index < parts.length; index++) {
+            const part = parts[index];
+            if (part === 'all' || part === 'screen' || part === 'print') {
+              if (index !== 0) return false;
+              mediaTypeCount++;
+              continue;
+            }
+            if (/^\(\s*[a-z-]+(?:\s*:\s*[^)]+)?\s*\)$/.test(part)) continue;
+            return false;
+          }
+          return mediaTypeCount <= 1;
+        }
+
+        function serializeMediaQuery(query) {
+          const original = String(query ?? '');
+          const trimmed = original.trim();
+          if (trimmed === '') return '';
+          const parts = mediaQueryParts(trimmed);
+          if (parts.length === 0) return '';
+
+          const serialized = [];
+          for (const part of parts) {
+            if (!isRecognizedMediaQueryItem(part)) return 'not all';
+            serialized.push(part
+              .replace(/\s+/g, ' ')
+              .replace(/^all\s+and\s+/i, '')
+              .replace(/^only\s+all\s+and\s+/i, ''));
+          }
+          return serialized.join(', ');
+        }
+
+        function evaluateMediaQueryItem(query) {
+          const text = String(query || '').trim().toLowerCase();
+          if (!text) return true;
+
+          let rest = text;
+          let negated = false;
+          if (rest.startsWith('not ')) {
+            negated = true;
+            rest = rest.slice(4).trim();
+          } else if (rest.startsWith('only ')) {
+            rest = rest.slice(5).trim();
+          }
+
+          const parts = rest.split(/\s+and\s+/).map((part) => part.trim()).filter(Boolean);
+          if (parts.length === 0) return false;
+
+          let mediaTypeMatched = false;
+          for (const part of parts) {
+            if (part === 'all' || part === 'screen') {
+              mediaTypeMatched = true;
+              continue;
+            }
+            if (part === 'print') return negated;
+
+            const feature = /^\(\s*([a-z-]+)\s*:\s*([^)]+)\s*\)$/.exec(part);
+            if (!feature || !evaluateMediaFeature(feature[1], feature[2])) {
+              return negated;
+            }
+          }
+
+          const matched = mediaTypeMatched || parts.some((part) => part.startsWith('('));
+          return negated ? !matched : matched;
+        }
+
+        function evaluateSimpleMediaQuery(query) {
+          const serialized = serializeMediaQuery(query);
+          if (serialized === 'not all') return false;
+          const parts = mediaQueryParts(serialized);
+          if (parts.length === 0) return true;
+          return parts.some((part) => evaluateMediaQueryItem(part));
+        }
+
+        class MediaQueryListEvent extends Event {
+          constructor(type, init = {}) {
+            const normalized = init && typeof init === 'object' ? init : {};
+            super(type, normalized);
+            this.media = normalized.media === undefined ? '' : String(normalized.media);
+            this.matches = Boolean(normalized.matches);
+          }
+
+          get [Symbol.toStringTag]() { return 'MediaQueryListEvent'; }
+        }
+
+        class MediaQueryList extends EventTarget {
+          constructor(query) {
+            super();
+            this._media = serializeMediaQuery(query);
+            this.onchange = null;
+          }
+
+          get matches() { return evaluateSimpleMediaQuery(this._media); }
+          get media() { return this._media; }
+          addListener(callback) { this.addEventListener('change', callback); }
+          removeListener(callback) { this.removeEventListener('change', callback); }
+          get [Symbol.toStringTag]() { return 'MediaQueryList'; }
+        }
+
         function makeMediaQueryList(query) {
-          const target = new EventTarget();
-          return {
-            matches: false,
-            media: String(query),
-            onchange: null,
-            addEventListener: target.addEventListener.bind(target),
-            removeEventListener: target.removeEventListener.bind(target),
-            dispatchEvent: target.dispatchEvent.bind(target),
-            addListener(callback) { this.addEventListener('change', callback); },
-            removeListener(callback) { this.removeEventListener('change', callback); }
-          };
+          return new MediaQueryList(query);
         }
 
         function getRandomValues(array) {
@@ -1313,6 +1464,8 @@
         XMLSerializer,
         DOMParser,
         locationFromURL,
+        MediaQueryList,
+        MediaQueryListEvent,
         makeMediaQueryList,
         getRandomValues,
         randomUUID,
