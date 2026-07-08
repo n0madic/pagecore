@@ -10,4 +10,7 @@ namespace pagecore {
 // untouched under the C locale.
 std::string ascii_lower(std::string_view value);
 
+// Case-insensitive HTTP header-name comparison, shared across the codebase.
+bool header_name_equals(std::string_view left, std::string_view right);
+
 } // namespace pagecore

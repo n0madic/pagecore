@@ -197,19 +197,6 @@ bool starts_with(std::string_view value, std::string_view prefix)
     return value.substr(0, prefix.size()) == prefix;
 }
 
-bool header_name_equals(std::string_view left, std::string_view right)
-{
-    if (left.size() != right.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < left.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool has_request_header(const ResourceRequest& request, std::string_view name)
 {
     return std::any_of(request.headers.begin(), request.headers.end(), [&](const auto& header) {

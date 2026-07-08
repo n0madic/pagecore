@@ -13,6 +13,17 @@ endif()
 option(PAGECORE_BUILD_TESTS "Build PageCore tests" ${PAGECORE_DEFAULT_BUILD_EXTRAS})
 option(PAGECORE_BUILD_TOOLS "Build PageCore command-line tools" ${PAGECORE_DEFAULT_BUILD_EXTRAS})
 option(PAGECORE_BUILD_EXAMPLES "Build PageCore examples" OFF)
+option(PAGECORE_ENABLE_WPT_EXTENDED "Enable the opt-in WPT subset from PAGECORE_WPT_ROOT" OFF)
+set(PAGECORE_WPT_ROOT "" CACHE PATH "Path to a local upstream web-platform-tests checkout")
+set(
+    PAGECORE_WPT_EXTENDED_MANIFEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/wpt/pagecore-wpt-extended.json"
+    CACHE FILEPATH
+    "Manifest for the opt-in PAGECORE_WPT_ROOT subset"
+)
+if(PAGECORE_ENABLE_WPT_EXTENDED AND NOT PAGECORE_BUILD_TESTS)
+    message(FATAL_ERROR "PAGECORE_ENABLE_WPT_EXTENDED=ON requires PAGECORE_BUILD_TESTS=ON")
+endif()
 set(PAGECORE_DEFAULT_ENABLE_RENDERING ${PAGECORE_BUILD_TOOLS})
 option(PAGECORE_ENABLE_RENDERING "Build the litehtml layout adapter and Cairo/Pango rendering pipeline" ${PAGECORE_DEFAULT_ENABLE_RENDERING})
 option(PAGECORE_ENABLE_WEBP "Build WebP image decoding support" ON)
@@ -591,6 +602,10 @@ endif()
 
 if(PAGECORE_BUILD_TESTS)
     enable_testing()
+    add_executable(pagecore_wpt_case tools/pagecore_wpt_case.cpp)
+    target_link_libraries(pagecore_wpt_case PRIVATE pagecore)
+    target_include_directories(pagecore_wpt_case PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    pagecore_strip_release_binary(pagecore_wpt_case)
     if(PAGECORE_NODE_EXECUTABLE)
         add_test(
             NAME pagecore_dom_shim_modules
@@ -605,6 +620,42 @@ if(PAGECORE_BUILD_TESTS)
                 "${PAGECORE_NODE_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/dom_shim/dom_shim_unit_tests.js"
         )
+        add_test(
+            NAME pagecore_wpt_smoke
+            COMMAND
+                ${CMAKE_COMMAND}
+                -E env
+                "PAGECORE_ENABLE_RENDERING=$<BOOL:${PAGECORE_ENABLE_RENDERING}>"
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_wpt_subset.js"
+                --case-runner $<TARGET_FILE:pagecore_wpt_case>
+                --manifest "${CMAKE_CURRENT_SOURCE_DIR}/tests/wpt/pagecore-wpt-smoke.json"
+                --root "${CMAKE_CURRENT_SOURCE_DIR}/tests/wpt"
+        )
+        set_tests_properties(pagecore_wpt_smoke PROPERTIES TIMEOUT 120)
+        if(PAGECORE_ENABLE_WPT_EXTENDED)
+            if(PAGECORE_WPT_ROOT STREQUAL "")
+                message(FATAL_ERROR "PAGECORE_ENABLE_WPT_EXTENDED=ON requires PAGECORE_WPT_ROOT")
+            endif()
+            if(NOT IS_DIRECTORY "${PAGECORE_WPT_ROOT}")
+                message(FATAL_ERROR "PAGECORE_WPT_ROOT is not a directory: ${PAGECORE_WPT_ROOT}")
+            endif()
+            add_test(
+                NAME pagecore_wpt_extended
+                COMMAND
+                    ${CMAKE_COMMAND}
+                    -E env
+                    "PAGECORE_ENABLE_RENDERING=$<BOOL:${PAGECORE_ENABLE_RENDERING}>"
+                    "${PAGECORE_NODE_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_wpt_subset.js"
+                    --case-runner $<TARGET_FILE:pagecore_wpt_case>
+                    --manifest "${PAGECORE_WPT_EXTENDED_MANIFEST}"
+                    --root "${PAGECORE_WPT_ROOT}"
+            )
+            set_tests_properties(pagecore_wpt_extended PROPERTIES TIMEOUT 300)
+        endif()
+    elseif(PAGECORE_ENABLE_WPT_EXTENDED)
+        message(FATAL_ERROR "PAGECORE_ENABLE_WPT_EXTENDED=ON requires node on PATH")
     endif()
     add_executable(pagecore_tests tests/pagecore_tests.cpp)
     target_compile_definitions(
@@ -687,6 +738,18 @@ if(PAGECORE_BUILD_TESTS)
             PROPERTIES
                 PASS_REGULAR_EXPRESSION "\"phase\":\"raster\""
         )
+        if(PAGECORE_NODE_EXECUTABLE)
+            add_test(
+                NAME pagecore_display_list_reftests
+                COMMAND
+                    "${PAGECORE_NODE_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_display_list_reftests.js"
+                    --pagecore-cli $<TARGET_FILE:pagecore_cli>
+                    --manifest "${CMAKE_CURRENT_SOURCE_DIR}/tests/display-list/pagecore-display-list-reftests.json"
+                    --root "${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+            set_tests_properties(pagecore_display_list_reftests PROPERTIES TIMEOUT 120)
+        endif()
 
         # Negative argument-parsing cases must exit non-zero with a clear error.
         add_test(

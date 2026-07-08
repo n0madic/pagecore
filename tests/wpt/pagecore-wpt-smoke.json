@@ -1,0 +1,47 @@
+{
+  "root": ".",
+  "tests": [
+    {
+      "name": "dom/document-basics",
+      "path": "/dom/nodes/pagecore-document-basics.window.js",
+      "expected": {
+        "harness": "OK",
+        "subtests": {
+          "document creation, selectors, classList and textContent": "PASS",
+          "Node.normalize merges adjacent text nodes and drops empty nodes": "PASS"
+        }
+      }
+    },
+    {
+      "name": "cssom-view/geometry",
+      "path": "/css/cssom-view/pagecore-geometry.window.js",
+      "requiresRendering": true,
+      "expected": {
+        "harness": "OK",
+        "subtests": {
+          "CSSOM View geometry is backed by layout": "PASS"
+        }
+      }
+    },
+    {
+      "name": "fetch/basic",
+      "path": "/fetch/api/pagecore-fetch.window.js",
+      "expected": {
+        "harness": "OK",
+        "subtests": {
+          "fetch resolves resources through the WPT loader": "PASS"
+        }
+      }
+    },
+    {
+      "name": "cookies/document-cookie",
+      "path": "/cookies/pagecore-document-cookie.window.js",
+      "expected": {
+        "harness": "OK",
+        "subtests": {
+          "document.cookie stores and exposes same-page cookies": "PASS"
+        }
+      }
+    }
+  ]
+}

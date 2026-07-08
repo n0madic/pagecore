@@ -284,3 +284,5 @@ target_link_libraries(my_app PRIVATE PageCore::pagecore)
   internally (DOM, JS runtime, resource pipeline, security, rendering).
 - [docs/browser-api-support.md](docs/browser-api-support.md) — per-API
   `supported`/`partial`/`absent` status.
+- [docs/testing.md](docs/testing.md) — CTest, WPT subset, and display-list
+  regression infrastructure.

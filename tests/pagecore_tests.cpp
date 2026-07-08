@@ -2,6 +2,7 @@
 #include "css_scan.hpp"
 #include "page_activity_tracker.hpp"
 #include "script_type.hpp"
+#include "util.hpp"
 
 #include "pagecore/image_io.hpp"
 #include "pagecore/image_decoder.hpp"
@@ -203,18 +204,7 @@ bool has_header(const pagecore::ResourceRequest& request, std::string_view name,
     return false;
 }
 
-bool header_name_equals(std::string_view left, std::string_view right)
-{
-    if (left.size() != right.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < left.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
+using pagecore::header_name_equals;
 
 bool header_contains(const pagecore::ResourceRequest& request, std::string_view name, std::string_view value)
 {

@@ -1,0 +1,12 @@
+{
+  "root": "../..",
+  "tolerance": 0.01,
+  "tests": [
+    {
+      "name": "visual-regression-display-list",
+      "input": "examples/visual-regression/index.html",
+      "reference": "examples/visual-regression/display-list.json",
+      "viewport": "1280x1000"
+    }
+  ]
+}
