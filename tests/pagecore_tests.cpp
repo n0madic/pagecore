@@ -8583,6 +8583,52 @@ void test_geometry_box_model_apis_reflect_real_layout()
         "box-model geometry APIs should reflect the real litehtml layout");
 }
 
+void test_input_client_geometry_uses_content_box_inline_axis()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!doctype html>
+<html>
+<head>
+  <style>
+    input, textarea {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 200px;
+      width: 300px;
+      border-style: solid;
+      border-width: 10px 20px;
+      padding: 2px;
+      box-sizing: content-box;
+    }
+    .block { display: block; }
+  </style>
+</head>
+<body>
+  <input id="input-inline">
+  <textarea id="textarea-inline"></textarea>
+  <input id="input-block" class="block">
+  <textarea id="textarea-block" class="block"></textarea>
+  <script>
+    const checks = [];
+    for (const element of document.querySelectorAll('input, textarea')) {
+      const isInput = element.nodeName === 'INPUT';
+      checks.push(element.clientHeight === 204);
+      checks.push(element.clientTop === 10);
+      checks.push(element.clientWidth === (isInput ? 300 : 304));
+      checks.push(element.clientLeft === (isInput ? 22 : 20));
+    }
+    document.body.setAttribute('data-input-client-geometry', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body>
+</html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-input-client-geometry='ok']").has_value(),
+        "input client geometry should use the content box on the inline axis while textarea uses padding box");
+}
+
 void test_geometry_get_client_rects_returns_domrectlist()
 {
     pagecore::Page page;
@@ -11500,6 +11546,7 @@ int main()
         test_layout_serialization_preserves_user_layout_id_attribute();
         test_visual_fixture_regression();
         test_geometry_box_model_apis_reflect_real_layout();
+        test_input_client_geometry_uses_content_box_inline_axis();
         test_geometry_get_client_rects_returns_domrectlist();
         test_window_named_element_access_exposes_document_ids();
         test_root_client_geometry_uses_viewport();

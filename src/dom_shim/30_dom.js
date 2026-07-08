@@ -2509,6 +2509,21 @@
           return elementGeometryForVersion(element, layoutMutationVersion());
         }
 
+        function cssPixelValue(value) {
+          const match = /^(-?(?:\d+|\d*\.\d+))px$/.exec(String(value || '').trim());
+          if (!match) return 0;
+          const number = Number(match[1]);
+          return Number.isFinite(number) ? number : 0;
+        }
+
+        function horizontalPadding(element) {
+          const style = computedStyleFor(element);
+          return {
+            left: cssPixelValue(style.getPropertyValue('padding-left')),
+            right: cssPixelValue(style.getPropertyValue('padding-right'))
+          };
+        }
+
         function currentViewport() {
           try {
             return bridge.viewport();
@@ -3047,7 +3062,12 @@
           get clientWidth() {
             if (isDocumentElement(this)) return Math.round(currentViewport().width);
             const geometry = elementGeometry(this);
-            return geometry ? Math.round(geometry.paddingWidth) : 0;
+            if (!geometry) return 0;
+            if (this.localName === 'input') {
+              const padding = horizontalPadding(this);
+              return Math.round(geometry.paddingWidth - padding.left - padding.right);
+            }
+            return Math.round(geometry.paddingWidth);
           }
           get clientHeight() {
             if (isDocumentElement(this)) return Math.round(currentViewport().height);
@@ -3062,7 +3082,12 @@
           get clientLeft() {
             if (isDocumentElement(this)) return 0;
             const geometry = elementGeometry(this);
-            return geometry ? Math.round(geometry.paddingX - geometry.borderX) : 0;
+            if (!geometry) return 0;
+            const borderLeft = geometry.paddingX - geometry.borderX;
+            if (this.localName === 'input') {
+              return Math.round(borderLeft + horizontalPadding(this).left);
+            }
+            return Math.round(borderLeft);
           }
           // Approximation (no patch to litehtml's protected scroll-size
           // state): equates scroll size with the padding-box client size.
