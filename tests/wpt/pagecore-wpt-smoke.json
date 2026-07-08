@@ -34,6 +34,16 @@
       }
     },
     {
+      "name": "fetch/headers-override",
+      "path": "/fetch/api/pagecore-fetch-headers-override.window.js",
+      "expected": {
+        "harness": "OK",
+        "subtests": {
+          "a .headers sidecar overrides the extension-guessed Content-Type": "PASS"
+        }
+      }
+    },
+    {
       "name": "cookies/document-cookie",
       "path": "/cookies/pagecore-document-cookie.window.js",
       "expected": {

@@ -1,0 +1,1 @@
+this file's real extension is .txt but its .headers sidecar overrides Content-Type

@@ -621,6 +621,24 @@ if(PAGECORE_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/dom_shim/dom_shim_unit_tests.js"
         )
         add_test(
+            NAME pagecore_wpt_testharness_unit_tests
+            COMMAND
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/wpt/resources/testharness_unit_tests.js"
+        )
+        add_test(
+            NAME pagecore_wpt_tooling_unit_tests
+            COMMAND
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/run_wpt_subset_unit_tests.js"
+        )
+        add_test(
+            NAME pagecore_display_list_tooling_unit_tests
+            COMMAND
+                "${PAGECORE_NODE_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/run_display_list_reftests_unit_tests.js"
+        )
+        add_test(
             NAME pagecore_wpt_smoke
             COMMAND
                 ${CMAKE_COMMAND}

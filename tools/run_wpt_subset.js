@@ -224,9 +224,13 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`run_wpt_subset.js: ${error.message}`);
-  process.exit(1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`run_wpt_subset.js: ${error.message}`);
+    process.exit(1);
+  }
 }
+
+module.exports = { compareExpected, actualSubtestMap, renderingEnabled };

@@ -1,0 +1,20 @@
+{
+  "root": ".",
+  "tests": [
+    {
+      "name": "broken-first",
+      "path": "/broken.window.js",
+      "expected": { "harness": "OK" }
+    },
+    {
+      "name": "no-expected-harness-errors",
+      "path": "/errored.window.js"
+    },
+    {
+      "name": "zero-wait",
+      "path": "/good-zero-wait.window.js",
+      "waitMs": 0,
+      "expected": { "harness": "OK", "subtests": { "ok subtest": "PASS" } }
+    }
+  ]
+}
