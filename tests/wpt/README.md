@@ -27,6 +27,9 @@ node tools/generate_wpt_manifest.js \
   --output /tmp/pagecore-wpt-generated.json
 ```
 
+The generator also skips HTML tests whose local helper scripts or stylesheet
+resources are absent from the selected checkout.
+
 All tests are served from the single synthetic origin
 `https://web-platform.test` — cross-origin/multi-origin tests (references to
 `www1.web-platform.test` and similar) are not supported. See

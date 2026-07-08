@@ -72,6 +72,7 @@ test('sourceSkipReason rejects unsupported WPT infrastructure', () => {
 });
 
 test('generateManifest emits sorted all-pass tests and rendering markers', () => withTempWptTree((root) => {
+  writeFile(root, 'resources/testharness.js', '');
   writeFile(root, 'url/b.any.js', 'test(() => {}, "b");\n');
   writeFile(root, 'url/a.window.js', 'test(() => {}, "a");\n');
   writeFile(root, 'url/resources/helper.window.js', 'test(() => {}, "helper");\n');
@@ -103,6 +104,58 @@ test('generateManifest emits sorted all-pass tests and rendering markers', () =>
   assert.strictEqual(manifest.tests[1].requiresRendering, undefined);
   assert.strictEqual(manifest.skipped['support resource'], 1);
   assert.strictEqual(manifest.skipped['python handler'], 1);
+}));
+
+test('generateManifest skips HTML tests with missing local helper scripts', () => withTempWptTree((root) => {
+  writeFile(root, 'resources/testharness.js', '');
+  writeFile(root, 'css/cssom-view/has-helper.html', [
+    '<script src="/resources/testharness.js"></script>',
+    '<script src="resources/present-helper.js"></script>'
+  ].join('\n'));
+  writeFile(root, 'css/cssom-view/missing-helper.html', [
+    '<script src="/resources/testharness.js"></script>',
+    '<script src="resources/missing-helper.js"></script>'
+  ].join('\n'));
+  writeFile(root, 'css/cssom-view/resources/present-helper.js', '');
+
+  const manifest = generateManifest({
+    root,
+    prefixes: ['css/cssom-view/'],
+    requiresRenderingPrefixes: ['css/cssom-view/'],
+    includeUnsupported: false,
+    limit: null
+  });
+
+  assert.deepStrictEqual(manifest.tests.map((entry) => entry.path), [
+    '/css/cssom-view/has-helper.html'
+  ]);
+  assert.strictEqual(manifest.skipped['missing helper script'], 1);
+}));
+
+test('generateManifest skips HTML tests with missing local stylesheet resources', () => withTempWptTree((root) => {
+  writeFile(root, 'resources/testharness.js', '');
+  writeFile(root, 'fonts/ahem.css', '');
+  writeFile(root, 'css/cssom-view/has-font.html', [
+    '<script src="/resources/testharness.js"></script>',
+    '<link rel="stylesheet" href="/fonts/ahem.css">'
+  ].join('\n'));
+  writeFile(root, 'css/cssom-view/missing-font.html', [
+    '<script src="/resources/testharness.js"></script>',
+    '<link href="/fonts/missing.css" rel="stylesheet">'
+  ].join('\n'));
+
+  const manifest = generateManifest({
+    root,
+    prefixes: ['css/cssom-view/'],
+    requiresRenderingPrefixes: ['css/cssom-view/'],
+    includeUnsupported: false,
+    limit: null
+  });
+
+  assert.deepStrictEqual(manifest.tests.map((entry) => entry.path), [
+    '/css/cssom-view/has-font.html'
+  ]);
+  assert.strictEqual(manifest.skipped['missing stylesheet resource'], 1);
 }));
 
 test('generateManifest honors limit after sorting', () => withTempWptTree((root) => {

@@ -126,6 +126,64 @@ function sourceSkipReason(source) {
   return null;
 }
 
+function scriptSourceReferences(source) {
+  const references = [];
+  const scriptPattern = /<script\b[^>]*\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  let match;
+  while ((match = scriptPattern.exec(source)) !== null) {
+    references.push({ kind: 'script', value: match[1] || match[2] || match[3] || '' });
+  }
+  return references;
+}
+
+function attributeValue(tag, name) {
+  const pattern = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i');
+  const match = pattern.exec(tag);
+  return match ? (match[1] || match[2] || match[3] || '') : '';
+}
+
+function localHtmlResourceReferences(source) {
+  const references = scriptSourceReferences(source);
+  const linkPattern = /<link\b[^>]*>/gi;
+  let match;
+  while ((match = linkPattern.exec(source)) !== null) {
+    const tag = match[0];
+    const rel = attributeValue(tag, 'rel').toLowerCase().split(/\s+/);
+    if (!rel.includes('stylesheet')) continue;
+    references.push({ kind: 'stylesheet', value: attributeValue(tag, 'href') });
+  }
+  return references;
+}
+
+function dependencyPathForHtmlResource(relativePath, src) {
+  const raw = String(src || '').trim();
+  if (!raw) return null;
+  if (/^(?:[a-z][a-z0-9+.-]*:)?\/\//i.test(raw)) return null;
+  if (/^(?:data|javascript|mailto):/i.test(raw)) return null;
+
+  const pathOnly = raw.split(/[?#]/, 1)[0];
+  if (!pathOnly) return null;
+  if (pathOnly.startsWith('/')) {
+    return normalizeSlashes(pathOnly.replace(/^\/+/, ''));
+  }
+
+  const base = path.posix.dirname(normalizeSlashes(relativePath));
+  const resolved = path.posix.normalize(path.posix.join(base, pathOnly));
+  return normalizeSlashes(resolved).replace(/^\/+/, '');
+}
+
+function missingLocalResourceReason(root, relativePath, source) {
+  if (!relativePath.endsWith('.html')) return null;
+  for (const reference of localHtmlResourceReferences(source)) {
+    const dependency = dependencyPathForHtmlResource(relativePath, reference.value);
+    if (!dependency) continue;
+    if (!fs.existsSync(path.join(root, dependency))) {
+      return reference.kind === 'stylesheet' ? 'missing stylesheet resource' : 'missing helper script';
+    }
+  }
+  return null;
+}
+
 function walkFiles(root) {
   const files = [];
   const pending = [''];
@@ -172,7 +230,7 @@ function generateManifest(options) {
     let reason = pathSkipReason(relativePath);
     if (!reason && !options.includeUnsupported) {
       const source = fs.readFileSync(path.join(root, relativePath), 'utf8');
-      reason = sourceSkipReason(source);
+      reason = missingLocalResourceReason(root, relativePath, source) || sourceSkipReason(source);
     }
     if (reason) {
       skipped[reason] = (skipped[reason] || 0) + 1;

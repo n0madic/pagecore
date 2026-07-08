@@ -55,12 +55,34 @@
           static fromRect(other = {}) {
             return new DOMRectReadOnly(other.x, other.y, other.width, other.height);
           }
+
+          get [Symbol.toStringTag]() { return 'DOMRectReadOnly'; }
         }
 
         class DOMRect extends DOMRectReadOnly {
           static fromRect(other = {}) {
             return new DOMRect(other.x, other.y, other.width, other.height);
           }
+
+          get [Symbol.toStringTag]() { return 'DOMRect'; }
+        }
+
+        class DOMRectList {
+          constructor(rects = []) {
+            this._rects = Array.from(rects);
+            for (let index = 0; index < this._rects.length; index++) {
+              Object.defineProperty(this, index, {
+                configurable: true,
+                enumerable: true,
+                value: this._rects[index]
+              });
+            }
+          }
+
+          get length() { return this._rects.length; }
+          item(index) { return this._rects[Number(index)] || null; }
+          [Symbol.iterator]() { return this._rects[Symbol.iterator](); }
+          get [Symbol.toStringTag]() { return 'DOMRectList'; }
         }
 
         function nodeLength(node) {
@@ -153,7 +175,12 @@
 
           detach() {}
           getBoundingClientRect() { return new DOMRect(0, 0, 0, 0); }
-          getClientRects() { return []; }
+          getClientRects() {
+            if (this._startContainer && typeof this._startContainer.getClientRects === 'function') {
+              return this._startContainer.getClientRects();
+            }
+            return new DOMRectList([]);
+          }
           toString() {
             if (this._startContainer === this._endContainer && this._startContainer.nodeType === 3) {
               return this._startContainer.data.slice(this._startOffset, this._endOffset);
@@ -1265,6 +1292,7 @@
       return {
         DOMRectReadOnly,
         DOMRect,
+        DOMRectList,
         Range,
         Selection,
         selection,

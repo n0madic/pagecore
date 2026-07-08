@@ -88,7 +88,9 @@ The v1 runner supports manifest-listed `.html`, `.window.js`, and
 window-variant `.any.js` tests. The generator filters out common unsupported WPT
 infrastructure such as workers, service workers, Python handlers, wptserve
 template substitutions, iframe navigation, JavaScript URL navigation, persistent
-network APIs, and cross-origin helpers. It does not implement WPT's full
+network APIs, cross-origin helpers, and HTML tests that reference missing local
+script or stylesheet resources in the selected WPT checkout. It does not
+implement WPT's full
 manifest discovery, workers, service workers, Python handlers, websockets,
 HTTPS certificates, the full wptserve feature set, or cross-origin/multi-origin
 requests — every test is served from the single synthetic origin

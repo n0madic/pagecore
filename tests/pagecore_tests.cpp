@@ -8476,6 +8476,119 @@ void test_geometry_box_model_apis_reflect_real_layout()
         "box-model geometry APIs should reflect the real litehtml layout");
 }
 
+void test_geometry_get_client_rects_returns_domrectlist()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="box" style="width:20px;height:10px;"></div>
+  <script>
+    const box = document.getElementById('box');
+    const rects = box.getClientRects();
+    const range = new Range();
+    range.selectNodeContents(box);
+    const rangeRects = range.getClientRects();
+    const checks = [
+      Object.prototype.toString.call(rects) === '[object DOMRectList]',
+      typeof rects.item === 'function',
+      rects.item(0) instanceof DOMRect,
+      Object.prototype.toString.call(rects.item(0)) === '[object DOMRect]',
+      rects.item(999) === null,
+      Object.prototype.toString.call(rangeRects) === '[object DOMRectList]',
+      rangeRects.item(0) instanceof DOMRect,
+      Object.prototype.toString.call(rangeRects.item(0)) === '[object DOMRect]'
+    ];
+    document.body.setAttribute('data-domrectlist-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-domrectlist-check='ok']").has_value(),
+        "getClientRects should expose DOMRectList-compatible objects");
+}
+
+void test_window_named_element_access_exposes_document_ids()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="namedBox"></div>
+  <img id="imageById" name="imageByName">
+  <div id="document"></div>
+  <script>
+    const checks = [
+      window.namedBox === document.getElementById('namedBox'),
+      namedBox === window.namedBox,
+      window.imageById === document.getElementById('imageById'),
+      window.imageByName === document.getElementById('imageById'),
+      window.document.nodeType === Node.DOCUMENT_NODE
+    ];
+    document.body.setAttribute('data-window-named-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-window-named-check='ok']").has_value(),
+        "window named element access should expose ids/names without overriding real globals");
+}
+
+void test_root_client_geometry_uses_viewport()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!doctype html>
+<html style="margin:5px"><body><div style="height:200vh;width:200vw"></div></body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{375, 812, 1.0f};
+    (void) page.display_list(options);
+
+    require(page.eval("document.documentElement.clientTop") == "0", "root clientTop should be zero");
+    require(page.eval("document.documentElement.clientLeft") == "0", "root clientLeft should be zero");
+    require(
+        page.eval("document.documentElement.clientWidth === window.innerWidth") == "true",
+        "root clientWidth should match the viewport width");
+    require(
+        page.eval("document.documentElement.clientHeight === window.innerHeight") == "true",
+        "root clientHeight should match the viewport height");
+}
+
+void test_html_image_element_x_y_reflect_layout_position()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!doctype html>
+<html><body style="margin:0">
+  <img id="shown" style="position:absolute;left:10px;top:15px">
+  <img id="hidden" style="display:none;position:absolute;left:20px;top:25px">
+  <script>
+    const dynamicHidden = document.createElement('img');
+    document.body.appendChild(dynamicHidden);
+    dynamicHidden.style.setProperty('position', 'absolute');
+    dynamicHidden.style.setProperty('left', '30px');
+    dynamicHidden.style.setProperty('top', '35px');
+    dynamicHidden.style.setProperty('display', 'none');
+    const checks = [
+      shown.x === 10,
+      shown.y === 15,
+      hidden.x === 0,
+      hidden.y === 0,
+      dynamicHidden.x === 0,
+      dynamicHidden.y === 0
+    ];
+    document.body.setAttribute('data-image-xy-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-image-xy-check='ok']").has_value(),
+        "HTMLImageElement.x/y should expose the image layout position");
+}
+
 void test_layout_serialization_materializes_cached_absolute_width()
 {
     pagecore::Page page;
@@ -11278,6 +11391,10 @@ int main()
         test_layout_serialization_preserves_user_layout_id_attribute();
         test_visual_fixture_regression();
         test_geometry_box_model_apis_reflect_real_layout();
+        test_geometry_get_client_rects_returns_domrectlist();
+        test_window_named_element_access_exposes_document_ids();
+        test_root_client_geometry_uses_viewport();
+        test_html_image_element_x_y_reflect_layout_position();
         test_layout_serialization_materializes_cached_absolute_width();
         test_layout_serialization_materializes_absolute_percentage_width_without_js_measure();
         test_layout_serialization_skips_stale_cached_width_after_history_rollover();

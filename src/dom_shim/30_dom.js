@@ -262,6 +262,7 @@
       }
 
       function scheduleElementResourceLoad(element) {
+        if (ctx.suppressResourceLoadScheduling) return;
         if (!element || !element.localName) return;
         let kind = '';
         let url = '';
@@ -424,7 +425,10 @@
                 nextSibling: null,
                 attributeName: null
               });
-              for (const node of addedNodes) scheduleResourceLoadsInSubtree(node);
+              for (const node of addedNodes) {
+                scheduleResourceLoadsInSubtree(node);
+                installWindowNamedPropertiesFromTree(node);
+              }
               return child;
             }
             if (child && child.__fragmentParent) child.__fragmentParent.removeChild(child);
@@ -442,6 +446,7 @@
             });
             executeDynamicScriptsInSubtree(result);
             scheduleResourceLoadsInSubtree(result);
+            installWindowNamedPropertiesFromTree(result);
             return result;
           }
 
@@ -464,7 +469,10 @@
                 nextSibling: referenceChild || null,
                 attributeName: null
               });
-              for (const node of addedNodes) scheduleResourceLoadsInSubtree(node);
+              for (const node of addedNodes) {
+                scheduleResourceLoadsInSubtree(node);
+                installWindowNamedPropertiesFromTree(node);
+              }
               return child;
             }
             if (child && child.__fragmentParent) child.__fragmentParent.removeChild(child);
@@ -483,6 +491,7 @@
             });
             executeDynamicScriptsInSubtree(result);
             scheduleResourceLoadsInSubtree(result);
+            installWindowNamedPropertiesFromTree(result);
             return result;
           }
 
@@ -526,6 +535,7 @@
             });
             executeDynamicScriptsInSubtree(child);
             scheduleResourceLoadsInSubtree(child);
+            installWindowNamedPropertiesFromTree(child);
             return result;
           }
 
@@ -2074,6 +2084,120 @@
           return computedDisplayForVersion(element, layoutMutationVersion());
         }
 
+        const windowNamedPropertyGetterMarker = Symbol('pagecoreWindowNamedPropertyGetter');
+
+        function isNamedWindowElement(element) {
+          return element instanceof Element
+            && ['embed', 'form', 'img', 'object'].includes(element.localName);
+        }
+
+        function windowNamedPropertyNamesForElement(element) {
+          if (!(element instanceof Element)) return [];
+          const names = [];
+          const id = element.getAttribute('id');
+          if (id) names.push(id);
+          if (isNamedWindowElement(element)) {
+            const name = element.getAttribute('name');
+            if (name) names.push(name);
+          }
+          return names;
+        }
+
+        function walkSubtree(root, callback) {
+          if (!root) return;
+          const pending = [root];
+          while (pending.length) {
+            const node = pending.pop();
+            callback(node);
+            const children = node && node.childNodes ? node.childNodes : [];
+            for (let index = children.length - 1; index >= 0; index--) {
+              pending.push(children[index]);
+            }
+          }
+        }
+
+        function namedWindowElementsFromTree(root) {
+          const elements = [];
+          const seen = new Set();
+          const add = (element) => {
+            if (!(element instanceof Element) || seen.has(element.__id)) return;
+            seen.add(element.__id);
+            elements.push(element);
+          };
+
+          if (root instanceof Element) add(root);
+          if (root && typeof root.querySelectorAll === 'function') {
+            try {
+              for (const selector of ['[id]', 'embed[name]', 'form[name]', 'img[name]', 'object[name]']) {
+                for (const element of root.querySelectorAll(selector)) add(element);
+              }
+              return elements;
+            } catch (_selectorError) {
+              elements.length = 0;
+              seen.clear();
+            }
+          }
+
+          walkSubtree(root, (node) => {
+            if (windowNamedPropertyNamesForElement(node).length > 0) add(node);
+          });
+          return elements;
+        }
+
+        function firstNamedElementByName(name) {
+          let found = null;
+          walkSubtree(document.documentElement, (node) => {
+            if (found || !isNamedWindowElement(node)) return;
+            if (node.getAttribute('name') === name) found = node;
+          });
+          return found;
+        }
+
+        function resolveWindowNamedProperty(name) {
+          const byId = document.getElementById(name);
+          if (byId) return byId;
+          return firstNamedElementByName(name) || undefined;
+        }
+
+        function installWindowNamedProperty(name) {
+          const key = String(name || '');
+          if (!key) return;
+          const descriptor = Object.getOwnPropertyDescriptor(global, key);
+          if (descriptor && !(descriptor.get && descriptor.get[windowNamedPropertyGetterMarker])) return;
+
+          const getter = function() {
+            return resolveWindowNamedProperty(key);
+          };
+          defineValue(getter, windowNamedPropertyGetterMarker, true);
+
+          Object.defineProperty(global, key, {
+            configurable: true,
+            enumerable: true,
+            get: getter,
+            set(value) {
+              defineValue(global, key, value, true);
+            }
+          });
+        }
+
+        function installWindowNamedPropertiesForElement(element) {
+          for (const name of windowNamedPropertyNamesForElement(element)) {
+            installWindowNamedProperty(name);
+          }
+        }
+
+        function installWindowNamedPropertiesFromTree(root) {
+          const previous = ctx.suppressResourceLoadScheduling;
+          ctx.suppressResourceLoadScheduling = true;
+          try {
+            for (const element of namedWindowElementsFromTree(root)) {
+              installWindowNamedPropertiesForElement(element);
+            }
+          } finally {
+            ctx.suppressResourceLoadScheduling = previous;
+          }
+        }
+
         function selectorTokens(selector) {
           const parts = [];
           let current = '';
@@ -2385,6 +2509,18 @@
           return elementGeometryForVersion(element, layoutMutationVersion());
         }
 
+        function currentViewport() {
+          try {
+            return bridge.viewport();
+          } catch (_viewportError) {
+            return { width: 1280, height: 720, deviceScaleFactor: 1 };
+          }
+        }
+
+        function isDocumentElement(element) {
+          return element === document.documentElement;
+        }
+
         const offsetParentCache = new WeakMap();
         function resolveOffsetParent(element, version) {
           if (!(element instanceof HTMLElement) || !isNodeWrapper(element)) return null;
@@ -2646,6 +2782,7 @@
             });
             markScriptsStartedInSubtree(this);
             scheduleResourceLoadsInSubtree(this);
+            installWindowNamedPropertiesFromTree(this);
           }
           get outerHTML() { return bridge.outerHTML(this._liveId()); }
           get style() { return memo(this, '__style', () => styleDeclaration(this)); }
@@ -2702,6 +2839,9 @@
             if (oldValue !== newValue) notifyCustomElementAttributeChanged(this, attributeName, oldValue, newValue);
             if (oldValue !== newValue && ['src', 'href', 'rel', 'disabled'].includes(attributeName.toLowerCase())) {
               scheduleElementResourceLoad(this);
+            }
+            if (oldValue !== newValue && ['id', 'name'].includes(attributeName.toLowerCase())) {
+              installWindowNamedPropertiesForElement(this);
             }
             return result;
           }
@@ -2884,7 +3024,7 @@
             // Known simplification: returns one bounding rect instead of a
             // rect per line-box fragment for inline elements.
             const rect = this.getBoundingClientRect();
-            return rect.width > 0 || rect.height > 0 ? [rect] : [];
+            return new DOMRectList(rect.width > 0 || rect.height > 0 ? [rect] : []);
           }
           get offsetWidth() {
             const geometry = elementGeometry(this);
@@ -2905,18 +3045,22 @@
             return Math.round(geometry.borderX - (parentGeometry ? parentGeometry.borderX : 0));
           }
           get clientWidth() {
+            if (isDocumentElement(this)) return Math.round(currentViewport().width);
             const geometry = elementGeometry(this);
             return geometry ? Math.round(geometry.paddingWidth) : 0;
           }
           get clientHeight() {
+            if (isDocumentElement(this)) return Math.round(currentViewport().height);
             const geometry = elementGeometry(this);
             return geometry ? Math.round(geometry.paddingHeight) : 0;
           }
           get clientTop() {
+            if (isDocumentElement(this)) return 0;
             const geometry = elementGeometry(this);
             return geometry ? Math.round(geometry.paddingY - geometry.borderY) : 0;
           }
           get clientLeft() {
+            if (isDocumentElement(this)) return 0;
             const geometry = elementGeometry(this);
             return geometry ? Math.round(geometry.paddingX - geometry.borderX) : 0;
           }
@@ -3178,7 +3322,16 @@
           }
           get contentDocument() { return this.contentWindow.document; }
         }
-        class HTMLImageElement extends HTMLElement {}
+        class HTMLImageElement extends HTMLElement {
+          get x() {
+            if (computedDisplay(this) === 'none') return 0;
+            return Math.round(this.getBoundingClientRect().left);
+          }
+          get y() {
+            if (computedDisplay(this) === 'none') return 0;
+            return Math.round(this.getBoundingClientRect().top);
+          }
+        }
         class HTMLInputElement extends HTMLFormControlElement {
           get type() { return normalizedInputType(this); }
           set type(value) { this.setAttribute('type', String(value)); }
@@ -4055,7 +4208,8 @@
         parseHTMLFragment,
         fragmentFromHTML,
         wrapNode,
-        isDocumentFragment
+        isDocumentFragment,
+        installWindowNamedPropertiesFromTree
       };
       ctx.dom = exports;
       return exports;

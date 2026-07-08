@@ -140,11 +140,13 @@
         CSSMediaRule,
         CSSStyleSheet,
         CSSStyleDeclaration,
-        computedStyleFor
+        computedStyleFor,
+        installWindowNamedPropertiesFromTree
       } = api.dom;
       const {
         DOMRectReadOnly,
         DOMRect,
+        DOMRectList,
         Range,
         Selection,
         URL,
@@ -324,6 +326,7 @@
         global.Selection = Selection;
         global.DOMRectReadOnly = DOMRectReadOnly;
         global.DOMRect = DOMRect;
+        global.DOMRectList = DOMRectList;
         global.URL = URL;
         global.URLSearchParams = URLSearchParams;
         global.TextEncoder = TextEncoder;
@@ -629,6 +632,7 @@
             }, 'xhr-fetch');
           });
         };
+        installWindowNamedPropertiesFromTree(document);
         global.__pagecore_install_wpt_hook = installWptHook;
         installWptHook();
         global.__pagecore_fireDOMContentLoaded = () => {
