@@ -60,6 +60,16 @@ top-level `throw` in an ES module, whose evaluation returns a rejected promise �
 are surfaced the same way through a host promise-rejection tracker. Direct
 `Page::eval()` remains fail-fast.
 
+Adversarial script is bounded on several independent axes: `LoadOptions::js_timeout`
+caps each individual script's execution, while `LoadOptions::max_load_time` caps
+the aggregate wall-clock of the whole `<script>` sequence (so K scripts cannot
+consume K × `js_timeout`); once the aggregate deadline passes the remaining scripts
+are skipped. `LoadOptions::js_memory_limit_bytes` bounds the QuickJS heap, and
+`LoadOptions::max_dom_nodes` separately bounds the cumulative number of DOM nodes
+scripts may create (`createElement`, `cloneNode`, `innerHTML`, …) — native Lexbor
+node memory the JS heap limit does not cover. Setting a limit to 0 / `std::nullopt`
+disables that axis.
+
 ## Resource pipeline
 
 Resources flow through `ResourceRequest`/`ResourceResponse` with request kinds
@@ -86,8 +96,13 @@ stylesheet imports, and image placeholders all share this one pipeline.
   batches only the misses.
 
 `LoadOptions::js_resource_load_policy` and the JS resource budgets restrict only
-JS-initiated `fetch`/XHR/dynamic-script loads, leaving the top-level document and
-parser-discovered scripts unchanged.
+JS-initiated `fetch`/XHR/dynamic-script loads. Parser-discovered `<script src>`
+fan-out is bounded separately by `LoadOptions::max_document_script_loads` (excess
+`<script src>` are neither fetched nor executed). Every transfer is size-bounded:
+`ResourcePolicy::max_response_bytes` caps the body, and response headers are capped
+cumulatively across the whole transfer (including `Set-Cookie` accumulated over
+redirect hops, which libcurl resets per hop) so a server cannot move an unbounded
+payload into headers.
 
 ### Script loading
 

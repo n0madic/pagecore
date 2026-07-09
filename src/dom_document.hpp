@@ -91,6 +91,16 @@ struct DomDocument::Impl {
     Impl();
     ~Impl();
 
+    // Cumulative budget for script-created nodes (see DomDocument::set_max_created_nodes).
+    // max_created_nodes == 0 disables the limit; created_nodes resets on parse().
+    std::size_t max_created_nodes = 0;
+    std::size_t created_nodes = 0;
+    // Throws std::runtime_error if creating `additional` more nodes would exceed
+    // the budget; otherwise charges them against it.
+    void note_created_nodes(std::size_t additional);
+    // Counts the nodes in a subtree (the node plus all descendants).
+    static std::size_t subtree_node_count(const lxb_dom_node_t* node);
+
     lxb_dom_node_t* require_node(NodeId id) const;
     lxb_dom_element_t* require_element(NodeId id) const;
     NodeId id_for(lxb_dom_node_t* node) const;

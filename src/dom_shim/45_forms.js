@@ -155,6 +155,11 @@
         [Symbol.iterator]() { return this.entries(); }
       }
 
+      // Exposed on ctx so the web module (a dependency of forms, and therefore
+      // unable to import FormData directly) can recognise a FormData request body
+      // and serialize it as multipart/form-data.
+      ctx.FormData = FormData;
+
       return {
         FormData
       };

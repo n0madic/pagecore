@@ -626,7 +626,10 @@
             let root = this;
             while (root.parentNode) root = root.parentNode;
             if (options && options.composed && root instanceof ShadowRoot) return root.host.getRootNode(options);
-            return root instanceof ShadowRoot || root instanceof DocumentFragment ? root : document;
+            // The root of a node attached to the main tree is the document; for a
+            // detached subtree it is the topmost ancestor reached (e.g. a bare
+            // createElement('div') is its own root), never the document.
+            return root instanceof Document ? document : root;
           }
 
           hasChildNodes() { return this.firstChild !== null; }
@@ -3296,9 +3299,18 @@
           }
           reportValidity() { return this.checkValidity(); }
           reset() {
+            // Clear each control's HTML "dirty" flags so its IDL
+            // value/checkedness/selectedness falls back to the corresponding
+            // default (defaultValue/defaultChecked/defaultSelected).
             for (const control of this.elements) {
-              if ('defaultValue' in control) control.value = control.defaultValue;
-              if ('defaultChecked' in control) control.checked = control.defaultChecked;
+              if (control instanceof HTMLInputElement) {
+                control._dirtyValue = false;
+                control._dirtyCheckedness = false;
+              } else if (control instanceof HTMLTextAreaElement) {
+                control._dirtyValue = false;
+              } else if (control instanceof HTMLSelectElement) {
+                for (const option of control.querySelectorAll('option')) option._dirtySelectedness = false;
+              }
             }
             this.dispatchEvent(new Event('reset', { bubbles: true, cancelable: true }));
           }
@@ -3372,8 +3384,16 @@
           }
           get defaultValue() { return this.getAttribute('value') || ''; }
           set defaultValue(value) { this.setAttribute('value', String(value)); }
-          get checked() { return this.hasAttribute('checked'); }
-          set checked(value) { this.toggleAttribute('checked', Boolean(value)); }
+          // Checkedness is tracked separately from the "checked" content
+          // attribute (the default), per the HTML "dirty checkedness flag", so
+          // toggling the control does not rewrite the attribute and reset() works.
+          get checked() {
+            return this._dirtyCheckedness ? this._checkedness : this.hasAttribute('checked');
+          }
+          set checked(value) {
+            this._checkedness = Boolean(value);
+            this._dirtyCheckedness = true;
+          }
           get defaultChecked() { return this.hasAttribute('checked'); }
           set defaultChecked(value) { this.toggleAttribute('checked', Boolean(value)); }
           get minLength() { return Number(this.getAttribute('minlength') || -1); }
@@ -3406,8 +3426,16 @@
         class HTMLOptionElement extends HTMLElement {
           get value() { return this.getAttribute('value') || this.textContent || ''; }
           set value(value) { this.setAttribute('value', String(value)); }
-          get selected() { return this.hasAttribute('selected'); }
-          set selected(value) { this.toggleAttribute('selected', Boolean(value)); }
+          // Selectedness is tracked separately from the "selected" content
+          // attribute (the default), per the HTML "dirtiness" flag, so scripting
+          // the option does not rewrite the attribute and form.reset() works.
+          get selected() {
+            return this._dirtySelectedness ? this._selectedness : this.hasAttribute('selected');
+          }
+          set selected(value) {
+            this._selectedness = Boolean(value);
+            this._dirtySelectedness = true;
+          }
           get defaultSelected() { return this.hasAttribute('selected'); }
           set defaultSelected(value) { this.toggleAttribute('selected', Boolean(value)); }
           get disabled() { return this.hasAttribute('disabled'); }
@@ -3437,9 +3465,11 @@
         class HTMLSelectElement extends HTMLFormControlElement {
           get options() { return this.querySelectorAll('option'); }
           get value() {
-            const selected = this.querySelector('option[selected]');
-            const option = selected || this.querySelector('option');
-            return option ? option.value : '';
+            // Read live selectedness (the IDL flag), not the "selected" content
+            // attribute, so a script-set option.selected is reflected here.
+            const options = this.options;
+            const selected = options.find((option) => option.selected) || options[0];
+            return selected ? selected.value : '';
           }
           set value(value) {
             const text = String(value);
@@ -3480,8 +3510,16 @@
           get content() { return memo(this, '__templateContent', () => new DocumentFragment()); }
         }
         class HTMLTextAreaElement extends HTMLFormControlElement {
-          get value() { return this.getAttribute('value') || this.textContent || ''; }
-          set value(value) { this.textContent = String(value); }
+          // The raw value is tracked separately from the child text (the default
+          // value), per the HTML "dirty value flag", so setting value does not
+          // rewrite the text content and form.reset() restores the default.
+          get value() {
+            return this._dirtyValue ? this._value : (this.getAttribute('value') || this.textContent || '');
+          }
+          set value(value) {
+            this._value = String(value);
+            this._dirtyValue = true;
+          }
           get defaultValue() { return this.textContent || ''; }
           set defaultValue(value) { this.textContent = String(value ?? ''); }
         }
@@ -4236,6 +4274,27 @@
         isDocumentFragment,
         installWindowNamedPropertiesFromTree
       };
+
+      // Give every Node-derived interface a Symbol.toStringTag so
+      // Object.prototype.toString.call(node) reports the real interface name
+      // (e.g. "[object HTMLDivElement]", "[object HTMLDocument]") instead of the
+      // giveaway "[object Object]". The names come from the export keys, which —
+      // unlike Constructor.name — survive the optional class-name minifier. The
+      // shim collapses Document/HTMLDocument into one class, so the real
+      // document object must still report "HTMLDocument".
+      const interfaceTagOverrides = { Document: 'HTMLDocument' };
+      for (const [name, value] of Object.entries(exports)) {
+        if (typeof value !== 'function' || !value.prototype) continue;
+        const isNodeInterface = value === Node || value === DocumentFragment
+          || value.prototype instanceof Node || value.prototype instanceof DocumentFragment;
+        if (!isNodeInterface) continue;
+        const tag = interfaceTagOverrides[name] || name;
+        Object.defineProperty(value.prototype, Symbol.toStringTag, {
+          get() { return tag; },
+          configurable: true
+        });
+      }
+
       ctx.dom = exports;
       return exports;
     }

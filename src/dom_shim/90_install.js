@@ -616,7 +616,7 @@
                 }
                 const loaded = loadHostResource(request.url, 'other', {
                   method: request.method,
-                  body: bodyText(request.body),
+                  body: bodyText(request.body, request.headers),
                   headers: request.headers,
                   credentials: request.credentials,
                   referrer: request.referrer

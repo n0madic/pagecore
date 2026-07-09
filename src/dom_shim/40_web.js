@@ -404,7 +404,15 @@
             this._searchParams = null;
           }
 
-          get href() { return `${this.origin}${this.pathname}${this.search}${this.hash}`; }
+          get href() {
+            // href carries userinfo (user[:password]@) when present; origin never
+            // does (kept userinfo-free below, per the URL spec).
+            const parts = this._parts;
+            const credentials = parts.username || parts.password
+              ? `${parts.username}${parts.password ? `:${parts.password}` : ''}@`
+              : '';
+            return `${parts.protocol}//${credentials}${this.host}${this.pathname}${this.search}${this.hash}`;
+          }
           set href(value) { this._parts = parseURL(value); this._searchParams = null; }
           get origin() { return `${this.protocol}//${this.host}`; }
           get protocol() { return this._parts.protocol; }
@@ -794,12 +802,52 @@
           return new URL(referrer, global.location.href || undefined).href;
         }
 
-        function bodyText(body) {
+        function generateMultipartBoundary() {
+          let boundary = '----PageCoreFormBoundary';
+          for (let i = 0; i < 24; i++) boundary += Math.floor(Math.random() * 36).toString(36);
+          return boundary;
+        }
+
+        function escapeMultipartFieldName(value) {
+          return String(value).replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+        }
+
+        // Serialize a FormData body as multipart/form-data and, unless the caller
+        // already set one, declare the matching Content-Type (with the generated
+        // boundary) on the request headers. The C++ bridge carries the request
+        // body as a single UTF-8 string, so binary file parts are transmitted as
+        // their decoded text — text fields (the common case) round-trip exactly.
+        function multipartFormDataBody(formData, headers) {
+          const boundary = generateMultipartBoundary();
+          if (headers && typeof headers.has === 'function' && !headers.has('content-type')) {
+            headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
+          }
+          let body = '';
+          for (const [name, value] of formData) {
+            body += `--${boundary}\r\n`;
+            if (value instanceof Blob) {
+              const filename = value instanceof File ? value.name : 'blob';
+              body += `Content-Disposition: form-data; name="${escapeMultipartFieldName(name)}"; filename="${escapeMultipartFieldName(filename)}"\r\n`;
+              body += `Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`;
+              body += `${decodeUtf8(value._bytes)}\r\n`;
+            } else {
+              body += `Content-Disposition: form-data; name="${escapeMultipartFieldName(name)}"\r\n\r\n`;
+              body += `${value}\r\n`;
+            }
+          }
+          body += `--${boundary}--\r\n`;
+          return body;
+        }
+
+        function bodyText(body, headers = null) {
           if (body == null) return '';
           if (body instanceof Blob) return decodeUtf8(body._bytes);
           if (body instanceof Uint8Array) return decodeUtf8(body);
           if (body instanceof ArrayBuffer) return decodeUtf8(new Uint8Array(body));
           if (ArrayBuffer.isView(body)) return decodeUtf8(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+          // FormData lives in the forms module, which depends on web, so web cannot
+          // import it; the forms module stashes the class on ctx for this check.
+          if (ctx.FormData && body instanceof ctx.FormData) return multipartFormDataBody(body, headers);
           return String(body);
         }
 
@@ -901,7 +949,7 @@
               try {
                 loaded = loadHostResource(this._url, 'other', {
                   method: this._method,
-                  body: bodyText(body),
+                  body: bodyText(body, this._requestHeaders),
                   headers: this._requestHeaders,
                   credentials: this.withCredentials ? 'include' : 'same-origin',
                   referrer: 'about:client'
@@ -912,9 +960,18 @@
                 this._responseHeaders = responseHeadersFromHost(loaded);
                 if (this._overrideMimeType) this._responseHeaders.set('content-type', this._overrideMimeType);
                 this.responseText = loaded.body || '';
-                this.response = this.responseType === 'json'
-                  ? (this.responseText ? JSON.parse(this.responseText) : null)
-                  : this.responseText;
+                if (this.responseType === 'json') {
+                  // A JSON responseType whose body is not valid JSON still loads
+                  // successfully; the response attribute simply yields null. Parse
+                  // outside the fatal path so it never turns a load into an error.
+                  try {
+                    this.response = this.responseText ? JSON.parse(this.responseText) : null;
+                  } catch (_jsonError) {
+                    this.response = null;
+                  }
+                } else {
+                  this.response = this.responseText;
+                }
               } catch (error) {
                 if (this._aborted) {
                   this._endActivity();

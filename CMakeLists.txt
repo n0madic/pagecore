@@ -44,6 +44,49 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# --- Warnings and sanitizers -------------------------------------------------
+# This engine parses untrusted HTML/CSS, images, and fonts and runs untrusted JS,
+# so compiler diagnostics and sanitizers are the first line of defense.
+option(PAGECORE_WARNINGS "Enable -Wall -Wextra on PageCore's own targets" ${PAGECORE_DEFAULT_BUILD_EXTRAS})
+option(PAGECORE_WERROR "Treat warnings as errors on PageCore's own targets (recommended in CI)" OFF)
+# Comma-separated sanitizer set (e.g. "address,undefined"); empty disables. Applied
+# globally so the vendored parsers that process untrusted input are instrumented too.
+set(PAGECORE_SANITIZE "" CACHE STRING "Sanitizers to enable globally, e.g. address,undefined")
+
+# Warning flags are attached per-target (see pagecore_apply_warnings) so the vendored
+# FetchContent dependencies are not drowned in third-party warnings.
+set(PAGECORE_WARNING_FLAGS "")
+if(PAGECORE_WARNINGS)
+    if(MSVC)
+        list(APPEND PAGECORE_WARNING_FLAGS /W4)
+        if(PAGECORE_WERROR)
+            list(APPEND PAGECORE_WARNING_FLAGS /WX)
+        endif()
+    else()
+        # -Wno-missing-field-initializers: the code intentionally uses partial
+        # aggregate initialization for value-initialized trailing fields throughout.
+        list(APPEND PAGECORE_WARNING_FLAGS -Wall -Wextra -Wno-missing-field-initializers)
+        if(PAGECORE_WERROR)
+            list(APPEND PAGECORE_WARNING_FLAGS -Werror)
+        endif()
+    endif()
+endif()
+
+function(pagecore_apply_warnings target)
+    if(PAGECORE_WARNING_FLAGS)
+        target_compile_options(${target} PRIVATE ${PAGECORE_WARNING_FLAGS})
+    endif()
+endfunction()
+
+if(PAGECORE_SANITIZE)
+    if(MSVC)
+        message(FATAL_ERROR "PAGECORE_SANITIZE is not supported with MSVC")
+    endif()
+    message(STATUS "PageCore sanitizers enabled: ${PAGECORE_SANITIZE}")
+    add_compile_options(-fsanitize=${PAGECORE_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${PAGECORE_SANITIZE})
+endif()
+
 if(PAGECORE_OPTIMIZE_SIZE)
     if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
         set(CMAKE_BUILD_TYPE MinSizeRel CACHE STRING "Build type" FORCE)
@@ -475,7 +518,10 @@ if(PAGECORE_ENABLE_RENDERING)
         FetchContent_Declare(
             lunasvg
             GIT_REPOSITORY https://github.com/sammycage/lunasvg.git
-            GIT_TAG v3.5.0
+            # Immutable commit for tag v3.5.0 (a tag can be re-pointed upstream). Pinning
+            # the SHA keeps the fetched source — and lunasvg's transitively fetched
+            # plutovg — reproducible and tamper-evident, matching the other deps above.
+            GIT_TAG 83c58df8103dc7dca423dfd824992af94d49bed6
             ${PAGECORE_FETCHCONTENT_EXCLUDE_FROM_ALL}
         )
         pagecore_fetchcontent_make_available_excluded(lunasvg)
@@ -503,6 +549,7 @@ add_library(pagecore
 )
 add_dependencies(pagecore pagecore_dom_shim)
 add_library(PageCore::pagecore ALIAS pagecore)
+pagecore_apply_warnings(pagecore)
 
 if(PAGECORE_ENABLE_RENDERING)
     target_sources(pagecore PRIVATE
@@ -592,6 +639,7 @@ endif()
 if(PAGECORE_BUILD_TOOLS)
     add_executable(pagecore_cli tools/pagecore_cli.cpp)
     target_link_libraries(pagecore_cli PRIVATE pagecore)
+    pagecore_apply_warnings(pagecore_cli)
     pagecore_strip_release_binary(pagecore_cli)
 endif()
 
@@ -605,6 +653,7 @@ if(PAGECORE_BUILD_TESTS)
     add_executable(pagecore_wpt_case tools/pagecore_wpt_case.cpp)
     target_link_libraries(pagecore_wpt_case PRIVATE pagecore)
     target_include_directories(pagecore_wpt_case PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    pagecore_apply_warnings(pagecore_wpt_case)
     pagecore_strip_release_binary(pagecore_wpt_case)
     if(PAGECORE_NODE_EXECUTABLE)
         add_test(
@@ -690,6 +739,7 @@ if(PAGECORE_BUILD_TESTS)
     )
     target_include_directories(pagecore_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps pagecore_libpsl_deps)
+    pagecore_apply_warnings(pagecore_tests)
     pagecore_strip_release_binary(pagecore_tests)
     add_test(NAME pagecore_tests COMMAND pagecore_tests)
     # Cap the suite so a hung loopback-server test (blocking accept()) fails the

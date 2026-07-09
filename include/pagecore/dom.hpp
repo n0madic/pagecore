@@ -90,6 +90,14 @@ public:
     NodeId head();
     NodeId body();
 
+    // Upper bound on the cumulative number of nodes scripts may create over the
+    // document's lifetime via create_element/text/comment, clone_node, and
+    // set_inner_html. Bounds native (Lexbor) node memory, which the JS heap limit
+    // does not cover, so an adversarial `for(;;) createElement(...)` cannot exhaust
+    // memory before the JS deadline fires. 0 disables the limit. The count resets
+    // on parse(); the limit persists.
+    void set_max_created_nodes(std::size_t max);
+
     NodeId create_element(std::string_view tag_name);
     NodeId create_text_node(std::string_view text);
     NodeId create_comment(std::string_view text);

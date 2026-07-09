@@ -85,8 +85,13 @@ struct Page::Impl {
     DomDocument document;
     std::shared_ptr<ResourceLoader> loader;
     std::shared_ptr<LayoutEngineFactory> layout_factory;
-    std::unique_ptr<JsRuntime> js;
     CookieJar cookie_jar;
+    // Declared after document/loader/cookie_jar so it is destroyed BEFORE them:
+    // JsRuntime holds a DomDocument& and a CookieJar* into those members. Today
+    // ~JsRuntime only frees the QuickJS context (no native finalizers), so the
+    // order is not yet load-bearing, but a future finalizer calling back into the
+    // DOM or cookie jar during teardown would be a use-after-free without it.
+    std::unique_ptr<JsRuntime> js;
     std::string current_url;
 
     // The single litehtml document shared by the rendered DisplayList and by
@@ -155,6 +160,9 @@ struct Page::Impl {
         // With JS disabled, <noscript> content must parse as the real fallback
         // elements browsers lay out (the flag carries across every parse()).
         document.set_scripting_enabled(options.enable_js);
+        // Bound native DOM-node memory against adversarial script (persists across
+        // parse()); js_memory_limit_bytes covers only the JS heap.
+        document.set_max_created_nodes(options.max_dom_nodes);
     }
 
     void invalidate_display_list_cache()
@@ -209,6 +217,7 @@ struct Page::Impl {
         std::vector<ScriptSource> scripts;
         std::vector<ResourceRequest> external_requests;
         std::vector<std::size_t> external_slots;
+        bool external_script_cap_logged = false;
 
         const NodeId root = document.document_node();
         std::size_t inline_script_index = 0;
@@ -227,6 +236,21 @@ struct Page::Impl {
             }
 
             if (src && !src->empty()) {
+                // Bound parser-discovered external-script fan-out: excess <script src>
+                // are neither fetched nor executed (a page cannot force an unbounded
+                // number of network requests through script tags alone).
+                if (options.max_document_script_loads != 0
+                    && external_requests.size() >= options.max_document_script_loads) {
+                    if (!external_script_cap_logged) {
+                        external_script_cap_logged = true;
+                        if (js) {
+                            js->log_console(
+                                "warn",
+                                "External script limit reached; skipping remaining <script src> requests");
+                        }
+                    }
+                    continue;
+                }
                 const std::string base = current_url.empty() ? options.base_url : current_url;
                 const std::string url = resolve_url(base, *src);
                 // Record the slot; the body is fetched in one batched, concurrent
@@ -292,7 +316,21 @@ struct Page::Impl {
     {
         ensure_js();
         js->activity_tracker().reset(document.mutation_version());
+        // Aggregate wall-clock ceiling across the whole script sequence, so a page
+        // with many scripts cannot spend K * js_timeout of CPU. Cleared before
+        // returning so later interactive eval() calls get a fresh per-call budget.
+        if (options.max_load_time.has_value()) {
+            js->set_load_deadline(std::chrono::steady_clock::now() + *options.max_load_time);
+        }
+        struct LoadDeadlineGuard {
+            JsRuntime* js;
+            ~LoadDeadlineGuard() { js->set_load_deadline(std::nullopt); }
+        } load_deadline_guard{js.get()};
         for (const auto& script : collect_scripts()) {
+            if (js->load_deadline_passed()) {
+                js->log_console("error", "Aggregate script execution deadline exceeded; skipping remaining scripts");
+                break;
+            }
             js->execute("document.__markScriptStarted(" + std::to_string(script.node) + ");", "<pagecore-script-state>");
             if (script.module) {
                 js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
@@ -319,10 +357,16 @@ struct Page::Impl {
             } catch (...) {
             }
         }
-        js->execute(
-            "if (typeof __pagecore_fireDOMContentLoaded === 'function') __pagecore_fireDOMContentLoaded();\n"
-            "if (typeof __pagecore_fireLoad === 'function') __pagecore_fireLoad();",
-            "<pagecore-lifecycle>");
+        try {
+            js->execute(
+                "if (typeof __pagecore_fireDOMContentLoaded === 'function') __pagecore_fireDOMContentLoaded();\n"
+                "if (typeof __pagecore_fireLoad === 'function') __pagecore_fireLoad();",
+                "<pagecore-lifecycle>");
+        } catch (const std::exception& error) {
+            js->log_console("error", error.what());
+        } catch (...) {
+            js->log_console("error", "JS exception in lifecycle handlers");
+        }
         js->activity_tracker().mark_load_fired();
         js->run_until_ready(PageReadinessOptions{
             options.wait_until,
@@ -1306,6 +1350,11 @@ void Page::set_resource_loader(std::shared_ptr<ResourceLoader> loader)
         throw std::runtime_error("resource loader must not be null");
     }
     impl_->loader = std::move(loader);
+    // Drop any live JsRuntime: it captured a shared_ptr to the previous loader at
+    // construction, so JS-initiated fetch/XHR/dynamic-script loads would otherwise
+    // keep hitting the old loader while document loads and renders use the new one.
+    // A fresh runtime is created on the next load (matching load_html's behavior).
+    impl_->js.reset();
     impl_->invalidate_display_list_cache();
 }
 

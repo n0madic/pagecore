@@ -400,7 +400,7 @@ PerfEvent js_resource_blocked_event(
 template <typename Func>
 JSValue timed_bridge_call(JSContext* ctx, std::string_view name, Func&& func)
 {
-    return bridge_call(ctx, [ctx, name, func = std::forward<Func>(func)](JsRuntime& js) mutable {
+    return bridge_call(ctx, [name, func = std::forward<Func>(func)](JsRuntime& js) mutable {
         const auto start = std::chrono::steady_clock::now();
         JSValue result = func(js);
         js.record_dom_bridge_perf(name, elapsed_us_since(start));
@@ -451,6 +451,11 @@ void promise_rejection_tracker(
         }
         JS_FreeValue(ctx, stack);
     }
+    // A throwing toString/valueOf on `reason` (JS_ToCString above) or a throwing
+    // `stack` getter leaves a pending exception on the context. This host hook runs
+    // during job draining and must not leak that exception onto an unrelated later
+    // operation, so clear it (JS_GetException returns JS_NULL when none is pending).
+    JS_FreeValue(ctx, JS_GetException(ctx));
     runtime->log_console("error", "Uncaught (in promise) " + message);
 }
 
@@ -2041,9 +2046,24 @@ void JsRuntime::log_console(std::string_view severity, std::string_view message)
     std::cerr << '\n';
 }
 
+void JsRuntime::set_load_deadline(std::optional<std::chrono::steady_clock::time_point> deadline)
+{
+    load_deadline_ = deadline;
+}
+
+bool JsRuntime::load_deadline_passed() const
+{
+    return load_deadline_.has_value() && std::chrono::steady_clock::now() >= *load_deadline_;
+}
+
 void JsRuntime::start_deadline()
 {
     deadline_ = std::chrono::steady_clock::now() + options_.js_timeout;
+    // Clamp the per-call deadline to the aggregate load deadline so the whole
+    // <script> sequence cannot exceed it even though each script gets js_timeout.
+    if (load_deadline_.has_value() && *load_deadline_ < deadline_) {
+        deadline_ = *load_deadline_;
+    }
     deadline_active_ = true;
 }
 

@@ -28,6 +28,12 @@ struct Viewport {
 struct RenderOptions {
     Viewport viewport;
     bool load_external_resources = true;
+    // Render sub-resource budgets (all opt-in; unset = unlimited). max_external_
+    // resource_loads is enforced exactly (per request). max_external_resource_bytes
+    // and max_external_resource_time are enforced at batch granularity: a discovery
+    // wave is admitted against the totals accumulated by prior waves, so the byte
+    // and time totals can overshoot by up to one wave's worth before the next wave
+    // is blocked. Use max_external_resource_loads for a hard, exact ceiling.
     std::optional<std::size_t> max_external_resource_loads;
     std::optional<std::size_t> max_external_resource_bytes;
     std::optional<std::chrono::milliseconds> max_external_resource_time;

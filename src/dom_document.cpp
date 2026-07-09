@@ -979,6 +979,43 @@ void DomDocument::Impl::clear_user_data_subtree(lxb_dom_node_t* node)
     }
 }
 
+std::size_t DomDocument::Impl::subtree_node_count(const lxb_dom_node_t* node)
+{
+    if (node == nullptr) {
+        return 0;
+    }
+    std::size_t count = 0;
+    std::vector<const lxb_dom_node_t*> stack;
+    stack.push_back(node);
+    while (!stack.empty()) {
+        const auto* current = stack.back();
+        stack.pop_back();
+        ++count;
+        for (const auto* child = current->first_child; child != nullptr; child = child->next) {
+            stack.push_back(child);
+        }
+    }
+    return count;
+}
+
+void DomDocument::Impl::note_created_nodes(std::size_t additional)
+{
+    if (max_created_nodes == 0) {
+        return;
+    }
+    // created_nodes never exceeds the cap (we throw before charging), so the
+    // subtraction cannot underflow.
+    if (additional > max_created_nodes - created_nodes) {
+        throw std::runtime_error("DOM node budget exceeded");
+    }
+    created_nodes += additional;
+}
+
+void DomDocument::set_max_created_nodes(std::size_t max)
+{
+    impl_->max_created_nodes = max;
+}
+
 DomDocument::DomDocument()
     : impl_(new Impl())
 {
@@ -1015,6 +1052,9 @@ void DomDocument::parse(std::string_view html)
     std::uint64_t carried_forget_version = 1;
     std::uint64_t carried_stylesheet_generation = 1;
     bool carried_scripting_enabled = true;
+    // The node budget is configuration, not per-document state, so it survives the
+    // fresh Impl below; created_nodes resets to 0 with the new document.
+    std::size_t carried_max_created_nodes = 0;
     if (impl_ != nullptr) {
         carried_next_id = impl_->next_id;
         carried_mutation_version = impl_->mutation_version;
@@ -1022,6 +1062,7 @@ void DomDocument::parse(std::string_view html)
         carried_forget_version = impl_->forget_version;
         carried_stylesheet_generation = impl_->stylesheet_generation;
         carried_scripting_enabled = impl_->scripting_enabled;
+        carried_max_created_nodes = impl_->max_created_nodes;
     }
 
     // Construct the replacement first, then swap: if the Impl constructor throws
@@ -1037,6 +1078,7 @@ void DomDocument::parse(std::string_view html)
     impl_->stylesheet_generation = carried_stylesheet_generation + 1;
     impl_->forget_version = carried_forget_version + 1;
     impl_->scripting_enabled = carried_scripting_enabled;
+    impl_->max_created_nodes = carried_max_created_nodes;
     lxb_html_document_scripting_set(impl_->document, carried_scripting_enabled);
     // The fresh Impl starts with an empty journal; align its base with the
     // carried layout version so pre-parse versions read as incomplete.
@@ -1088,6 +1130,7 @@ NodeId DomDocument::body()
 
 NodeId DomDocument::create_element(std::string_view tag_name)
 {
+    impl_->note_created_nodes(1);
     auto* element = lxb_html_document_create_element(
         impl_->document,
         reinterpret_cast<const lxb_char_t*>(tag_name.data()),
@@ -1103,6 +1146,7 @@ NodeId DomDocument::create_element(std::string_view tag_name)
 
 NodeId DomDocument::create_text_node(std::string_view text)
 {
+    impl_->note_created_nodes(1);
     auto* node = lxb_dom_document_create_text_node(
         &impl_->document->dom_document,
         reinterpret_cast<const lxb_char_t*>(text.data()),
@@ -1117,6 +1161,7 @@ NodeId DomDocument::create_text_node(std::string_view text)
 
 NodeId DomDocument::create_comment(std::string_view text)
 {
+    impl_->note_created_nodes(1);
     auto* node = lxb_dom_document_create_comment(
         &impl_->document->dom_document,
         reinterpret_cast<const lxb_char_t*>(text.data()),
@@ -1595,6 +1640,17 @@ void DomDocument::set_inner_html(NodeId id, std::string_view html)
     // React to both inserted and removed <style>/<link>/<base> content.
     const bool affects_sheets = removed_stylesheet || impl_->mutation_affects_stylesheets(node);
     impl_->mark_mutated(impl_->node_affects_layout(node), id, affects_sheets);
+
+    // Charge the newly parsed subtree against the node budget. Old children are
+    // detached rather than freed (see forget_node above), so a `for(;;)
+    // el.innerHTML = ...` loop grows native memory without bound; counting each
+    // parse's new nodes caps that. Charged after the mutation is recorded so the
+    // document stays consistent if the budget is exceeded here.
+    std::size_t inserted = 0;
+    for (auto* child = node->first_child; child != nullptr; child = child->next) {
+        inserted += Impl::subtree_node_count(child);
+    }
+    impl_->note_created_nodes(inserted);
 }
 
 std::string DomDocument::outer_html(NodeId id) const
@@ -1978,7 +2034,10 @@ NodeId DomDocument::replace_child(NodeId parent, NodeId child, NodeId replaced_c
 
 NodeId DomDocument::clone_node(NodeId id, bool deep)
 {
-    auto* cloned = lxb_dom_node_clone(impl_->require_node(id), deep);
+    auto* source = impl_->require_node(id);
+    // A deep clone reproduces the whole source subtree; a shallow clone one node.
+    impl_->note_created_nodes(deep ? Impl::subtree_node_count(source) : 1);
+    auto* cloned = lxb_dom_node_clone(source, deep);
     if (cloned == nullptr) {
         throw std::runtime_error("failed to clone DOM node");
     }

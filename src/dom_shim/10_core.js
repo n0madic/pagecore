@@ -11,6 +11,14 @@
 })(globalThis, function() {
   'use strict';
 
+  // Capture the primordials the node-creation hot path relies on at shim load,
+  // before any page script can run. Because every DOM module builds nodes and
+  // defines properties through these core helpers, hardening them here protects
+  // the whole shim from a page reassigning Object.defineProperty or
+  // Object.prototype.hasOwnProperty.
+  const ObjectDefineProperty = Object.defineProperty;
+  const ObjectPrototypeHasOwnProperty = Object.prototype.hasOwnProperty;
+
   return {
     name: 'core',
     deps: [],
@@ -88,7 +96,7 @@
       };
 
       function defineValue(target, property, value, enumerable = false) {
-        Object.defineProperty(target, property, {
+        ObjectDefineProperty(target, property, {
           value,
           writable: true,
           configurable: true,
@@ -132,7 +140,7 @@
       }
 
       function attachNodeId(target, id) {
-        Object.defineProperty(target, '__id', {
+        ObjectDefineProperty(target, '__id', {
           value: id,
           configurable: true
         });
@@ -154,8 +162,8 @@
       }
 
       function memo(target, property, factory) {
-        if (!Object.prototype.hasOwnProperty.call(target, property)) {
-          Object.defineProperty(target, property, {
+        if (!ObjectPrototypeHasOwnProperty.call(target, property)) {
+          ObjectDefineProperty(target, property, {
             value: factory(),
             configurable: true
           });

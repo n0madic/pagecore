@@ -46,6 +46,13 @@ public:
     void install();
     void execute(std::string_view script, std::string_view filename = "<eval>");
     void execute_module(std::string_view script, std::string_view filename);
+    // Sets an aggregate wall-clock deadline that every per-call execution deadline
+    // is additionally clamped to (see start_deadline). std::nullopt clears it.
+    // Used by the loader to bound the entire <script> sequence, not just one script.
+    void set_load_deadline(std::optional<std::chrono::steady_clock::time_point> deadline);
+    // True once a load deadline has been set and reached; the script loop uses this
+    // to stop launching further scripts.
+    bool load_deadline_passed() const;
     std::string evaluate(std::string_view script, std::string_view filename = "<eval>");
     void run_until_idle();
     bool run_until_ready(PageReadinessOptions options);
@@ -115,6 +122,8 @@ private:
     PageActivityTracker activity_tracker_;
     std::chrono::steady_clock::time_point deadline_{};
     bool deadline_active_ = false;
+    // Aggregate load deadline; each per-call deadline is clamped down to it.
+    std::optional<std::chrono::steady_clock::time_point> load_deadline_;
 
     static char* normalize_module(JSContext* ctx, const char* module_base_name, const char* module_name, void* opaque);
     static JSModuleDef* load_module(JSContext* ctx, const char* module_name, void* opaque);

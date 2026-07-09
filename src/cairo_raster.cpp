@@ -341,11 +341,6 @@ std::string font_family(const Font& font)
     return font.family.empty() ? "sans-serif" : font.family;
 }
 
-PangoWeight pango_weight(int weight)
-{
-    return static_cast<PangoWeight>(std::clamp(weight, 100, 1000));
-}
-
 int scaled_font_pango_size(const Font& font, float scale)
 {
     // std::max/min propagate NaN, so a NaN font-size would reach static_cast<int>
@@ -895,7 +890,40 @@ void draw_conic_gradient(cairo_t* cr, const ConicGradientCommand& command, float
         return;
     }
 
-    cairo_surface_t* raw_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, bounds.width, bounds.height);
+    // Clamp the painted region to the command clip and the current target/clip
+    // extents BEFORE allocating. Unlike the pattern-based gradients (Cairo clips
+    // those to the surface), this painter materializes a per-pixel surface and runs
+    // an atan2 per pixel, so a huge on-screen element box (e.g. 32767x32767) would
+    // otherwise allocate gigabytes and run ~1e9 transcendental calls. The gradient
+    // math uses absolute pixel coordinates, so restricting the sampled rectangle to
+    // the visible area is pixel-identical to sampling the whole box and clipping.
+    const IntRect clip = scale_rect(command.clip, scale);
+    IntRect draw_area = bounds;
+    if (!empty(clip)) {
+        const int cx0 = std::max(draw_area.x, clip.x);
+        const int cy0 = std::max(draw_area.y, clip.y);
+        const int cx1 = std::min(draw_area.x + draw_area.width, clip.x + clip.width);
+        const int cy1 = std::min(draw_area.y + draw_area.height, clip.y + clip.height);
+        draw_area = IntRect{cx0, cy0, std::max(0, cx1 - cx0), std::max(0, cy1 - cy0)};
+    }
+    double ext_x0 = 0.0;
+    double ext_y0 = 0.0;
+    double ext_x1 = 0.0;
+    double ext_y1 = 0.0;
+    cairo_clip_extents(cr, &ext_x0, &ext_y0, &ext_x1, &ext_y1);
+    if (std::isfinite(ext_x0) && std::isfinite(ext_y0) && std::isfinite(ext_x1) && std::isfinite(ext_y1)
+        && ext_x1 > ext_x0 && ext_y1 > ext_y0) {
+        const int ax0 = std::max(draw_area.x, to_pixel_floor(ext_x0));
+        const int ay0 = std::max(draw_area.y, to_pixel_floor(ext_y0));
+        const int ax1 = std::min(draw_area.x + draw_area.width, to_pixel_ceil(ext_x1));
+        const int ay1 = std::min(draw_area.y + draw_area.height, to_pixel_ceil(ext_y1));
+        draw_area = IntRect{ax0, ay0, std::max(0, ax1 - ax0), std::max(0, ay1 - ay0)};
+    }
+    if (empty(draw_area)) {
+        return;
+    }
+
+    cairo_surface_t* raw_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, draw_area.width, draw_area.height);
     check_status(cairo_surface_status(raw_surface), "create Cairo conic surface");
     std::unique_ptr<cairo_surface_t, decltype(&cairo_surface_destroy)> surface(raw_surface, cairo_surface_destroy);
 
@@ -905,11 +933,11 @@ void draw_conic_gradient(cairo_t* cr, const ConicGradientCommand& command, float
     const double from = static_cast<double>(command.angle);
     constexpr double pi = 3.14159265358979323846;
 
-    for (int j = 0; j < bounds.height; ++j) {
+    for (int j = 0; j < draw_area.height; ++j) {
         auto* row = reinterpret_cast<std::uint32_t*>(data + static_cast<std::ptrdiff_t>(j) * stride);
-        const double py = static_cast<double>(bounds.y) + j + 0.5;
-        for (int i = 0; i < bounds.width; ++i) {
-            const double dx = static_cast<double>(bounds.x) + i + 0.5 - cx;
+        const double py = static_cast<double>(draw_area.y) + j + 0.5;
+        for (int i = 0; i < draw_area.width; ++i) {
+            const double dx = static_cast<double>(draw_area.x) + i + 0.5 - cx;
             const double dy = py - cy;
             const double deg = std::atan2(dx, -dy) * 180.0 / pi; // 0 at top, clockwise
             double t = std::fmod((deg - from) / 360.0, 1.0);
@@ -928,13 +956,12 @@ void draw_conic_gradient(cairo_t* cr, const ConicGradientCommand& command, float
 
     cairo_save(cr);
     clip_rounded_rect(cr, bounds, command.radii, scale);
-    const IntRect clip = scale_rect(command.clip, scale);
     if (!empty(clip)) {
         cairo_rectangle(cr, clip.x, clip.y, clip.width, clip.height);
         cairo_clip(cr);
     }
 
-    cairo_set_source_surface(cr, surface.get(), bounds.x, bounds.y);
+    cairo_set_source_surface(cr, surface.get(), draw_area.x, draw_area.y);
     cairo_paint(cr);
     cairo_restore(cr);
 }

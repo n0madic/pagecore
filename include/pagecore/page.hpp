@@ -49,8 +49,23 @@ struct LoadOptions {
     WaitUntil wait_until = WaitUntil::Ready;
     std::chrono::milliseconds stable_window{350};
     std::chrono::milliseconds js_timeout{30000};
+    // Aggregate wall-clock ceiling on all JavaScript executed during a single
+    // load (the whole <script> sequence plus lifecycle/readiness), as opposed to
+    // js_timeout which bounds each script individually. Without it, a page with K
+    // scripts could consume up to K * js_timeout of CPU. std::nullopt disables it.
+    std::optional<std::chrono::milliseconds> max_load_time{std::chrono::milliseconds{60000}};
     std::size_t js_memory_limit_bytes = 256 * 1024 * 1024;
+    // Cumulative cap on DOM nodes scripts may create (createElement, cloneNode,
+    // innerHTML, ...). Bounds native Lexbor node memory that js_memory_limit_bytes
+    // does not cover. 0 disables it. See DomDocument::set_max_created_nodes.
+    std::size_t max_dom_nodes = 5 * 1000 * 1000;
     JsResourceLoadPolicy js_resource_load_policy = JsResourceLoadPolicy::Allow;
+    // Ceiling on the number of parser-discovered external <script src> fetched
+    // during a load. Unlike max_js_resource_* (which bound script-INITIATED loads
+    // — fetch/XHR/dynamic script), this bounds the document's own <script src>
+    // fan-out, which is otherwise limited only by the per-request size cap. 0
+    // disables it. Scripts beyond the cap are not fetched or executed.
+    std::size_t max_document_script_loads = 1000;
     std::optional<std::size_t> max_js_resource_loads;
     std::optional<std::size_t> max_js_resource_bytes;
     std::optional<std::chrono::milliseconds> max_js_resource_time;
@@ -62,6 +77,12 @@ struct LoadOptions {
 
 class ResourceLoader;
 
+// A Page is NOT thread-safe and must be used from a single thread at a time. This
+// includes the const read methods (display_list/render/computed_style/
+// element_geometry and document() const): they maintain internal styled-document,
+// geometry, and computed-style caches and adjust the DomDocument's
+// layout-sensitive-attribute configuration, so concurrent "reads" race on shared
+// mutable state. Use one Page per thread, or serialize access externally.
 class Page {
 public:
     explicit Page(LoadOptions options = {});

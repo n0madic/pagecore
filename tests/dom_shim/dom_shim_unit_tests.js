@@ -939,6 +939,226 @@ test('runtime removes native bridges even when a module install throws', () => {
   assert.strictEqual(root.__host, undefined, 'raw __host bridge must be removed even on a failed install');
 });
 
+test('dom Object.prototype.toString reports real DOM interface names', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const tag = (value) => Object.prototype.toString.call(value);
+
+  // Regression: without Symbol.toStringTag these all reported "[object Object]",
+  // a trivial tell that the DOM is shimmed.
+  assert.strictEqual(tag(document), '[object HTMLDocument]');
+  assert.strictEqual(tag(document.createElement('div')), '[object HTMLDivElement]');
+  assert.strictEqual(tag(document.createElement('a')), '[object HTMLAnchorElement]');
+  assert.strictEqual(tag(document.createElement('input')), '[object HTMLInputElement]');
+  assert.strictEqual(tag(document.createElement('span')), '[object HTMLSpanElement]');
+  assert.strictEqual(tag(document.createTextNode('x')), '[object Text]');
+  assert.strictEqual(tag(document.createComment('x')), '[object Comment]');
+  assert.strictEqual(tag(document.createDocumentFragment()), '[object DocumentFragment]');
+  // A hyphenated unknown tag falls back to the generic HTMLElement interface.
+  assert.strictEqual(tag(document.createElement('unknown-xyz')), '[object HTMLElement]');
+
+  // The tag is inherited (non-own) and non-enumerable, like a real interface.
+  const div = document.createElement('div');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(div, Symbol.toStringTag), false);
+});
+
+test('dom getRootNode returns the actual root for detached and attached nodes', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+
+  const parent = document.createElement('div');
+  const child = document.createElement('span');
+  parent.appendChild(child);
+
+  // Regression: a detached subtree used to report the document as its root.
+  assert.strictEqual(child.getRootNode(), parent);
+  assert.strictEqual(parent.getRootNode(), parent);
+
+  document.body.appendChild(parent);
+  assert.strictEqual(child.getRootNode(), document);
+});
+
+test('dom form control dirty flags keep defaults independent and reset restores them', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+  const form = document.createElement('form');
+
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.name = 'agree';
+
+  const textarea = document.createElement('textarea');
+  textarea.name = 'note';
+  textarea.textContent = 'default text';
+
+  const select = document.createElement('select');
+  select.name = 'choice';
+  const optionA = document.createElement('option');
+  optionA.value = 'a';
+  optionA.setAttribute('selected', '');
+  const optionB = document.createElement('option');
+  optionB.value = 'b';
+  select.appendChild(optionA);
+  select.appendChild(optionB);
+
+  form.appendChild(checkbox);
+  form.appendChild(textarea);
+  form.appendChild(select);
+  document.body.appendChild(form);
+
+  // Baseline defaults.
+  assert.strictEqual(checkbox.checked, false);
+  assert.strictEqual(textarea.value, 'default text');
+  assert.strictEqual(optionA.selected, true);
+  assert.strictEqual(select.value, 'a');
+
+  // Mutating the IDL properties must not touch the defaults or content attributes.
+  checkbox.checked = true;
+  textarea.value = 'typed text';
+  optionA.selected = false;
+  optionB.selected = true;
+
+  assert.strictEqual(checkbox.checked, true);
+  assert.strictEqual(checkbox.defaultChecked, false, 'checked must not flip defaultChecked');
+  assert.strictEqual(checkbox.hasAttribute('checked'), false, 'checked must not write the content attribute');
+  assert.strictEqual(textarea.value, 'typed text');
+  assert.strictEqual(textarea.defaultValue, 'default text', 'value must not overwrite defaultValue');
+  assert.strictEqual(optionA.defaultSelected, true, 'selected must not flip defaultSelected');
+  assert.strictEqual(optionA.hasAttribute('selected'), true);
+  assert.strictEqual(select.value, 'b');
+
+  // reset() clears the dirty flags, restoring every default.
+  form.reset();
+  assert.strictEqual(checkbox.checked, false);
+  assert.strictEqual(textarea.value, 'default text');
+  assert.strictEqual(optionA.selected, true);
+  assert.strictEqual(optionB.selected, false);
+  assert.strictEqual(select.value, 'a');
+});
+
+test('dom MutationObserver re-observing a target replaces its options', () => {
+  const { dom, events } = installDomEnvironment();
+  const { document } = dom;
+  const seen = [];
+  const observer = new events.MutationObserver((records) => {
+    for (const record of records) seen.push(record.type);
+  });
+
+  observer.observe(document.body, { childList: true });
+  observer.observe(document.body, { attributes: true });
+
+  // childList is no longer observed after the replacing observe() call.
+  document.body.appendChild(document.createElement('span'));
+  assert.strictEqual(events.deliverMutationObservers(), 0);
+  assert.deepStrictEqual(seen, []);
+
+  // attributes IS observed.
+  document.body.setAttribute('data-x', '1');
+  assert.strictEqual(events.deliverMutationObservers(), 1);
+  assert.deepStrictEqual(seen, ['attributes']);
+});
+
+test('dom MutationObserver is retained by its observed node (fire-and-forget delivery)', () => {
+  const { dom, events } = installDomEnvironment();
+  const { document } = dom;
+  const seen = [];
+
+  // Regression: the "new MutationObserver(cb).observe(node)" form keeps no
+  // reference to the observer. A purely weak global registry let an aggressive GC
+  // (as in the embedded QuickJS engine) collect it before any record was queued,
+  // dropping every delivery. The observed node must strongly anchor the observer,
+  // so its reachability — not GC timing — governs the observer's lifetime.
+  new events.MutationObserver((records) => {
+    for (const record of records) seen.push(record.type);
+  }).observe(document.body, { childList: true, attributes: true, subtree: true });
+
+  const anchors = document.body.__mutationObserverAnchors;
+  assert.ok(anchors && anchors.size === 1, 'the observed node must strongly reference its observer');
+
+  document.body.appendChild(document.createElement('span'));
+  document.body.setAttribute('data-order', '1');
+  assert.strictEqual(events.deliverMutationObservers(), 1);
+  assert.deepStrictEqual(seen, ['childList', 'attributes']);
+
+  // disconnect() releases the node → observer anchor so it can be collected.
+  const observer = new events.MutationObserver(() => {});
+  observer.observe(document.body, { childList: true });
+  assert.strictEqual(document.body.__mutationObserverAnchors.size, 2);
+  observer.disconnect();
+  assert.strictEqual(document.body.__mutationObserverAnchors.size, 1);
+});
+
+test('web URL href and toString serialize embedded credentials', () => {
+  const { web } = installWeb();
+
+  const url = new web.URL('https://user:pass@example.com/path?q=1#frag');
+  assert.strictEqual(url.href, 'https://user:pass@example.com/path?q=1#frag');
+  assert.strictEqual(url.toString(), 'https://user:pass@example.com/path?q=1#frag');
+  assert.strictEqual(url.username, 'user');
+  assert.strictEqual(url.password, 'pass');
+  // origin stays userinfo-free (correct per the URL spec).
+  assert.strictEqual(url.origin, 'https://example.com');
+
+  // Username without password.
+  assert.strictEqual(new web.URL('https://user@example.com/').href, 'https://user@example.com/');
+  // No credentials → unchanged.
+  assert.strictEqual(new web.URL('https://example.com/x').href, 'https://example.com/x');
+});
+
+test('web XHR responseType json yields null (not error) on malformed body', () => {
+  const env = installDomEnvironment();
+  const { web } = env;
+  env.ctx.host.loadResource = () => ({ body: 'not: valid json', status: 200 });
+
+  const xhr = new web.XMLHttpRequest();
+  const fired = [];
+  xhr.addEventListener('load', () => fired.push('load'));
+  xhr.addEventListener('error', () => fired.push('error'));
+  xhr.open('GET', '/data.json', false);
+  xhr.responseType = 'json';
+  xhr.send();
+
+  assert.strictEqual(xhr.status, 200);
+  assert.strictEqual(xhr.response, null);
+  assert.deepStrictEqual(fired, ['load']);
+
+  // Valid JSON still parses into a value.
+  env.ctx.host.loadResource = () => ({ body: '{"ok":true}', status: 200 });
+  const good = new web.XMLHttpRequest();
+  good.open('GET', '/ok.json', false);
+  good.responseType = 'json';
+  good.send();
+  assert.deepStrictEqual(good.response, { ok: true });
+});
+
+test('web XHR serializes a FormData body as multipart/form-data', () => {
+  const env = installDomEnvironment();
+  const { web, forms } = env;
+  let captured = null;
+  env.ctx.host.loadResource = (url, kind, method, body, headers) => {
+    captured = { body, headers };
+    return { body: '', status: 200 };
+  };
+
+  const data = new forms.FormData();
+  data.append('title', 'hello');
+  data.append('note', 'a b');
+
+  const xhr = new web.XMLHttpRequest();
+  xhr.open('POST', '/submit', false);
+  xhr.send(data);
+
+  // Regression: a FormData body used to be transmitted as "[object FormData]".
+  const contentType = captured.headers.find((pair) => pair[0] === 'content-type');
+  assert.ok(contentType, 'a content-type header is set for a FormData body');
+  assert.match(contentType[1], /^multipart\/form-data; boundary=----PageCoreFormBoundary/);
+  const boundary = contentType[1].split('boundary=')[1];
+  assert.ok(captured.body.includes(`--${boundary}\r\n`), 'body uses the declared boundary');
+  assert.match(captured.body, /Content-Disposition: form-data; name="title"\r\n\r\nhello\r\n/);
+  assert.match(captured.body, /Content-Disposition: form-data; name="note"\r\n\r\na b\r\n/);
+  assert.ok(captured.body.endsWith(`--${boundary}--\r\n`), 'body ends with the closing boundary');
+});
+
 Promise.all(testPromises).catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exitCode = 1;

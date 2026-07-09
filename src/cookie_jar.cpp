@@ -11,6 +11,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -328,7 +329,11 @@ bool same_site_allows_cookie(
     bool top_level_navigation,
     std::string_view method)
 {
-    if (site_url.empty() || same_site_url(request_url, site_url)) {
+    // An empty site_url means there is no known first-party context; treat it as
+    // cross-site (fail closed) rather than allow-all. same_site_url() already
+    // returns false for an empty/opaque site, so it flows into the checks below —
+    // only SameSite=None (and Lax on a safe top-level navigation) is sent.
+    if (same_site_url(request_url, site_url)) {
         return true;
     }
     if (cookie.same_site == CookieSameSite::None) {
@@ -398,6 +403,10 @@ ResourceRequest CookieJar::with_cookie_header(
     if (!cookie_credentials_allow(credentials, request.url, document_url) || has_cookie_header(request)) {
         return request;
     }
+    // A Document-kind request is a top-level navigation in this single-document
+    // engine, which has no nested/iframe browsing context. If iframe document
+    // loads are ever added, this must distinguish nested documents (which are NOT
+    // top-level navigations) so cross-site Lax cookies are not over-sent to them.
     const bool top_level_navigation = request.kind == ResourceKind::Document;
     const std::string header = cookie_header_for_url(
         request.url,
@@ -688,8 +697,28 @@ void CookieJar::set_cookie_from_header(std::string_view request_url, std::string
         }
         cookies_.erase(oldest);
     }
+    // Global cap: evict the oldest cookie of the largest-contributing domain
+    // rather than the globally-oldest cookie. This keeps a single noisy origin
+    // from evicting another origin's (possibly older) session cookie once the jar
+    // is full — the origin that filled the jar sheds its own oldest entries first.
     while (cookies_.size() > kMaxCookiesTotal) {
-        cookies_.erase(cookies_.begin());
+        std::unordered_map<std::string, std::size_t> per_domain;
+        for (const Cookie& existing : cookies_) {
+            ++per_domain[existing.domain];
+        }
+        const std::string* heaviest = nullptr;
+        std::size_t heaviest_count = 0;
+        for (const auto& [domain, count] : per_domain) {
+            if (count > heaviest_count) {
+                heaviest_count = count;
+                heaviest = &domain;
+            }
+        }
+        const auto victim = heaviest == nullptr
+            ? cookies_.begin()
+            : std::find_if(cookies_.begin(), cookies_.end(),
+                  [&](const Cookie& existing) { return existing.domain == *heaviest; });
+        cookies_.erase(victim == cookies_.end() ? cookies_.begin() : victim);
     }
 }
 

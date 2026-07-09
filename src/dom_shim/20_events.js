@@ -11,6 +11,15 @@
 })(globalThis, function() {
   'use strict';
 
+  // Capture the primordials the event-listener and mutation hot paths rely on
+  // at shim load, before any page script can run. A page reassigning
+  // Object.defineProperty or Array.prototype.push must not be able to corrupt
+  // listener/observer bookkeeping.
+  const ObjectDefineProperty = Object.defineProperty;
+  const ObjectPrototypeHasOwnProperty = Object.prototype.hasOwnProperty;
+  const ObjectAssign = Object.assign;
+  const ArrayPrototypePush = Array.prototype.push;
+
   return {
     name: 'events',
     deps: ['core'],
@@ -185,8 +194,8 @@
         }
 
         function ensureListeners(target) {
-          if (!Object.prototype.hasOwnProperty.call(target, '__listeners')) {
-            Object.defineProperty(target, '__listeners', {
+          if (!ObjectPrototypeHasOwnProperty.call(target, '__listeners')) {
+            ObjectDefineProperty(target, '__listeners', {
               value: new Map(),
               configurable: true
             });
@@ -311,7 +320,7 @@
             const list = listeners.get(key) || [];
             if (!list.some((entry) => entry.callback === callback && entry.capture === opts.capture)) {
               const entry = { callback, ...opts };
-              list.push(entry);
+              ArrayPrototypePush.call(list, entry);
               if (opts.signal && typeof opts.signal.addEventListener === 'function') {
                 const remove = () => this.removeEventListener(key, callback, { capture: opts.capture });
                 opts.signal.addEventListener('abort', remove, { once: true });
@@ -512,20 +521,56 @@
           }
         }
 
+        // The global registry only holds WeakRefs, so it never keeps an observer
+        // alive by itself — that is what used to leak (an observer never
+        // disconnected lived, with its target wrappers and queued records, for the
+        // page's whole life). Liveness instead follows the browser model: each
+        // observed node strongly anchors its observers (see anchorObserver), so an
+        // observer stays alive — and keeps delivering — exactly as long as one of
+        // its observed nodes is reachable, even in the very common
+        // `new MutationObserver(cb).observe(node)` form where the page keeps no
+        // reference to the observer. Observers with records already queued for the
+        // next delivery are also held strongly in pendingMutationObservers so an
+        // in-flight delivery survives its target being forgotten mid-cycle.
         const mutationObservers = new Set();
+        const pendingMutationObservers = new Set();
         let mutationFlushQueued = false;
+
+        // Anchor/unanchor an observer on a node so the node's reachability governs
+        // the observer's lifetime. The anchor set is a non-enumerable field on the
+        // node wrapper, invisible to DOM traversal and serialization.
+        function anchorObserver(target, observer) {
+          let anchors = target.__mutationObserverAnchors;
+          if (!anchors) {
+            anchors = new Set();
+            defineValue(target, '__mutationObserverAnchors', anchors);
+          }
+          anchors.add(observer);
+        }
+
+        function unanchorObserver(target, observer) {
+          if (target && target.__mutationObserverAnchors) {
+            target.__mutationObserverAnchors.delete(observer);
+          }
+        }
 
         function queueMutation(record) {
           if (mutationObservers.size === 0) return;
 
-          for (const observer of mutationObservers) {
+          for (const ref of mutationObservers) {
+            const observer = ref.deref();
+            if (!observer) {
+              mutationObservers.delete(ref);
+              continue;
+            }
             const wantsOldValue = observer._matchWithOldValue(record);
             if (wantsOldValue === null) continue;
             // Each observer gets its own record; oldValue is exposed only when
             // that observer asked for it (attributeOldValue/characterDataOldValue).
-            const delivered = Object.assign({}, record);
+            const delivered = ObjectAssign({}, record);
             delivered.oldValue = wantsOldValue && record.oldValue !== undefined ? record.oldValue : null;
-            observer._records.push(delivered);
+            ArrayPrototypePush.call(observer._records, delivered);
+            pendingMutationObservers.add(observer);
           }
 
           if (mutationFlushQueued) return;
@@ -538,7 +583,12 @@
           mutationFlushQueued = false;
           let delivered = 0;
           try {
-            for (const observer of [...mutationObservers]) {
+            for (const ref of [...mutationObservers]) {
+              const observer = ref.deref();
+              if (!observer) {
+                mutationObservers.delete(ref);
+                continue;
+              }
               const records = observer.takeRecords();
               if (records.length === 0) continue;
               delivered++;
@@ -560,6 +610,7 @@
             this._callback = callback;
             this._observations = [];
             this._records = [];
+            this._selfRef = new WeakRef(this);
           }
 
           observe(target, options = {}) {
@@ -585,19 +636,27 @@
             if (normalized.attributeFilter) {
               normalized.attributeFilter = Array.from(normalized.attributeFilter, (name) => String(name));
             }
-            this._observations.push({ target, options: normalized });
-            mutationObservers.add(this);
+            // Re-observing an already-observed target replaces that target's
+            // options instead of accumulating a duplicate observation (per spec).
+            const existing = this._observations.find((observation) => observation.target === target);
+            if (existing) existing.options = normalized;
+            else this._observations.push({ target, options: normalized });
+            mutationObservers.add(this._selfRef);
+            anchorObserver(target, this);
           }
 
           disconnect() {
+            for (const { target } of this._observations) unanchorObserver(target, this);
             this._observations = [];
             this._records = [];
-            mutationObservers.delete(this);
+            mutationObservers.delete(this._selfRef);
+            pendingMutationObservers.delete(this);
           }
 
           takeRecords() {
             const records = this._records;
             this._records = [];
+            pendingMutationObservers.delete(this);
             return records;
           }
 

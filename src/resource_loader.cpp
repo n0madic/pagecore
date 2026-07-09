@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -24,8 +25,11 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace pagecore {
@@ -40,6 +44,13 @@ struct CurlBody {
     bool too_large = false;
 };
 
+// Absolute ceiling on the cumulative bytes of response header lines across the
+// whole transfer (all redirect hops and their accumulated Set-Cookie headers).
+// The body path is bounded by ResourcePolicy::max_response_bytes; without this,
+// a server could move an unbounded payload into headers and exhaust memory,
+// bypassing that limit. 1 MiB is far above any legitimate response's headers.
+constexpr std::size_t kMaxResponseHeaderBytes = 1 * 1024 * 1024;
+
 struct CurlHeaders {
     std::vector<std::pair<std::string, std::string>> headers;
     std::vector<std::pair<std::string, std::string>> set_cookie_sources;
@@ -47,6 +58,8 @@ struct CurlHeaders {
     std::string current_url;
     std::string next_url;
     std::string status_text;
+    std::size_t header_bytes = 0;
+    bool too_large = false;
 };
 
 struct CurlHeaderListDeleter {
@@ -146,6 +159,14 @@ size_t write_header(char* ptr, size_t size, size_t nmemb, void* userdata)
 {
     auto* data = static_cast<CurlHeaders*>(userdata);
     const size_t len = size * nmemb;
+    // Bound cumulative header bytes across the whole transfer (mirrors write_body's
+    // body cap). Aborting the transfer with a short return yields CURLE_WRITE_ERROR,
+    // which build_network_response converts into a TooLarge error.
+    data->header_bytes += len;
+    if (data->header_bytes > kMaxResponseHeaderBytes) {
+        data->too_large = true;
+        return 0;
+    }
     std::string_view line(ptr, len);
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
         line.remove_suffix(1);
@@ -554,8 +575,9 @@ bool is_blocked_literal_host(const std::string& raw_host, const ResourcePolicy& 
     return false;
 }
 
-// Platform-neutral so the same helpers compile on Windows, where the open-socket
-// guard is unavailable and `blocked` simply stays false.
+// Platform-neutral: these helpers and the CURLOPT_OPENSOCKETFUNCTION guard below
+// compile and run on every libcurl platform (including Windows via winsock), so the
+// connect-time SSRF check is not weakened on any target.
 struct OpenSocketContext {
     const ResourcePolicy* policy = nullptr;
     bool blocked = false;
@@ -990,6 +1012,59 @@ std::string read_file(std::string_view url, const ResourcePolicy& policy)
             "file resource is not a regular file: " + fs_path.string());
     }
 
+    std::string out;
+
+#if !defined(_WIN32)
+    // Close the check-then-open TOCTOU on the sandboxed path: open with O_NOFOLLOW
+    // so the final path component cannot be swapped for a symlink after the
+    // containment/regular-file checks, then re-validate the opened inode via fstat
+    // (authoritative, race-free). A residual race on an *intermediate* directory
+    // component being swapped for a symlink is not covered here; closing it fully
+    // would require an openat() walk. This is defense-in-depth over the canonical
+    // containment check and the allow_file_from_network gate that already stops
+    // network-origin documents from reaching this path at all.
+    const int fd = ::open(canonical.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        throw ResourceError(
+            ResourceErrorCode::NotFound,
+            std::string(url),
+            "failed to open file resource: " + fs_path.string());
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        throw ResourceError(
+            ResourceErrorCode::NotFound,
+            std::string(url),
+            "file resource is not a regular file: " + fs_path.string());
+    }
+    char buffer[64 * 1024];
+    for (;;) {
+        const ssize_t got = ::read(fd, buffer, sizeof(buffer));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ::close(fd);
+            throw ResourceError(
+                ResourceErrorCode::NotFound,
+                std::string(url),
+                "failed to read file resource: " + fs_path.string());
+        }
+        if (got == 0) {
+            break;
+        }
+        if (policy.max_response_bytes > 0 && out.size() + static_cast<std::size_t>(got) > policy.max_response_bytes) {
+            ::close(fd);
+            throw ResourceError(
+                ResourceErrorCode::TooLarge,
+                std::string(url),
+                "file resource exceeds max response size");
+        }
+        out.append(buffer, static_cast<std::size_t>(got));
+    }
+    ::close(fd);
+#else
     std::ifstream in(canonical, std::ios::binary);
     if (!in) {
         throw ResourceError(
@@ -998,7 +1073,6 @@ std::string read_file(std::string_view url, const ResourcePolicy& policy)
             "failed to open file resource: " + fs_path.string());
     }
 
-    std::string out;
     char buffer[64 * 1024];
     while (in) {
         in.read(buffer, sizeof(buffer));
@@ -1014,6 +1088,7 @@ std::string read_file(std::string_view url, const ResourcePolicy& policy)
         }
         out.append(buffer, static_cast<std::size_t>(got));
     }
+#endif
     return out;
 }
 
@@ -1340,6 +1415,10 @@ ResourceResponse build_network_response(
 
     if (body.too_large) {
         throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
+    }
+
+    if (response_headers.too_large) {
+        throw ResourceError(ResourceErrorCode::TooLarge, request.url, "response headers exceed maximum size");
     }
 
     if (socket_context.blocked) {

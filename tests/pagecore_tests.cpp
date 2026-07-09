@@ -21,7 +21,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <chrono>
+#include <csignal>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -1771,6 +1771,63 @@ void test_dom_fragment_range_serializer_and_mutation_observer()
             "MutationObserver should receive queued childList and attribute records");
     require(root->find("data-filtered=\"data-order\"") != std::string::npos,
             "MutationObserver attributeFilter should imply attributes and filter attribute records");
+}
+
+void test_page_enforces_dom_node_budget()
+{
+    // Regression for the native DOM-node budget: js_memory_limit_bytes bounds only
+    // the JS heap, so without this an adversarial createElement loop exhausts native
+    // (Lexbor) memory before the JS deadline fires. A low budget must stop it.
+    pagecore::LoadOptions options;
+    options.max_dom_nodes = 100;
+    pagecore::Page page(options);
+    page.load_html(R"HTML(<html><body><script>
+      window.__created = 0;
+      window.__hit = false;
+      try {
+        for (let i = 0; i < 100000; i++) { document.createElement('div'); window.__created++; }
+      } catch (e) { window.__hit = true; }
+    </script></body></html>)HTML");
+    require(page.eval("String(window.__hit)") == "true",
+            "exceeding max_dom_nodes should throw a catchable error in script");
+    require(std::stoi(page.eval("String(window.__created)")) < 1000,
+            "node creation must stop near the budget rather than run unbounded");
+
+    // A generous default budget must not interfere with an ordinary page.
+    pagecore::Page unbounded;
+    unbounded.load_html(R"HTML(<html><body><script>
+      for (let i = 0; i < 5000; i++) document.body.appendChild(document.createElement('span'));
+      window.__count = document.querySelectorAll('span').length;
+    </script></body></html>)HTML");
+    require(unbounded.eval("String(window.__count)") == "5000",
+            "a normal page well under the default budget should not be affected");
+}
+
+void test_page_enforces_aggregate_load_deadline()
+{
+    // Regression for the aggregate load deadline: js_timeout bounds each script, but
+    // without an aggregate ceiling K scripts can consume K * js_timeout. The second
+    // script must be skipped once the first exhausts the aggregate budget.
+    std::vector<std::string> console;
+    pagecore::LoadOptions options;
+    options.max_load_time = std::chrono::milliseconds{50};
+    options.js_timeout = std::chrono::milliseconds{30000};
+    options.console_log = [&](std::string_view severity, std::string_view message) {
+        console.emplace_back(std::string(severity) + ":" + std::string(message));
+    };
+    pagecore::Page page(options);
+    page.load_html(R"HTML(<html><body>
+      <script>window.__ran1 = true; const t = Date.now(); while (Date.now() - t < 60000) {}</script>
+      <script>window.__ran2 = true;</script>
+    </body></html>)HTML");
+    require(page.eval("String(typeof window.__ran1)") == "boolean",
+            "the first script should have started before the deadline");
+    require(page.eval("String(typeof window.__ran2)") == "undefined",
+            "the second script must be skipped once the aggregate load deadline is exceeded");
+    const bool logged = std::any_of(console.begin(), console.end(), [](const std::string& line) {
+        return line.find("Aggregate script execution deadline") != std::string::npos;
+    });
+    require(logged, "an aggregate-deadline console error should be reported");
 }
 
 void test_text_content_mutation_observer_records_nodes()
@@ -4666,6 +4723,125 @@ void test_curl_loader_preserves_set_cookie_headers_across_redirects()
         server.join();
     }
     require(accepted == 2, "redirect cookie fixture should serve redirect and final requests");
+}
+
+void test_curl_loader_rejects_oversized_response_headers()
+{
+    // Regression for the response-header size cap: the body path is bounded by
+    // max_response_bytes, but without a header cap a server can move an unbounded
+    // payload into response headers and exhaust memory. The load must be rejected
+    // rather than accumulate the headers. ~1.5 MiB of header lines is sent; the
+    // protection is enforced by our cumulative header cap (the authoritative bound
+    // for Set-Cookie accumulated across redirect hops, which libcurl resets per
+    // hop) and/or by libcurl's own per-response header limit — either way the
+    // oversized response must not succeed.
+    const BoundTestServer bound = bind_loopback_test_server(2, "oversized headers");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
+
+    std::thread server([server_fd] {
+        const int client = ::accept(server_fd, nullptr, nullptr);
+        if (client >= 0) {
+            char buffer[2048];
+            (void) ::recv(client, buffer, sizeof(buffer), 0);
+            std::string response = "HTTP/1.1 200 OK\r\n";
+            const std::string pad(200, 'x');
+            for (int i = 0; i < 7000; ++i) {
+                response += "X-Fill-" + std::to_string(i) + ": " + pad + "\r\n";
+            }
+            response += "Content-Length: 2\r\n\r\nok";
+            // Flush until all bytes are sent or curl aborts the transfer and closes
+            // the socket (send() then fails), so enough header bytes reach the cap.
+            std::size_t sent = 0;
+            while (sent < response.size()) {
+                const ssize_t n = ::send(client, response.data() + sent, response.size() - sent, 0);
+                if (n <= 0) {
+                    break;
+                }
+                sent += static_cast<std::size_t>(n);
+            }
+            ::close(client);
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        pagecore::CurlResourceLoader loader("pagecore-test", policy);
+        bool rejected = false;
+        try {
+            (void) loader.load(pagecore::ResourceRequest{
+                "http://127.0.0.1:" + std::to_string(port) + "/big-headers",
+                pagecore::ResourceKind::Document});
+        } catch (const pagecore::ResourceError&) {
+            rejected = true;
+        }
+        require(rejected, "a response whose headers exceed the size cap must be rejected");
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        throw;
+    }
+    if (server.joinable()) {
+        server.join();
+    }
+}
+
+void test_curl_loader_rejects_cross_scheme_redirect()
+{
+    // A 3xx redirect to a disallowed scheme (file://) must not be followed: the
+    // request/redirect protocol set is pinned to http(s), closing a redirect-to-
+    // file SSRF/local-read. The load must not yield the local file's contents.
+    const BoundTestServer bound = bind_loopback_test_server(2, "cross-scheme redirect");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
+
+    std::thread server([server_fd] {
+        const int client = ::accept(server_fd, nullptr, nullptr);
+        if (client >= 0) {
+            char buffer[2048];
+            (void) ::recv(client, buffer, sizeof(buffer), 0);
+            const std::string response =
+                "HTTP/1.1 302 Found\r\n"
+                "Location: file:///etc/passwd\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            (void) ::send(client, response.data(), response.size(), 0);
+            ::close(client);
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        pagecore::CurlResourceLoader loader("pagecore-test", policy);
+        bool threw = false;
+        std::string body;
+        std::string url;
+        try {
+            const auto response = loader.load(pagecore::ResourceRequest{
+                "http://127.0.0.1:" + std::to_string(port) + "/redir",
+                pagecore::ResourceKind::Document});
+            body = response.body;
+            url = response.url;
+        } catch (const pagecore::ResourceError&) {
+            threw = true;
+        }
+        require(threw || (url.rfind("file:", 0) != 0 && body.find("root:") == std::string::npos),
+                "redirect to a disallowed scheme (file://) must not be followed");
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        throw;
+    }
+    if (server.joinable()) {
+        server.join();
+    }
 }
 
 void test_curl_loader_sends_request_cookie_across_same_host_redirect()
@@ -7959,6 +8135,37 @@ void test_page_render_uses_web_font_formats()
     }
 }
 
+void test_page_render_rejects_malformed_web_font()
+{
+    // The woff2/brotli font path parses attacker-controlled bytes. A corrupt or
+    // truncated font must be rejected without crashing, and the page must still
+    // render (degrading to the fallback font) rather than fail the whole load.
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    const std::string font_url = "https://example.test/broken.woff2";
+    std::string corrupt = "wOF2";           // valid signature...
+    corrupt.append(300, '\x01');            // ...followed by garbage table/length fields
+    loader->add(font_url, corrupt, "font/woff2");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><head><style>
+@font-face { font-family: BrokenFont; src: url('/broken.woff2') format('woff2'); }
+</style></head>
+<body style="margin:0;background:white">
+<div style="font-family:BrokenFont;font-size:32px;color:black">hello</div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    pagecore::RenderOptions options;
+    options.viewport = pagecore::Viewport{120, 60, 1.0f};
+    const auto image = page.render(options); // must not throw or crash
+    require(image.width == 120 && image.height == 60,
+            "a page with a corrupt web font should still render at the requested size");
+    require(has_request_kind(*loader, font_url, pagecore::ResourceKind::Font),
+            "the corrupt web font should still be requested as a Font resource");
+}
+
 void test_page_render_decodes_and_draws_png_images()
 {
     auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
@@ -8374,6 +8581,41 @@ void test_conic_radial_gradient_raster_robustness()
                 && json.find("inf") == std::string::npos
                 && json.find("NaN") == std::string::npos,
             "display-list JSON must not emit non-finite tokens for radial/conic gradients");
+}
+
+void test_conic_gradient_clamps_oversized_element()
+{
+    // Regression for the conic-gradient DoS: the painter must clamp its temporary
+    // surface to the visible canvas rather than allocate a surface the size of the
+    // whole (huge) element box and run a per-pixel atan2 over every pixel. A
+    // 30000x30000 element on a 32x32 canvas must render instantly and correctly
+    // instead of allocating gigabytes.
+    pagecore::DisplayList display_list;
+    display_list.viewport = pagecore::Viewport{32, 32, 1.0f};
+
+    pagecore::ConicGradientCommand conic;
+    conic.rect = pagecore::Rect{0, 0, 30000, 30000};
+    conic.center = pagecore::Point{15000, 15000};
+    conic.angle = 0.0f;
+    conic.stops.push_back(pagecore::GradientStop{0.0f, pagecore::Color{240, 20, 30, 255}});
+    conic.stops.push_back(pagecore::GradientStop{1.0f, pagecore::Color{20, 30, 240, 255}});
+    display_list.commands.emplace_back(conic);
+
+    auto raster = pagecore::create_default_raster_backend(pagecore::Color{255, 255, 255, 255});
+    const auto image = raster->render(display_list);
+    require(image.width == 32 && image.height == 32,
+            "oversized conic gradient must render at the canvas size without a full-box allocation");
+
+    bool painted = false;
+    for (int y = 0; y < image.height && !painted; ++y) {
+        for (int x = 0; x < image.width && !painted; ++x) {
+            const auto* px = pixel_at(image, x, y);
+            if (!(px[0] == 255 && px[1] == 255 && px[2] == 255)) {
+                painted = true;
+            }
+        }
+    }
+    require(painted, "the visible region of the clamped conic gradient must still be painted");
 }
 
 void test_page_render_clips_background_to_border_radius()
@@ -9431,8 +9673,8 @@ private:
 class LayoutCallCountingFactory final : public pagecore::LayoutEngineFactory {
 public:
     explicit LayoutCallCountingFactory(std::shared_ptr<pagecore::LayoutEngineFactory> inner)
-        : inner_(std::move(inner))
-        , layout_calls(std::make_shared<int>(0))
+        : layout_calls(std::make_shared<int>(0))
+        , inner_(std::move(inner))
     {
     }
 
@@ -11317,6 +11559,13 @@ void test_computed_style_reacts_to_class_driven_width_change()
 
 int main()
 {
+#if !defined(_WIN32)
+    // The loopback test servers write to sockets the client (libcurl) may close
+    // first (e.g. when it aborts an oversized-header response), which would raise
+    // SIGPIPE and terminate the process. Ignore it; the send loops handle the
+    // resulting EPIPE return.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
     try {
         test_inline_script_mutates_lexbor_dom();
         test_timers_and_events();
@@ -11345,6 +11594,8 @@ int main()
         test_page_computed_style_cpp_api();
         test_get_computed_style_matches_real_cascade_for_cases_js_engine_got_wrong();
         test_dom_fragment_range_serializer_and_mutation_observer();
+        test_page_enforces_dom_node_budget();
+        test_page_enforces_aggregate_load_deadline();
         test_text_content_mutation_observer_records_nodes();
         test_document_write_fragment_insertion();
         test_document_write_external_script_and_open_close();
@@ -11418,6 +11669,8 @@ int main()
         test_resource_blocks_file_from_network_origin();
 #if !defined(_WIN32)
         test_curl_loader_preserves_set_cookie_headers_across_redirects();
+        test_curl_loader_rejects_oversized_response_headers();
+        test_curl_loader_rejects_cross_scheme_redirect();
         test_curl_loader_sends_request_cookie_across_same_host_redirect();
         test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths();
 #endif
@@ -11524,6 +11777,7 @@ int main()
         test_tiny_tiled_background_does_not_explode();
         test_shadow_dom_paints_real_content_and_hides_light_dom();
         test_page_render_uses_web_font_formats();
+        test_page_render_rejects_malformed_web_font();
         test_page_render_decodes_and_draws_png_images();
         test_page_render_decodes_and_draws_data_url_images();
         test_page_render_decodes_css_data_url_background_images();
@@ -11539,6 +11793,7 @@ int main()
         test_page_render_linear_gradient_background();
         test_page_render_radial_gradient_background();
         test_page_render_conic_gradient_background();
+        test_conic_gradient_clamps_oversized_element();
         test_conic_radial_gradient_raster_robustness();
         test_page_render_clips_background_to_border_radius();
         test_page_render_clips_background_image_to_border_radius();
