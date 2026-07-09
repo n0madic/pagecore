@@ -13,6 +13,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
