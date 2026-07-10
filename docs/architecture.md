@@ -374,6 +374,16 @@ forcing rebuilds and returns an inline `style=""` value when present, then the
 last known value, then conservative CSS defaults. Full `Page::computed_style()`
 remains exact.
 
+Two guarantees keep that backstop from ever inventing a value for an element whose
+cascade was never resolved, because scripts act on such an answer irreversibly —
+`display` fabricated as `block` for a stylesheet-hidden element makes jQuery's
+`.show()` conclude the element is already visible and never reveal it. First, the
+rebuild that trips bounded mode snapshots **every** connected element's cascade
+before the trip (mirroring the geometry snapshot). Second, an element first read
+*after* the trip — the common case for script-built subtrees — still gets one exact
+rebuild, which re-snapshots the whole tree. Both are bounded to at most one rebuild
+per layout mutation version, and neither ever feeds the paint.
+
 Element identity across the JS/C++ boundary uses a `data-pc-sid="<NodeId>"` marker
 that exists only on the litehtml side: the direct-DOM builder sets it on the
 litehtml elements it creates (the Lexbor DOM is never touched), and the serialized

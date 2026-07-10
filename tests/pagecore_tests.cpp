@@ -10546,6 +10546,67 @@ public:
     std::shared_ptr<int> compute_calls;
 };
 
+// Slow cascade whose `display` is `none` and comes ONLY from a stylesheet, never
+// from an inline style: exactly the shape of `.wrapper{display:none}` that a page
+// script reveals with jQuery's .show().
+class StylesheetHiddenComputedStyleEngine final : public pagecore::LayoutEngine {
+public:
+    explicit StylesheetHiddenComputedStyleEngine(std::shared_ptr<int> compute_calls)
+        : compute_calls_(std::move(compute_calls))
+    {
+    }
+
+    void set_resource_loader(std::shared_ptr<pagecore::ResourceLoader>) override { }
+    void set_viewport(pagecore::Viewport viewport) override
+    {
+        viewport_ = viewport;
+        display_list_.viewport = viewport_;
+    }
+    void load_html(std::string_view, std::string_view) override
+    {
+        display_list_.clear();
+        display_list_.viewport = viewport_;
+    }
+    void layout() override { }
+    const pagecore::DisplayList& display_list() const override { return display_list_; }
+    void compute_styles_only() override
+    {
+        ++(*compute_calls_);
+        // Two forced rebuilds must exceed the 100ms cumulative computed-style budget
+        // that trips bounded mode (2 x 80ms = 160ms), while one op stays well under
+        // the 250ms single-op "expensive" threshold. A must-exceed lower bound, so a
+        // contended scheduler only widens the margin.
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+    std::optional<pagecore::ComputedStyle> computed_style(std::string_view) override
+    {
+        return pagecore::ComputedStyle{{
+            {"display", "none"},
+            {"width", std::to_string(*compute_calls_ * 10) + "px"},
+        }};
+    }
+
+private:
+    std::shared_ptr<int> compute_calls_;
+    pagecore::Viewport viewport_;
+    pagecore::DisplayList display_list_;
+};
+
+class StylesheetHiddenComputedStyleFactory final : public pagecore::LayoutEngineFactory {
+public:
+    StylesheetHiddenComputedStyleFactory()
+        : compute_calls(std::make_shared<int>(0))
+    {
+    }
+
+    std::unique_ptr<pagecore::LayoutEngine> create_layout_engine() override
+    {
+        return std::make_unique<StylesheetHiddenComputedStyleEngine>(compute_calls);
+    }
+
+    std::shared_ptr<int> compute_calls;
+};
+
 void test_element_geometry_reuses_cached_layout()
 {
     auto counting = std::make_shared<LayoutCallCountingFactory>(pagecore::create_litehtml_layout_engine_factory());
@@ -10915,6 +10976,91 @@ void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
             && event.styled_document_cache_reason == "bounded_mode:layout_mutation_version_changed";
     });
     require(saw_bounded_event, "perf trace should identify bounded computed-style property reads");
+}
+
+// Regression: bounded mode must never fabricate a CSS initial value for a property
+// the cascade actually sets. The last forced rebuild before bounded mode trips
+// snapshots every element's cascade, so a stylesheet-hidden element keeps
+// reporting `display: none`. Fabricating `block` here made jQuery's .show() treat
+// `.wrapper` as already visible and left ukr.net rendering a blank page.
+void test_computed_style_property_bounded_mode_keeps_stylesheet_display()
+{
+    auto factory = std::make_shared<StylesheetHiddenComputedStyleFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected to find #x");
+
+    auto first = page.computed_style_property(box, "width");
+    require(first && *first == "10px", "first computed style property read should be exact");
+    require(*factory->compute_calls == 1, "first read should build the cascade once");
+
+    // Own-attribute mutations change #x's digest, so each read forces a rebuild.
+    // The second one exhausts the budget (2 x 80ms > 100ms) and trips bounded mode.
+    page.document().set_attribute(box, "class", "a");
+    auto second = page.computed_style_property(box, "width");
+    require(second && *second == "20px", "second post-mutation read should still be exact");
+    require(*factory->compute_calls == 2, "second read should force the second rebuild");
+
+    page.document().set_attribute(box, "class", "b");
+    auto display = page.computed_style_property(box, "display");
+    require(*factory->compute_calls == 2, "bounded mode must not force another computed-style rebuild");
+    require(
+        display && *display == "none",
+        "bounded mode must report the snapshotted cascade value, not the `display: block` CSS initial value");
+}
+
+// Regression, second half: an element created AFTER bounded mode tripped is absent
+// from every snapshot, so the backstop has nothing cached for it. It must still get
+// one exact cascade rather than a CSS initial value. This is ukr.net's exact shape:
+// scripts build `div.wrapper` late, then jQuery's .show() reads its `display`.
+void test_computed_style_property_bounded_mode_resolves_element_created_after_trip()
+{
+    std::vector<pagecore::PerfEvent> events;
+    auto factory = std::make_shared<StylesheetHiddenComputedStyleFactory>();
+
+    pagecore::LoadOptions load_options;
+    load_options.perf_trace = [&](const pagecore::PerfEvent& event) {
+        events.push_back(event);
+    };
+
+    pagecore::Page page(load_options);
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='x'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId box = page.document().query_selector(page.document().document_node(), "#x");
+    require(box != pagecore::kInvalidNodeId, "expected to find #x");
+
+    (void) page.computed_style_property(box, "width");
+    page.document().set_attribute(box, "class", "a");
+    (void) page.computed_style_property(box, "width");
+    require(*factory->compute_calls == 2, "two forced rebuilds should exhaust the budget and trip bounded mode");
+
+    // Created after the trip: no snapshot covers it, no cache entry exists.
+    const pagecore::NodeId late = page.document().create_element("div");
+    page.document().append_child(page.document().body(), late);
+
+    auto display = page.computed_style_property(late, "display");
+    require(
+        display && *display == "none",
+        "an element first seen in bounded mode must get an exact cascade, not the `display: block` initial value");
+    require(*factory->compute_calls == 3, "resolving the unknown element should cost exactly one rebuild");
+
+    // That rebuild snapshotted every connected element at this version, so an
+    // element never read directly also resolves to its real cascade.
+    auto sibling = page.computed_style_property(box, "display");
+    require(sibling && *sibling == "none", "the snapshot should cover every connected element");
+
+    const bool saw_snapshot_event = std::any_of(events.begin(), events.end(), [&](const pagecore::PerfEvent& event) {
+        return event.phase == pagecore::PerfPhase::ComputedStyle
+            && event.name == "computed_style_property"
+            && event.property == "display"
+            && event.styled_document_cache_reason.rfind("bounded_mode_snapshot:", 0) == 0;
+    });
+    require(saw_snapshot_event, "perf trace should identify the bounded-mode snapshot rebuild");
 }
 
 // The first computed-style read after appending a node is now exact (no
@@ -12505,6 +12651,8 @@ int main()
         test_element_geometry_after_heavy_append_child_runs_first_exact_layout();
         test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
+        test_computed_style_property_bounded_mode_keeps_stylesheet_display();
+        test_computed_style_property_bounded_mode_resolves_element_created_after_trip();
         test_computed_style_property_after_append_runs_first_exact();
         test_computed_style_property_reuses_digest_across_unrelated_mutation();
         test_render_never_injects_cross_viewport_measured_width();

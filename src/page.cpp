@@ -149,6 +149,11 @@ struct Page::Impl {
     int computed_style_property_forced_rebuild_count = 0;
     long long computed_style_property_forced_rebuild_us = 0;
     std::uint64_t computed_style_cache_forget_version = 0;
+    // The layout mutation version whose full cascade snapshot currently populates
+    // computed_style_cache. Bounds the bounded-mode backstop to at most one rebuild
+    // per version, however many never-before-read elements a script queries.
+    std::uint64_t computed_style_snapshot_version = 0;
+    bool computed_style_snapshot_valid = false;
     // Cascade results keyed by NodeId, each tagged with the layout-input digest
     // they were computed under. Reused iff the digest still matches.
     std::unordered_map<NodeId, ComputedStyleCacheEntry> computed_style_cache;
@@ -206,6 +211,7 @@ struct Page::Impl {
         computed_style_property_forced_rebuild_us = 0;
         computed_style_cache_forget_version = document.forget_version();
         computed_style_cache.clear();
+        computed_style_snapshot_valid = false;
         render_local_overrides.clear();
     }
 
@@ -872,6 +878,7 @@ struct Page::Impl {
         }
         computed_style_cache_forget_version = current_forget_version;
         computed_style_cache.clear();
+        computed_style_snapshot_valid = false;
     }
 
     void remember_computed_style_property(
@@ -939,6 +946,44 @@ struct Page::Impl {
             return true;
         }
         return false;
+    }
+
+    bool should_snapshot_computed_styles_after_forced_rebuild(long long elapsed_us) const
+    {
+        const long long normalized_elapsed = std::max<long long>(0, elapsed_us);
+        return styled_document_expensive
+            || normalized_elapsed > kExpensiveStyledDocumentUs
+            || (computed_style_property_forced_rebuild_count + 1 >= kComputedStylePropertyForcedRebuildCountThreshold
+                && computed_style_property_forced_rebuild_us + normalized_elapsed
+                    > kComputedStylePropertyForcedRebuildBudgetUs);
+    }
+
+    bool computed_style_snapshot_covers_current_version() const
+    {
+        return computed_style_snapshot_valid
+            && computed_style_snapshot_version == document.layout_mutation_version();
+    }
+
+    // Caches every connected element's exact cascade at the current version, so
+    // later bounded reads answer from a real cascade instead of the CSS
+    // initial-value table. Used only as the approximate deadline backstop; never
+    // feeds the paint. Mirrors snapshot_layout_geometry().
+    void snapshot_computed_styles(LayoutEngine& engine)
+    {
+        sync_computed_style_cache_for_forget_version();
+        const NodeId root = document.document_node();
+        if (root == kInvalidNodeId) {
+            return;
+        }
+        computed_style_snapshot_version = document.layout_mutation_version();
+        computed_style_snapshot_valid = true;
+        for (NodeId node : document.query_selector_all(root, "*")) {
+            if (!document.is_connected(node)) {
+                computed_style_cache.erase(node);
+                continue;
+            }
+            remember_computed_style_full(node, computed_style_digest(node), engine.computed_style(std::to_string(node)));
+        }
     }
 
     void note_computed_style_property_forced_rebuild(long long elapsed_us)
@@ -1375,22 +1420,56 @@ struct Page::Impl {
             return reused;
         }
 
-        // Within budget -> exact rebuild.
-        if (!(computed_style_property_bounded_mode || styled_document_expensive)) {
+        // Not yet in bounded mode -> force one exact rebuild. This runs even when the
+        // styled document is expensive: that rebuild snapshots EVERY element's
+        // cascade (see should_snapshot_computed_styles_after_forced_rebuild),
+        // seeding the cache before note_computed_style_property_forced_rebuild()
+        // trips bounded mode. Without this, an expensive page would enter bounded
+        // mode with an empty cache, and the backstop would answer every read with a
+        // CSS initial value: a stylesheet-hidden element then reports
+        // `display: block`, so jQuery's .show() concludes it is already visible and
+        // never reveals it (ukr.net renders as a blank page).
+        if (!computed_style_property_bounded_mode) {
             const auto t0 = std::chrono::steady_clock::now();
             auto& engine = ensure_styled_document(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
             engine.compute_styles_only();
             auto value = engine.computed_style_property(std::to_string(node), property);
             const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
+            if (should_snapshot_computed_styles_after_forced_rebuild(elapsed_us)) {
+                snapshot_computed_styles(engine);
+            }
             note_computed_style_property_forced_rebuild(elapsed_us);
             remember_computed_style_property(node, digest, property, value);
             trace.set_count(value ? 1 : 0);
             return value;
         }
 
-        // Deadline backstop -> approximate (inline / last-known / CSS defaults).
         computed_style_property_bounded_mode = true;
+
+        // An element whose cascade was never resolved gets one exact rebuild even in
+        // bounded mode, because the alternative — a CSS initial value — is a wrong
+        // answer that scripts act on irreversibly: `display` reads `block` for a
+        // stylesheet-hidden element, so jQuery's .show() decides it is already
+        // visible and never reveals it. That rebuild snapshots every element at this
+        // version, so it costs at most one rebuild per layout mutation version no
+        // matter how many unknown elements the page reads. Mirrors the exact
+        // first-read guarantee element_geometry() gives JS layout libraries.
+        sync_computed_style_cache_for_forget_version();
+        if (document.is_connected(node)
+            && !computed_style_cache.contains(node)
+            && !computed_style_snapshot_covers_current_version()) {
+            auto& engine = ensure_styled_document(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+            engine.compute_styles_only();
+            snapshot_computed_styles(engine);
+            auto value = engine.computed_style_property(std::to_string(node), property);
+            remember_computed_style_property(node, computed_style_digest(node), property, value);
+            trace.event().styled_document_cache_reason = "bounded_mode_snapshot:" + cache.cache_reason;
+            trace.set_count(value ? 1 : 0);
+            return value;
+        }
+
+        // Deadline backstop -> approximate (inline / last-known / CSS defaults).
         trace.event().styled_document_cache_reason = "bounded_mode:" + cache.cache_reason;
         auto value = bounded_computed_style_property(node, property);
         trace.set_count(value && !value->empty() ? 1 : 0);
