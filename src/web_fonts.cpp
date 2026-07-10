@@ -525,7 +525,12 @@ struct FontEnvironment {
                 "<cachedir>" + cache_dir.string() + "</cachedir>"
                 "</fontconfig>";
             FcConfigParseAndLoadFromMemory(config, reinterpret_cast<const FcChar8*>(xml.c_str()), FcFalse);
+#if defined(FC_VERSION) && FC_VERSION >= 21600
+            // Prefer application-added fonts over identically named system fonts.
+            // Added in Fontconfig 2.16.0; on older Fontconfig the app fonts are still
+            // registered, just not given priority over a same-named system font.
             FcConfigPreferAppFont(config, FcTrue);
+#endif
             pango_fc_font_map_set_config(PANGO_FC_FONT_MAP(font_map), config);
             pango_fc_font_map_set_default_substitute(PANGO_FC_FONT_MAP(font_map), font_substitute, &aliases, nullptr);
         } catch (...) {

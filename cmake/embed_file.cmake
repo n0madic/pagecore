@@ -12,11 +12,17 @@ get_filename_component(OUTPUT_DIR "${OUTPUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${OUTPUT_DIR}")
 file(WRITE "${OUTPUT}" "#pragma once
 
+#include <cstddef>
 #include <string_view>
 
 namespace pagecore {
-inline constexpr std::string_view kDomShim = R\"PAGECOREJS(
+// Stored as a char array and viewed with an explicit length. Constructing the
+// string_view from the raw literal directly (its single-argument, length-scanning
+// constructor) makes GCC constexpr-evaluate char_traits::length over the whole
+// ~200 KB blob, which ICEs cc1plus; sizeof avoids that scan entirely.
+inline constexpr char kDomShimData[] = R\"PAGECOREJS(
 ${CONTENT}
 )PAGECOREJS\";
+inline constexpr std::string_view kDomShim{kDomShimData, sizeof(kDomShimData) - 1};
 } // namespace pagecore
 ")
