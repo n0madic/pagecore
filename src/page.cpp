@@ -35,6 +35,24 @@ struct ScriptSource {
     std::string filename;
     std::string code;
     bool module = false;
+    // `async` attribute: execute as soon as the fetch completes, off the
+    // document-order sequence. Wins over defer.
+    bool async_load = false;
+    // `defer` attribute or module script: execute after parsing, in document
+    // order, before DOMContentLoaded.
+    bool defer_load = false;
+    bool external = false;
+    bool fetch_done = false;
+    bool fetch_failed = false;
+};
+
+// Shared between execute_scripts() and the fetch-completion callbacks (which
+// run as event-loop tasks while the sequence is still being pumped).
+struct DocumentScriptSet {
+    std::vector<ScriptSource> scripts;
+    // Parser-inserted async scripts not yet fetched+executed; the window
+    // 'load' event waits for this to reach zero (spec), within max_load_time.
+    std::size_t async_pending = 0;
 };
 
 // Identifies the inputs that fully determine a built styled document (the
@@ -194,7 +212,9 @@ struct Page::Impl {
     void ensure_js()
     {
         if (!js) {
-            js = std::make_unique<JsRuntime>(document, options, script_resource_loader(), &cookie_jar);
+            // The raw (uncached) loader lets JsRuntime pick the curl_multi
+            // async engine when the page is curl-backed.
+            js = std::make_unique<JsRuntime>(document, options, script_resource_loader(), &cookie_jar, loader);
             js->set_computed_style_resolver([this](NodeId node) { return computed_style(node); });
             js->set_computed_style_property_resolver(
                 [this](NodeId node, std::string_view property) { return computed_style_property(node, property); });
@@ -212,11 +232,13 @@ struct Page::Impl {
         return js_resource_cache;
     }
 
-    std::vector<ScriptSource> collect_scripts()
+    // Scans the parsed document and STARTS every external <script src> fetch
+    // immediately (truly concurrent through the async engine). Execution order
+    // is decided later in execute_scripts().
+    std::shared_ptr<DocumentScriptSet> collect_scripts()
     {
-        std::vector<ScriptSource> scripts;
-        std::vector<ResourceRequest> external_requests;
-        std::vector<std::size_t> external_slots;
+        auto set = std::make_shared<DocumentScriptSet>();
+        std::size_t external_count = 0;
         bool external_script_cap_logged = false;
 
         const NodeId root = document.document_node();
@@ -240,7 +262,7 @@ struct Page::Impl {
                 // are neither fetched nor executed (a page cannot force an unbounded
                 // number of network requests through script tags alone).
                 if (options.max_document_script_loads != 0
-                    && external_requests.size() >= options.max_document_script_loads) {
+                    && external_count >= options.max_document_script_loads) {
                     if (!external_script_cap_logged) {
                         external_script_cap_logged = true;
                         if (js) {
@@ -251,14 +273,19 @@ struct Page::Impl {
                     }
                     continue;
                 }
+                ++external_count;
                 const std::string base = current_url.empty() ? options.base_url : current_url;
                 const std::string url = resolve_url(base, *src);
-                // Record the slot; the body is fetched in one batched, concurrent
-                // pass after the whole document is scanned. Execution still happens
-                // in document order in execute_scripts().
-                scripts.push_back(ScriptSource{script, url, std::string{}, module});
-                external_slots.push_back(scripts.size() - 1);
-                external_requests.push_back(ResourceRequest{url, ResourceKind::Script, base, base});
+
+                ScriptSource slot{script, url, std::string{}, module};
+                slot.external = true;
+                // `async` wins over `defer`; module scripts without `async`
+                // behave like defer (spec).
+                slot.async_load = document.has_attribute(script, "async");
+                slot.defer_load = !slot.async_load
+                    && (module || document.has_attribute(script, "defer"));
+                set->scripts.push_back(std::move(slot));
+                start_document_script_fetch(set, set->scripts.size() - 1, base);
             } else {
                 std::string filename = "<inline-script>";
                 if (module) {
@@ -271,45 +298,142 @@ struct Page::Impl {
                         : base + "#inline-script-" + std::to_string(inline_script_index);
                     ++inline_script_index;
                 }
-                scripts.push_back(ScriptSource{script, std::move(filename), document.text_content(script), module});
+                ScriptSource slot{script, std::move(filename), document.text_content(script), module};
+                // Inline module scripts run in the deferred phase (spec).
+                slot.defer_load = module;
+                slot.fetch_done = true;
+                set->scripts.push_back(std::move(slot));
             }
         }
 
-        if (!external_requests.empty()) {
-            PerfScope trace(options.perf_trace, PerfPhase::ResourceLoad, "initial_script_load_all", external_requests.size());
-            trace.event().property = "script";
-            trace.event().url = current_url.empty() ? options.base_url : current_url;
-            auto loader = std::make_shared<CookieAwareResourceLoader>(
-                script_resource_loader(),
-                &cookie_jar,
-                current_url.empty() ? options.base_url : current_url,
-                CookieCredentials::SameOrigin);
-            // Lenient: a single failed external script (timeout, transport error,
-            // SSRF/policy block, oversize) must not abort the whole page load. A
-            // failed slot yields an empty body and is simply skipped at execution,
-            // matching how a browser continues past a broken <script src>.
-            std::vector<ResourceResponse> responses =
-                loader->load_all(external_requests, BatchErrorMode::Lenient);
-            std::uint64_t loaded_bytes = 0;
-            for (std::size_t i = 0; i < responses.size() && i < external_slots.size(); ++i) {
-                loaded_bytes += responses[i].body.size();
+        return set;
+    }
+
+    void start_document_script_fetch(
+        const std::shared_ptr<DocumentScriptSet>& set,
+        std::size_t index,
+        const std::string& base)
+    {
+        ScriptSource& slot = set->scripts[index];
+        if (slot.async_load) {
+            // Async scripts hold the window 'load' event (and readiness) open
+            // until they have fetched and executed.
+            ++set->async_pending;
+            js->activity_tracker().begin(PageActivityKind::DynamicScript);
+        }
+        auto on_complete = [this, set, index](AsyncLoadResult result) {
+            ScriptSource& script = set->scripts[index];
+            script.fetch_done = true;
+            if (result.error) {
+                // Lenient: a failed external script (timeout, transport error,
+                // SSRF/policy block, oversize) must not abort the page load; it
+                // is simply skipped, like a browser continuing past a broken
+                // <script src>.
+                script.fetch_failed = true;
+            } else {
+                if (!result.response.url.empty()) {
+                    script.filename = result.response.url;
+                }
+                script.code = std::move(result.response.body);
                 PerfEvent response_event{
                     PerfPhase::ResourceLoad,
                     "initial_script_response",
                     0,
-                    responses[i].body.size(),
+                    script.code.size(),
                 };
-                response_event.property = responses[i].from_cache ? "script:cache" : "script";
-                response_event.url = responses[i].url.empty() ? external_requests[i].url : responses[i].url;
+                response_event.property = result.response.from_cache ? "script:cache" : "script";
+                response_event.url = script.filename;
                 emit_perf_trace(options.perf_trace, std::move(response_event));
-                ScriptSource& slot = scripts[external_slots[i]];
-                slot.filename = std::move(responses[i].url);
-                slot.code = std::move(responses[i].body);
             }
-            trace.set_count(loaded_bytes);
+            if (script.async_load) {
+                if (js && !js->load_deadline_passed()) {
+                    run_document_script(script);
+                } else if (js) {
+                    // Same diagnostic the sync/deferred passes emit, so a
+                    // dropped async script is visible to the embedder.
+                    js->log_console(
+                        "error",
+                        "Aggregate script execution deadline exceeded; skipping async script: " + script.filename);
+                }
+                --set->async_pending;
+                js->activity_tracker().end(PageActivityKind::DynamicScript);
+            }
+        };
+        try {
+            js->start_document_script_load(
+                ResourceRequest{slot.filename, ResourceKind::Script, base, base},
+                std::move(on_complete));
+        } catch (const std::exception& error) {
+            slot.fetch_done = true;
+            slot.fetch_failed = true;
+            if (slot.async_load) {
+                --set->async_pending;
+                js->activity_tracker().end(PageActivityKind::DynamicScript);
+            }
+            js->log_console("error", error.what());
+        }
+    }
+
+    void run_document_script(const ScriptSource& script)
+    {
+        if (script.fetch_failed) {
+            return;
+        }
+        js->execute("document.__markScriptStarted(" + std::to_string(script.node) + ");", "<pagecore-script-state>");
+        if (script.module) {
+            js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
+            try {
+                js->execute_module(script.code, script.filename);
+            } catch (const std::exception& error) {
+                js->log_console("error", error.what());
+            } catch (...) {
+                js->log_console("error", "JS exception in module script");
+            }
+            return;
         }
 
-        return scripts;
+        js->execute("document.__setCurrentScript(" + std::to_string(script.node) + ");", "<pagecore-current-script>");
+        try {
+            js->execute(script.code, script.filename);
+        } catch (const std::exception& error) {
+            js->log_console("error", error.what());
+        } catch (...) {
+            js->log_console("error", "JS exception in script");
+        }
+        try {
+            js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
+        } catch (...) {
+        }
+    }
+
+    void fire_lifecycle_event(const char* function_name)
+    {
+        try {
+            js->execute(
+                std::string("if (typeof ") + function_name + " === 'function') " + function_name + "();",
+                "<pagecore-lifecycle>");
+        } catch (const std::exception& error) {
+            js->log_console("error", error.what());
+        } catch (...) {
+            js->log_console("error", "JS exception in lifecycle handlers");
+        }
+    }
+
+    // Waits (pumping the event loop) until the slot's fetch completes, then
+    // runs it; a fetch that misses the wait deadline is logged and skipped,
+    // like a broken <script src> in a browser.
+    void wait_and_run_document_script(
+        ScriptSource& script,
+        std::chrono::steady_clock::time_point wait_deadline)
+    {
+        if (script.external && !script.fetch_done) {
+            js->run_event_loop_until([&] { return script.fetch_done; }, wait_deadline);
+        }
+        if (script.external && !script.fetch_done) {
+            js->log_console("error", "Timed out waiting for external script: " + script.filename);
+            return;
+        }
+        run_document_script(script);
     }
 
     void execute_scripts()
@@ -319,54 +443,63 @@ struct Page::Impl {
         // Aggregate wall-clock ceiling across the whole script sequence, so a page
         // with many scripts cannot spend K * js_timeout of CPU. Cleared before
         // returning so later interactive eval() calls get a fresh per-call budget.
+        const auto load_start = std::chrono::steady_clock::now();
+        // Wall deadline for waiting on script fetches: the aggregate load
+        // deadline when configured, otherwise a generous fallback (individual
+        // transfers are bounded by the loader policy timeout anyway).
+        const auto wait_deadline =
+            load_start + options.max_load_time.value_or(std::chrono::milliseconds(60000));
         if (options.max_load_time.has_value()) {
-            js->set_load_deadline(std::chrono::steady_clock::now() + *options.max_load_time);
+            js->set_load_deadline(load_start + *options.max_load_time);
         }
         struct LoadDeadlineGuard {
             JsRuntime* js;
             ~LoadDeadlineGuard() { js->set_load_deadline(std::nullopt); }
         } load_deadline_guard{js.get()};
-        for (const auto& script : collect_scripts()) {
+
+        auto set = collect_scripts();
+
+        // Parse-order pass: inline and sync external classic scripts run here
+        // (a sync external blocks until its fetch lands, like a parser would);
+        // defer/module scripts queue up; async scripts run from their
+        // completion tasks whenever those land.
+        std::vector<std::size_t> deferred;
+        for (std::size_t i = 0; i < set->scripts.size(); ++i) {
+            ScriptSource& script = set->scripts[i];
             if (js->load_deadline_passed()) {
                 js->log_console("error", "Aggregate script execution deadline exceeded; skipping remaining scripts");
                 break;
             }
-            js->execute("document.__markScriptStarted(" + std::to_string(script.node) + ");", "<pagecore-script-state>");
-            if (script.module) {
-                js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
-                try {
-                    js->execute_module(script.code, script.filename);
-                } catch (const std::exception& error) {
-                    js->log_console("error", error.what());
-                } catch (...) {
-                    js->log_console("error", "JS exception in module script");
-                }
+            if (script.async_load) {
                 continue;
             }
+            if (script.defer_load) {
+                deferred.push_back(i);
+                continue;
+            }
+            wait_and_run_document_script(script, wait_deadline);
+        }
 
-            js->execute("document.__setCurrentScript(" + std::to_string(script.node) + ");", "<pagecore-current-script>");
-            try {
-                js->execute(script.code, script.filename);
-            } catch (const std::exception& error) {
-                js->log_console("error", error.what());
-            } catch (...) {
-                js->log_console("error", "JS exception in script");
+        // Deferred scripts (defer + modules) run after parsing, in document
+        // order, before DOMContentLoaded.
+        for (const std::size_t i : deferred) {
+            if (js->load_deadline_passed()) {
+                js->log_console("error", "Aggregate script execution deadline exceeded; skipping deferred scripts");
+                break;
             }
-            try {
-                js->execute("document.__setCurrentScript(null);", "<pagecore-current-script>");
-            } catch (...) {
-            }
+            wait_and_run_document_script(set->scripts[i], wait_deadline);
         }
-        try {
-            js->execute(
-                "if (typeof __pagecore_fireDOMContentLoaded === 'function') __pagecore_fireDOMContentLoaded();\n"
-                "if (typeof __pagecore_fireLoad === 'function') __pagecore_fireLoad();",
-                "<pagecore-lifecycle>");
-        } catch (const std::exception& error) {
-            js->log_console("error", error.what());
-        } catch (...) {
-            js->log_console("error", "JS exception in lifecycle handlers");
+
+        fire_lifecycle_event("__pagecore_fireDOMContentLoaded");
+
+        // The window 'load' event waits for parser-inserted async scripts
+        // (they run from completion tasks while this pumps), bounded by the
+        // load deadline.
+        if (set->async_pending > 0) {
+            js->run_event_loop_until([&] { return set->async_pending == 0; }, wait_deadline);
         }
+
+        fire_lifecycle_event("__pagecore_fireLoad");
         js->activity_tracker().mark_load_fired();
         js->run_until_ready(PageReadinessOptions{
             options.wait_until,

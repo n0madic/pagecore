@@ -252,6 +252,55 @@
         );
       }
 
+      // Asynchronous resource loads. Each start registers its promise callbacks
+      // under a plain integer id; the host's event loop settles them later via
+      // __pagecore_resource_load_complete (a Networking task). Only ids and
+      // plain data cross the C++ boundary.
+      const pendingResourceLoads = new Map();
+      let nextResourceLoadId = 1;
+
+      function loadHostResourceAsync(url, kind = 'other', init = {}) {
+        if (ctx.host && typeof ctx.host.startResourceLoad === 'function') {
+          return new Promise((resolve, reject) => {
+            const id = nextResourceLoadId++;
+            pendingResourceLoads.set(id, { resolve, reject });
+            try {
+              ctx.host.startResourceLoad(
+                id,
+                absoluteURL(url),
+                kind,
+                init.method || 'GET',
+                init.body == null ? '' : String(init.body),
+                Array.isArray(init.headers) ? init.headers : [],
+                init.credentials || 'same-origin',
+                normalizeReferrer(Object.prototype.hasOwnProperty.call(init, 'referrer') ? init.referrer : 'about:client'));
+            } catch (error) {
+              // Synchronous policy/budget violations become async rejections.
+              pendingResourceLoads.delete(id);
+              reject(error);
+              return;
+            }
+            if (typeof init.onStarted === 'function') init.onStarted(id);
+          });
+        }
+        // Fallback (e.g. the node test harness): settle asynchronously through
+        // the blocking loader.
+        return Promise.resolve().then(() => loadHostResource(url, kind, init));
+      }
+
+      function cancelResourceLoad(id) {
+        pendingResourceLoads.delete(id);
+        if (ctx.host && typeof ctx.host.cancelResourceLoad === 'function') ctx.host.cancelResourceLoad(id);
+      }
+
+      function completeResourceLoad(id, result, errorMessage) {
+        const pending = pendingResourceLoads.get(Number(id));
+        if (!pending) return; // cancelled between completion and delivery
+        pendingResourceLoads.delete(Number(id));
+        if (result) pending.resolve(result);
+        else pending.reject(new Error(String(errorMessage || 'resource load failed')));
+      }
+
       return {
         DOM_EXCEPTION_CODES,
         DOM_EXCEPTION_LEGACY_CONSTANTS,
@@ -271,7 +320,10 @@
         activityMarkMutation,
         absoluteURL,
         formatErrorForLog,
-        loadHostResource
+        loadHostResource,
+        loadHostResourceAsync,
+        cancelResourceLoad,
+        completeResourceLoad
       };
     }
   };

@@ -313,13 +313,25 @@ function installEvents(overrides = {}) {
 }
 
 function installWeb() {
-  const { ctx, core, events } = installEvents();
+  const logs = [];
+  const scheduled = [];
+  const queued = [];
+  const cancelled = [];
+  const { ctx, core, events } = installEvents({
+    host: {
+      log: (...args) => logs.push(args),
+      now: () => 0,
+      scheduleTimer: (id, delay, repeat, relevant) => scheduled.push({ id, delay, repeat, relevant }),
+      cancelTimer: (id) => cancelled.push(id),
+      queueTask: (id, kind) => queued.push({ id, kind })
+    }
+  });
   const dom = {
     document: { nodeType: 9, childNodes: [], textContent: '' },
     fragmentFromHTML: (html) => ({ html: String(html) })
   };
   const web = webDefinition.install(ctx, { core, events, dom });
-  return { ctx, core, events, dom, web };
+  return { ctx, core, events, dom, web, logs, scheduled, queued, cancelled };
 }
 
 function installDomEnvironment() {
@@ -514,38 +526,68 @@ test('web TextEncoder and TextDecoder round-trip UTF-8', () => {
   assert.strictEqual(decoded, 'A\u20ac\u{1f642}');
 });
 
-test('web timers run timeout and interval callbacks deterministically', () => {
-  const { web } = installWeb();
+test('web timers register with the host scheduler and run via runTask', () => {
+  const { web, scheduled, cancelled } = installWeb();
   const calls = [];
 
-  web.setTimeoutShim((value) => calls.push(`timeout:${value}`), 10, 'a');
-  const intervalId = web.setIntervalShim(() => {
-    calls.push('interval');
-    if (calls.filter((value) => value === 'interval').length === 2) {
-      web.clearTask(intervalId);
-    }
-  }, 5);
+  const timeoutId = web.setTimeoutShim((value) => calls.push(`timeout:${value}`), 10, 'a');
+  const intervalId = web.setIntervalShim(() => calls.push('interval'), 5);
 
-  assert.strictEqual(web.runEventLoopStep(4), 0);
-  assert.deepStrictEqual(calls, []);
-  assert.strictEqual(web.runEventLoopStep(6), 1);
-  assert.deepStrictEqual(calls, ['interval']);
-  assert.strictEqual(web.runEventLoopStep(5), 1);
-  assert.strictEqual(web.runEventLoopStep(0), 1);
+  // Delayed one-shots and intervals go through the host timer wheel; interval
+  // ticks are never readiness-relevant.
+  assert.deepStrictEqual(scheduled, [
+    { id: timeoutId, delay: 10, repeat: false, relevant: true },
+    { id: intervalId, delay: 5, repeat: true, relevant: false }
+  ]);
+
+  // The host fires timers by id; intervals stay registered, one-shots do not.
+  assert.strictEqual(web.runTask(intervalId), 1);
+  assert.strictEqual(web.runTask(timeoutId), 1);
+  assert.strictEqual(web.runTask(timeoutId), 0);
+  assert.strictEqual(web.runTask(intervalId), 1);
   assert.deepStrictEqual(calls, ['interval', 'timeout:a', 'interval']);
+
+  web.clearTask(intervalId);
+  assert.deepStrictEqual(cancelled, [intervalId]);
+  assert.strictEqual(web.runTask(intervalId), 0);
 });
 
-test('web event loop step runs one due task in insertion order', () => {
-  const { web } = installWeb();
+test('web zero-delay page tasks queue to the host in insertion order', () => {
+  const { web, queued, scheduled } = installWeb();
   const calls = [];
 
-  web.queuePageTask(() => calls.push('first'), 'test');
-  web.queuePageTask(() => calls.push('second'), 'test');
+  const first = web.queuePageTask(() => calls.push('first'), 'test');
+  const second = web.queuePageTask(() => calls.push('second'), 'test');
 
-  assert.strictEqual(web.runEventLoopStep(0), 1);
+  // Zero-delay one-shots enqueue immediately instead of arming a 0ms timer.
+  assert.deepStrictEqual(queued, [
+    { id: first, kind: 'test' },
+    { id: second, kind: 'test' }
+  ]);
+  assert.deepStrictEqual(scheduled, []);
+
+  assert.strictEqual(web.runTask(first), 1);
   assert.deepStrictEqual(calls, ['first']);
-  assert.strictEqual(web.runEventLoopStep(0), 1);
+  assert.strictEqual(web.runTask(second), 1);
   assert.deepStrictEqual(calls, ['first', 'second']);
+});
+
+test('web nested zero-delay timers clamp to 4ms beyond depth 5', () => {
+  const { web, scheduled, queued } = installWeb();
+
+  // runTask() runs each callback at its task's nesting level, so a chain of
+  // zero-delay timers deepens one level per hop, like the HTML event loop.
+  const ids = [];
+  function chain(remaining) {
+    if (remaining <= 0) return;
+    ids.push(web.setTimeoutShim(() => chain(remaining - 1), 0));
+  }
+  chain(7);
+  for (let i = 0; i < ids.length; i++) web.runTask(ids[i]);
+
+  // Levels 1-5 enqueue immediately at 0ms; levels 6+ clamp to a >=4ms timer.
+  assert.strictEqual(queued.length, 5);
+  assert.deepStrictEqual(scheduled.map((entry) => entry.delay), [4, 4]);
 });
 
 test('events exposes standard DOMException legacy constants', () => {

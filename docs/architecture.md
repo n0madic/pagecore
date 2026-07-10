@@ -70,6 +70,83 @@ scripts may create (`createElement`, `cloneNode`, `innerHTML`, …) — native L
 node memory the JS heap limit does not cover. Setting a limit to 0 / `std::nullopt`
 disables that axis.
 
+## Event loop
+
+Each `JsRuntime` (one per document load) owns a real, single-threaded
+**libuv** event loop (`src/event_loop.{hpp,cpp}`). Everything runs on the
+page's thread: `Page::load_html`/`run_until_idle`/`run_until_ready` pump the
+loop from the inside; no background threads are involved. Timers are real
+wall-clock `uv_timer_t`s, `performance.now()` is the loop's monotonic clock,
+and network transfers are multiplexed over the same loop (below).
+
+**Task model.** Macrotasks live in C++ queues tagged with an HTML task source —
+`Timers`, `Networking`, or `Misc` — and execute in global FIFO order (one
+sequence counter across all sources), which keeps ordering deterministic for
+tests. One turn of the loop is: pump libuv (`UV_RUN_NOWAIT`) → run exactly one
+queued task → run the full microtask checkpoint (pending jobs + MutationObserver
+delivery) → run one rendering phase if an animation frame is due. The JS side
+keeps only a registry mapping task ids to callbacks; **only plain integer ids
+cross the C++/JS boundary**, never `JSValue`s, so teardown can drop queued tasks
+wholesale at any point.
+
+**Correctness invariant.** libuv callbacks (timer fires, socket readiness, curl
+completions) only *enqueue* tasks; JavaScript executes exclusively from a turn,
+never re-entrantly from inside `uv_run`. Each task runs under a fresh
+`js_timeout` budget, clamped to the aggregate `max_load_time` load deadline.
+
+**Asynchronous transfers.** JS-initiated `fetch`/XHR/dynamic-script loads and
+parser-discovered `<script src>` go through an internal `AsyncResourceLoader`
+(`src/async_loader.hpp`):
+
+- When the page's loader is the built-in `CurlResourceLoader`, transfers run on
+  a **`curl_multi_socket_action` engine** (`src/curl_async_loader.{hpp,cpp}`):
+  curl's socket callbacks map to per-fd `uv_poll_t` watchers and its timeout
+  callback to a `uv_timer_t`, so many transfers progress concurrently
+  (browser-like caps: 8 total / 6 per host) while timers and JS keep running.
+  The engine shares the `CURLSH` handle, the `ResourcePolicy` snapshot-per-
+  transfer discipline, the connect-time SSRF socket guard, and the response
+  construction with the blocking paths (shared internals in
+  `src/curl_transfer.hpp`), so both paths enforce identical policy.
+- Any other loader (`MemoryResourceLoader`, custom embedder loaders) is adapted
+  by `TaskQueueAsyncLoader`: the blocking `load()` runs inside one queued
+  Networking task. Custom loaders therefore block a single task, not the whole
+  engine — and their completion ordering is deterministic (completion lands at
+  the queue position where the transfer started).
+
+Requests snapshot cookies and pass policy/budget checks when the transfer
+**starts** (like a browser); completions store `Set-Cookie`, feed the JS
+resource cache, and settle the JS promise from a queued Networking task. The
+blocking `ResourceLoader` API is unchanged and still serves the top-level
+document fetch, render prefetch, synchronous XHR, and module imports.
+
+**Multi-uv pitfalls handled** (worth knowing before touching the engine):
+`CURL_POLL_REMOVE` only stops the `uv_poll_t` — curl may re-register the same
+fd within the same batch, so poll handles are cached per fd and destroyed only
+at shutdown; a 0ms curl timeout still goes through the uv timer (calling
+`curl_multi_socket_action` from inside curl's own callback is forbidden);
+`curl_multi_info_read` is drained after *every* socket action; and shutdown
+drains libuv close callbacks before the owning object's memory goes away
+(handles embedded in an object must be fully closed first — teardown order is
+async loader → event loop → QuickJS context).
+
+**Readiness in real time.** `run_until_ready` waits on wall-clock time: the
+next wake-up is the nearest timer, the moment the DOM-stability window would
+elapse, or the remaining `wait_time` budget. Relevant pending work (one-shot
+timers due within the stability window, queued network tasks, in-flight
+transfers) holds readiness open; interval timers and `requestAnimationFrame`
+never do (they would spin forever). One shortcut keeps quiescent pages fast: if
+the loop is *provably* quiescent — no queued tasks, no timers of any kind, no
+in-flight transfers, no pending frames — the DOM is trivially stable and
+readiness completes without waiting out `stable_window`.
+
+**requestAnimationFrame** is a real ~16ms frame cadence anchored to the
+previous frame, not a `setTimeout(16)` approximation. Callback ids accumulate
+until the frame timer fires; the rendering phase then dispatches the whole
+batch once with a monotonic timestamp (callbacks registered during a frame run
+in the next frame). rAF never blocks idleness or readiness by itself, but DOM
+mutations made inside frames extend the stability window like any other
+mutation.
+
 ## Resource pipeline
 
 Resources flow through `ResourceRequest`/`ResourceResponse` with request kinds
@@ -106,18 +183,23 @@ payload into headers.
 
 ### Script loading
 
-`Page` scans the whole document for external `<script src>` and prefetches them
-through `load_all`, while still executing parser-discovered classic scripts in
-document order. Static `async`/`defer` attributes are recognized. Static
-inline/external `type=module` scripts support relative imports and
-`import.meta.url`. Static scripts execute only for standard JavaScript MIME types;
-non-standard types stay inert until page code creates or mutates a classic
-`<script>` through the DOM.
+`Page` scans the whole document for external `<script src>` and starts every
+fetch immediately through the async transfer engine, then executes with spec
+semantics: inline and sync external classic scripts run in document order (a
+sync external pumps the event loop until its fetch lands); `defer` scripts and
+module scripts run after parsing, in document order, before `DOMContentLoaded`;
+`async` scripts execute as soon as their fetch completes, and the window `load`
+event waits for them (bounded by `max_load_time`). Static inline/external
+`type=module` scripts support relative imports and `import.meta.url`. Static
+scripts execute only for standard JavaScript MIME types; non-standard types
+stay inert until page code creates or mutates a classic `<script>` through the
+DOM. A failed external script is skipped without aborting the page load.
 
-Dynamically inserted classic scripts load through the same `ResourceLoader`, run
-with `document.currentScript`, dispatch `load`/`error`, and are marked as started
-so moving them later does not re-run them. DOM-created classic scripts default to
-async-like execution; explicit `script.async = false` uses an ordered FIFO queue.
+Dynamically inserted classic scripts fetch asynchronously through the same
+engine, run with `document.currentScript`, dispatch `load`/`error`, and are
+marked as started so moving them later does not re-run them. DOM-created
+classic scripts default to async-like execution; explicit
+`script.async = false` uses an ordered FIFO queue.
 
 ### Render prefetch
 

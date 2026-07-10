@@ -1,5 +1,6 @@
 #include "pagecore/resource_loader.hpp"
 
+#include "curl_transfer.hpp"
 #include "util.hpp"
 #include "base64_codec.hpp"
 
@@ -38,11 +39,13 @@ void ensure_curl_global_init();
 
 namespace {
 
-struct CurlBody {
-    std::string body;
-    std::size_t max_bytes = 0;
-    bool too_large = false;
-};
+// The transfer-state structs (CurlBody/CurlHeaders/CurlHeaderList/
+// OpenSocketContext) are defined in curl_transfer.hpp, shared with the async
+// curl_multi_socket_action engine.
+using detail::CurlBody;
+using detail::CurlHeaders;
+using detail::CurlHeaderList;
+using detail::OpenSocketContext;
 
 // Absolute ceiling on the cumulative bytes of response header lines across the
 // whole transfer (all redirect hops and their accumulated Set-Cookie headers).
@@ -50,28 +53,6 @@ struct CurlBody {
 // a server could move an unbounded payload into headers and exhaust memory,
 // bypassing that limit. 1 MiB is far above any legitimate response's headers.
 constexpr std::size_t kMaxResponseHeaderBytes = 1 * 1024 * 1024;
-
-struct CurlHeaders {
-    std::vector<std::pair<std::string, std::string>> headers;
-    std::vector<std::pair<std::string, std::string>> set_cookie_sources;
-    std::vector<std::pair<std::string, std::string>> set_cookie_headers;
-    std::string current_url;
-    std::string next_url;
-    std::string status_text;
-    std::size_t header_bytes = 0;
-    bool too_large = false;
-};
-
-struct CurlHeaderListDeleter {
-    void operator()(curl_slist* list) const
-    {
-        if (list != nullptr) {
-            curl_slist_free_all(list);
-        }
-    }
-};
-
-using CurlHeaderList = std::unique_ptr<curl_slist, CurlHeaderListDeleter>;
 
 // libcurl share handle for connection / DNS-cache / TLS-session reuse across
 // requests, with one lock mutex per shared data type so the share is safe to use
@@ -258,6 +239,10 @@ std::string default_status_text(int status)
     }
 }
 
+} // namespace
+
+namespace detail {
+
 std::vector<std::pair<std::string, std::string>> content_type_header(std::string_view mime_type)
 {
     if (mime_type.empty()) {
@@ -265,6 +250,12 @@ std::vector<std::pair<std::string, std::string>> content_type_header(std::string
     }
     return {{"Content-Type", std::string(mime_type)}};
 }
+
+} // namespace detail
+
+namespace {
+
+using detail::content_type_header;
 
 bool has_url_scheme(std::string_view value)
 {
@@ -284,6 +275,10 @@ bool has_url_scheme(std::string_view value)
     }
     return true;
 }
+
+} // namespace
+
+namespace detail {
 
 std::string scheme_of(std::string_view url)
 {
@@ -314,6 +309,15 @@ bool is_data_scheme(std::string_view scheme)
 {
     return scheme == "data";
 }
+
+} // namespace detail
+
+namespace {
+
+using detail::scheme_of;
+using detail::is_network_scheme;
+using detail::is_file_scheme;
+using detail::is_data_scheme;
 
 std::string sanitize_http_referrer(std::string_view referrer)
 {
@@ -577,12 +581,8 @@ bool is_blocked_literal_host(const std::string& raw_host, const ResourcePolicy& 
 
 // Platform-neutral: these helpers and the CURLOPT_OPENSOCKETFUNCTION guard below
 // compile and run on every libcurl platform (including Windows via winsock), so the
-// connect-time SSRF check is not weakened on any target.
-struct OpenSocketContext {
-    const ResourcePolicy* policy = nullptr;
-    bool blocked = false;
-};
-
+// connect-time SSRF check is not weakened on any target. OpenSocketContext is
+// defined in curl_transfer.hpp (shared with the async engine).
 bool is_blocked_sockaddr(const sockaddr* sa)
 {
     if (sa == nullptr) {
@@ -716,6 +716,10 @@ std::string referrer_for_target(std::string_view referrer, std::string_view targ
     return full;
 }
 
+} // namespace
+
+namespace detail {
+
 void enforce_request_policy(const ResourceRequest& request, const ResourcePolicy& policy)
 {
     if (request.url.empty()) {
@@ -774,6 +778,13 @@ void enforce_response_policy(const ResourceRequest& request, const ResourceRespo
         throw ResourceError(ResourceErrorCode::TooLarge, request.url, "resource exceeds max response size");
     }
 }
+
+} // namespace detail
+
+namespace {
+
+using detail::enforce_request_policy;
+using detail::enforce_response_policy;
 
 int hex_value(char ch)
 {
@@ -847,6 +858,10 @@ std::string base64_decode_data_payload(
     return out;
 }
 
+} // namespace
+
+namespace detail {
+
 ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePolicy& policy)
 {
     const auto colon = request.url.find(':');
@@ -909,6 +924,12 @@ ResourceResponse load_data_url(const ResourceRequest& request, const ResourcePol
     return response;
 }
 
+} // namespace detail
+
+namespace {
+
+using detail::load_data_url;
+
 std::string extension_of(std::string_view url)
 {
     const auto query = url.find('?');
@@ -919,6 +940,10 @@ std::string extension_of(std::string_view url)
     }
     return ascii_lower(clean.substr(dot + 1));
 }
+
+} // namespace
+
+namespace detail {
 
 std::string infer_mime_type(std::string_view url, ResourceKind kind)
 {
@@ -946,6 +971,12 @@ std::string infer_mime_type(std::string_view url, ResourceKind kind)
     return "application/octet-stream";
 }
 
+} // namespace detail
+
+namespace {
+
+using detail::infer_mime_type;
+
 // Decode "file:" / "file://" URLs into a filesystem path. Strips an optional
 // (empty or "localhost") authority and the URL fragment/query.
 std::filesystem::path file_path_of(std::string_view url)
@@ -970,6 +1001,10 @@ std::filesystem::path file_path_of(std::string_view url)
     }
     return std::filesystem::path(std::string(rest));
 }
+
+} // namespace
+
+namespace detail {
 
 std::string read_file(std::string_view url, const ResourcePolicy& policy)
 {
@@ -1091,6 +1126,12 @@ std::string read_file(std::string_view url, const ResourcePolicy& policy)
 #endif
     return out;
 }
+
+} // namespace detail
+
+namespace {
+
+using detail::read_file;
 
 std::string without_query_or_fragment(std::string_view url)
 {
@@ -1321,9 +1362,14 @@ std::string cache_key_for(const ResourceRequest& request)
     return key;
 }
 
+} // namespace
+
+namespace detail {
+
 // Applies every libcurl option for a single network transfer. Shared verbatim by
-// the serial load() and the concurrent load_all() so both paths enforce the same
-// protocol pinning, SSRF socket guard, size cap, timeout, and connection reuse.
+// the serial load(), the concurrent load_all(), and the async multi engine so
+// every path enforces the same protocol pinning, SSRF socket guard, size cap,
+// timeout, and connection reuse.
 CurlHeaderList configure_network_handle(
     CURL* curl,
     const ResourceRequest& request,
@@ -1455,6 +1501,13 @@ ResourceResponse build_network_response(
     enforce_response_policy(request, response, policy);
     return response;
 }
+
+} // namespace detail
+
+namespace {
+
+using detail::configure_network_handle;
+using detail::build_network_response;
 
 } // namespace
 
@@ -1732,6 +1785,12 @@ ResourcePolicy CurlResourceLoader::snapshot_policy() const
     return policy_;
 }
 
+void* CurlResourceLoader::share_handle() const noexcept
+{
+    auto* curl_shared = static_cast<CurlShared*>(shared_.get());
+    return curl_shared == nullptr ? nullptr : curl_shared->share;
+}
+
 MemoryResourceLoader::MemoryResourceLoader(ResourcePolicy policy)
     : policy_(std::move(policy))
 {
@@ -1814,35 +1873,15 @@ void CachingResourceLoader::touch_locked(const std::string& key)
 
 ResourceResponse CachingResourceLoader::load(const ResourceRequest& request)
 {
-    const std::string key = cache_key_for(request);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto cached = cache_.find(key);
-        if (cached != cache_.end()) {
-            touch_locked(key); // LRU: a hit becomes most-recently-used.
-            ResourceResponse response = cached->second;
-            response.from_cache = true;
-            return response;
-        }
+    if (auto hit = cached(request)) {
+        return std::move(*hit);
     }
 
     // The inner load runs without the lock so concurrent loads of different
     // resources do not serialize.
     ResourceResponse response = inner_->load(request);
     response.from_cache = false;
-
-    // Do not pin error responses (4xx/5xx) — they are often transient.
-    if (response.status < 400) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (cache_.find(key) == cache_.end()) {
-            order_.push_back(key);
-            while (order_.size() > max_entries_) {
-                cache_.erase(order_.front());
-                order_.pop_front();
-            }
-        }
-        cache_[key] = response;
-    }
+    store(request, response);
     return response;
 }
 
@@ -1898,6 +1937,41 @@ std::vector<ResourceResponse> CachingResourceLoader::load_all(const std::vector<
     }
 
     return responses;
+}
+
+std::optional<ResourceResponse> CachingResourceLoader::cached(const ResourceRequest& request)
+{
+    const std::string key = cache_key_for(request);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = cache_.find(key);
+    if (found == cache_.end()) {
+        return std::nullopt;
+    }
+    touch_locked(key); // LRU: a hit becomes most-recently-used.
+    ResourceResponse response = found->second;
+    response.from_cache = true;
+    return response;
+}
+
+void CachingResourceLoader::store(const ResourceRequest& request, const ResourceResponse& response)
+{
+    // Never pin error responses: 4xx/5xx are often transient, and status-0
+    // placeholders are failures that must stay retryable.
+    if (response.status >= 400 || response.status == 0) {
+        return;
+    }
+    const std::string key = cache_key_for(request);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cache_.find(key) == cache_.end()) {
+        order_.push_back(key);
+        while (order_.size() > max_entries_) {
+            cache_.erase(order_.front());
+            order_.pop_front();
+        }
+    }
+    ResourceResponse stored = response;
+    stored.from_cache = false;
+    cache_[key] = std::move(stored);
 }
 
 void CachingResourceLoader::clear()

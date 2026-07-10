@@ -16,7 +16,16 @@
     deps: ['core', 'events', 'dom'],
     install(ctx, api) {
       const { global, host } = ctx;
-      const { defineValue, assertNode, absoluteURL, activityBegin, activityEnd, formatErrorForLog } = api.core;
+      const {
+        defineValue,
+        assertNode,
+        absoluteURL,
+        activityBegin,
+        activityEnd,
+        formatErrorForLog,
+        loadHostResourceAsync: coreLoadHostResourceAsync,
+        cancelResourceLoad
+      } = api.core;
       const {
         DOMException,
         EventTarget,
@@ -870,6 +879,19 @@
           );
         }
 
+        // Headers-object-aware wrapper over the core async loader (which takes
+        // raw header pairs). Returns a promise of the host result object.
+        function loadHostResourceAsync(url, kind = 'other', init = {}) {
+          return coreLoadHostResourceAsync(url, kind, {
+            method: init.method || 'GET',
+            body: init.body == null ? '' : String(init.body),
+            headers: headerPairs(init.headers),
+            credentials: normalizeCredentials(init.credentials || 'same-origin'),
+            referrer: Object.prototype.hasOwnProperty.call(init, 'referrer') ? init.referrer : 'about:client',
+            onStarted: init.onStarted
+          });
+        }
+
         class XMLHttpRequest extends EventTarget {
           constructor() {
             super();
@@ -896,6 +918,7 @@
             this._responseHeaders = new Headers();
             this._aborted = false;
             this._activityPending = false;
+            this._loadId = null;
           }
 
           open(method, url, async = true) {
@@ -928,6 +951,10 @@
 
           abort() {
             this._aborted = true;
+            if (this._loadId != null) {
+              cancelResourceLoad(this._loadId);
+              this._loadId = null;
+            }
             this.status = 0;
             this.statusText = '';
             this.readyState = XMLHttpRequest.DONE;
@@ -937,78 +964,113 @@
             this._endActivity();
           }
 
+          _applyLoaded(loaded) {
+            this.status = loaded.status === undefined ? 200 : Number(loaded.status);
+            this.statusText = loaded.statusText === undefined ? '' : String(loaded.statusText);
+            this.responseURL = loaded.url || this._url;
+            this._responseHeaders = responseHeadersFromHost(loaded);
+            if (this._overrideMimeType) this._responseHeaders.set('content-type', this._overrideMimeType);
+            this.responseText = loaded.body || '';
+            if (this.responseType === 'json') {
+              // A JSON responseType whose body is not valid JSON still loads
+              // successfully; the response attribute simply yields null. Parse
+              // outside the fatal path so it never turns a load into an error.
+              try {
+                this.response = this.responseText ? JSON.parse(this.responseText) : null;
+              } catch (_jsonError) {
+                this.response = null;
+              }
+            } else {
+              this.response = this.responseText;
+            }
+          }
+
+          _finishSuccess() {
+            this.readyState = XMLHttpRequest.HEADERS_RECEIVED;
+            this._fire('readystatechange');
+
+            this.readyState = XMLHttpRequest.LOADING;
+            this._fire('readystatechange');
+
+            this.readyState = XMLHttpRequest.DONE;
+            this._fire('readystatechange');
+            this._fire('load');
+            this._fire('loadend');
+            this._endActivity();
+          }
+
+          _finishError() {
+            this.status = 0;
+            this.statusText = '';
+            this.response = '';
+            this.responseText = '';
+            this.readyState = XMLHttpRequest.DONE;
+            this._fire('readystatechange');
+            this._fire('error');
+            this._fire('loadend');
+            this._endActivity();
+          }
+
           send(body = null) {
             if (this.readyState !== XMLHttpRequest.OPENED) throw new DOMException('XMLHttpRequest is not open.', 'InvalidStateError');
             this._beginActivity();
-            const run = () => {
+            const init = {
+              method: this._method,
+              body: bodyText(body, this._requestHeaders),
+              headers: this._requestHeaders,
+              credentials: this.withCredentials ? 'include' : 'same-origin',
+              referrer: 'about:client'
+            };
+
+            if (!this._async) {
+              // Synchronous XHR stays on the blocking host loader.
               if (this._aborted) {
                 this._endActivity();
                 return;
               }
               let loaded = null;
               try {
-                loaded = loadHostResource(this._url, 'other', {
-                  method: this._method,
-                  body: bodyText(body, this._requestHeaders),
-                  headers: this._requestHeaders,
-                  credentials: this.withCredentials ? 'include' : 'same-origin',
-                  referrer: 'about:client'
-                });
-                this.status = loaded.status === undefined ? 200 : Number(loaded.status);
-                this.statusText = loaded.statusText === undefined ? '' : String(loaded.statusText);
-                this.responseURL = loaded.url || this._url;
-                this._responseHeaders = responseHeadersFromHost(loaded);
-                if (this._overrideMimeType) this._responseHeaders.set('content-type', this._overrideMimeType);
-                this.responseText = loaded.body || '';
-                if (this.responseType === 'json') {
-                  // A JSON responseType whose body is not valid JSON still loads
-                  // successfully; the response attribute simply yields null. Parse
-                  // outside the fatal path so it never turns a load into an error.
-                  try {
-                    this.response = this.responseText ? JSON.parse(this.responseText) : null;
-                  } catch (_jsonError) {
-                    this.response = null;
-                  }
-                } else {
-                  this.response = this.responseText;
-                }
-              } catch (error) {
+                loaded = loadHostResource(this._url, 'other', init);
+              } catch (_error) {
                 if (this._aborted) {
                   this._endActivity();
                   return;
                 }
-                this.status = 0;
-                this.statusText = '';
-                this.response = '';
-                this.responseText = '';
-                this.readyState = XMLHttpRequest.DONE;
-                this._fire('readystatechange');
-                this._fire('error');
-                this._fire('loadend');
-                this._endActivity();
+                this._finishError();
                 return;
               }
-
               if (this._aborted) {
                 this._endActivity();
                 return;
               }
-              this.readyState = XMLHttpRequest.HEADERS_RECEIVED;
-              this._fire('readystatechange');
+              this._applyLoaded(loaded);
+              this._finishSuccess();
+              return;
+            }
 
-              this.readyState = XMLHttpRequest.LOADING;
-              this._fire('readystatechange');
-
-              this.readyState = XMLHttpRequest.DONE;
-              this._fire('readystatechange');
-              this._fire('load');
-              this._fire('loadend');
-              this._endActivity();
-            };
-
-            void body;
-            if (this._async) queuePageTask(run, 'xhr-fetch');
-            else run();
+            // Async XHR: the transfer starts immediately; the readystatechange
+            // sequence runs when the completion task delivers the result.
+            loadHostResourceAsync(this._url, 'other', {
+              ...init,
+              onStarted: (id) => { this._loadId = id; }
+            }).then(
+              (loaded) => {
+                this._loadId = null;
+                if (this._aborted) {
+                  this._endActivity();
+                  return;
+                }
+                this._applyLoaded(loaded);
+                this._finishSuccess();
+              },
+              (_error) => {
+                this._loadId = null;
+                if (this._aborted) {
+                  this._endActivity();
+                  return;
+                }
+                this._finishError();
+              });
           }
 
           _beginActivity() {
@@ -1075,9 +1137,12 @@
           }
         }
 
-        const tasks = new Map();
+        // Macrotasks live in the host's libuv-backed event loop; this registry
+        // only maps task ids to their JS callbacks. Only plain integer ids
+        // cross the C++ boundary in either direction.
+        const taskRegistry = new Map();
         let nextTaskId = 1;
-        let timerNow = 0;
+        let timerNestingLevel = 0;
 
         function normalizeDelay(delay) {
           const value = Number(delay);
@@ -1402,17 +1467,37 @@
           });
         }
 
+      function isReadinessRelevantKind(kind) {
+        return kind === 'timer'
+          || kind === 'xhr-fetch'
+          || kind === 'dynamic-script'
+          || kind === 'dom-resource';
+      }
+
       function queueTask(callback, delay = 0, args = [], kind = 'other', interval = false) {
         const id = nextTaskId++;
-        const timeout = normalizeDelay(delay);
-        tasks.set(id, {
+        let timeout = normalizeDelay(delay);
+        const kindText = String(kind || 'other');
+        const nesting = timerNestingLevel + 1;
+        // HTML spec: timers nested more than 5 levels deep clamp to >= 4ms.
+        if (nesting > 5 && timeout < 4) timeout = 4;
+        taskRegistry.set(id, {
           callback,
-          delay: timeout,
-          due: timerNow + timeout,
           args: Array.isArray(args) ? args : [],
           interval: Boolean(interval),
-          kind: String(kind || 'other')
+          kind: kindText,
+          nesting
         });
+        const relevant = isReadinessRelevantKind(kindText) && !interval;
+        if (!interval && timeout === 0 && host && typeof host.queueTask === 'function') {
+          // Zero-delay one-shot tasks enqueue immediately (global FIFO across
+          // sources) instead of round-tripping through a 0ms uv timer.
+          host.queueTask(id, kindText);
+        } else if (host && typeof host.scheduleTimer === 'function') {
+          host.scheduleTimer(id, timeout, Boolean(interval), relevant);
+        }
+        // Without a host scheduler (the node unit-test harness) the task stays
+        // registered; tests drive it explicitly through runTask(id).
         return id;
       }
 
@@ -1425,15 +1510,57 @@
       }
 
       function clearTask(id) {
-        return tasks.delete(id);
+        const existed = taskRegistry.delete(id);
+        if (host && typeof host.cancelTimer === 'function') host.cancelTimer(Number(id) || 0);
+        return existed;
       }
 
       function setIntervalShim(callback, delay = 0, ...args) {
         return queueTask(callback, delay, args, 'timer', true);
       }
 
+      // Real animation frames: ids accumulate host-side until the ~16ms frame
+      // timer fires; the C++ rendering phase then dispatches the whole batch
+      // through runAnimationFrames below.
+      const rafRegistry = new Map();
+
       function requestAnimationFrameShim(callback) {
-        return setTimeoutShim(() => callback(timerNow), 16);
+        if (host && typeof host.requestAnimationFrame === 'function') {
+          const id = nextTaskId++;
+          rafRegistry.set(id, callback);
+          host.requestAnimationFrame(id);
+          return id;
+        }
+        return setTimeoutShim(() => callback(performanceNow()), 16);
+      }
+
+      function cancelAnimationFrameShim(id) {
+        if (rafRegistry.delete(Number(id))) {
+          if (host && typeof host.cancelAnimationFrame === 'function') host.cancelAnimationFrame(Number(id));
+          return true;
+        }
+        return clearTask(id);
+      }
+
+      // Entry point for the C++ rendering phase (__pagecore_run_raf_callbacks).
+      // Ids cancelled after the frame fired simply miss the registry.
+      function runAnimationFrames(ids, now) {
+        const timestamp = Number(now);
+        const list = Array.isArray(ids) ? ids : [];
+        let ran = 0;
+        for (const rawId of list) {
+          const id = Number(rawId);
+          const callback = rafRegistry.get(id);
+          if (!callback) continue;
+          rafRegistry.delete(id);
+          try {
+            callback.call(global, timestamp);
+            ran++;
+          } catch (error) {
+            reportTaskError(error);
+          }
+        }
+        return ran;
       }
 
       function requestIdleCallbackShim(callback) {
@@ -1441,60 +1568,25 @@
       }
 
       function performanceNow() {
-        return timerNow;
+        return host && typeof host.now === 'function' ? Number(host.now()) : Date.now();
       }
       ctx.pagecoreNow = performanceNow;
 
-	      function runEventLoopStep(advanceMs = 0) {
-	        const deadline = timerNow + normalizeDelay(advanceMs);
-	        let nextDue = Infinity;
-	        for (const task of tasks.values()) {
-	          if (task.due < nextDue) nextDue = task.due;
+      // Entry point the C++ event loop calls (as __pagecore_run_task) when a
+      // queued task or fired timer is due. Ids cancelled between fire and run
+      // simply miss the registry and are a no-op.
+      function runTask(id) {
+        const task = taskRegistry.get(Number(id));
+        if (!task) return 0;
+        if (!task.interval) taskRegistry.delete(Number(id));
+        const previousNesting = timerNestingLevel;
+        timerNestingLevel = task.nesting;
+        try {
+          callTaskCallback(task);
+        } finally {
+          timerNestingLevel = previousNesting;
         }
-
-        if (nextDue === Infinity || nextDue > deadline) {
-          timerNow = deadline;
-          return 0;
-        }
-
-        timerNow = nextDue;
-        const due = [...tasks.entries()]
-          .filter((entry) => entry[1].due <= timerNow)
-          .sort((left, right) => left[1].due - right[1].due || left[0] - right[0]);
-        if (due.length === 0) return 0;
-
-        const [id, task] = due[0];
-        if (!tasks.has(id)) return 0;
-        if (task.interval) {
-          task.due = timerNow + Math.max(1, task.delay);
-        } else {
-          tasks.delete(id);
-        }
-	        callTaskCallback(task);
-	        return 1;
-	      }
-
-	      function isReadinessRelevantTask(task) {
-	        if (task.interval) return false;
-	        return task.kind === 'timer'
-	          || task.kind === 'xhr-fetch'
-	          || task.kind === 'dynamic-script'
-	          || task.kind === 'dom-resource';
-	      }
-
-	      function eventLoopSnapshot(horizonMs = 0) {
-	        const horizon = timerNow + normalizeDelay(horizonMs);
-	        let relevant = 0;
-	        let nextDue = Infinity;
-	        for (const task of tasks.values()) {
-	          if (task.due < nextDue) nextDue = task.due;
-	          if (isReadinessRelevantTask(task) && task.due <= horizon) relevant++;
-	        }
-	        return {
-	          now: timerNow,
-	          relevant,
-          nextDelay: nextDue === Infinity ? -1 : Math.max(0, nextDue - timerNow)
-        };
+        return 1;
       }
 
       return {
@@ -1516,6 +1608,7 @@
         responseHeadersFromHost,
         bodyText,
         loadHostResource,
+        loadHostResourceAsync,
         XMLHttpRequest,
         Storage,
         XMLSerializer,
@@ -1531,11 +1624,12 @@
         clearTask,
         setIntervalShim,
         requestAnimationFrameShim,
+        cancelAnimationFrameShim,
+        runAnimationFrames,
         requestIdleCallbackShim,
         performanceNow,
         queuePageTask,
-        runEventLoopStep,
-        eventLoopSnapshot
+        runTask
       };
     }
   };

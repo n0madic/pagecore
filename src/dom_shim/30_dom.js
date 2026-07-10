@@ -31,7 +31,8 @@
         activityBegin,
         activityEnd,
         formatErrorForLog,
-        loadHostResource
+        loadHostResource,
+        loadHostResourceAsync
       } = api.core;
       const {
         DOMException,
@@ -166,14 +167,26 @@
         }
       }
 
-      function runDynamicExternalScript(script, url) {
-        try {
-          const loaded = loadHostResource(url, 'script');
-          executeDynamicScriptSource(script, loaded && loaded.body ? loaded.body : '', (loaded && loaded.url) || url);
-        } catch (error) {
-          reportDynamicScriptError(error);
-          script.dispatchEvent(new Event('error'));
-        }
+      // Starts the fetch immediately (truly async through the host engine);
+      // the script executes when the completion task lands. onDone always runs
+      // exactly once, after execution or failure.
+      function runDynamicExternalScript(script, url, onDone) {
+        loadHostResourceAsync(url, 'script').then(
+          (loaded) => {
+            try {
+              executeDynamicScriptSource(script, loaded && loaded.body ? loaded.body : '', (loaded && loaded.url) || url);
+            } finally {
+              if (onDone) onDone();
+            }
+          },
+          (error) => {
+            try {
+              reportDynamicScriptError(error);
+              script.dispatchEvent(new Event('error'));
+            } finally {
+              if (onDone) onDone();
+            }
+          });
       }
 
       function scheduleTask(callback, kind = 'other') {
@@ -187,15 +200,11 @@
         const next = orderedDynamicScripts.shift();
         if (!next) return;
         orderedDynamicScriptRunning = true;
-        scheduleTask(() => {
-          try {
-            runDynamicExternalScript(next.script, next.url);
-          } finally {
-            orderedDynamicScriptRunning = false;
-            activityEnd('dynamic-script');
-            drainOrderedDynamicScripts();
-          }
-        }, 'dynamic-script');
+        runDynamicExternalScript(next.script, next.url, () => {
+          orderedDynamicScriptRunning = false;
+          activityEnd('dynamic-script');
+          drainOrderedDynamicScripts();
+        });
       }
 
       function markScriptStarted(script) {
@@ -226,13 +235,7 @@
             drainOrderedDynamicScripts();
             return;
           }
-          scheduleTask(() => {
-            try {
-              runDynamicExternalScript(script, url);
-            } finally {
-              activityEnd('dynamic-script');
-            }
-          }, 'dynamic-script');
+          runDynamicExternalScript(script, url, () => activityEnd('dynamic-script'));
           return;
         }
 

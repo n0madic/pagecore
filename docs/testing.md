@@ -3,6 +3,28 @@
 PageCore has three layers of compatibility tests in addition to the C++ and
 DOM-shim unit tests.
 
+## Real-time event loop and tests
+
+The event loop runs on real wall-clock time (libuv timers), so time-dependent
+tests must budget real waits:
+
+- Use short timer delays (tens of milliseconds) with generous `wait_time`
+  budgets; never assert exact wall-clock ordering between a network response
+  and a timer of similar magnitude (that is a race by construction).
+- Pages that quiesce completely (no pending timers, tasks, transfers, or
+  animation frames) become ready immediately regardless of `stable_window`, so
+  most tests need no timing tweaks at all. Tests that keep work pending (an
+  interval, an rAF loop, a long timer) should set a small `stable_window` to
+  avoid waiting out the default 350ms per load.
+- `wait_time = 0` executes already-queued zero-delay tasks without blocking,
+  but never waits for delayed timers or in-flight transfers.
+- Loopback-server tests must make server threads exit-able (close the listening
+  socket from the test body) so a missing connection fails the assertion
+  instead of hanging `join()`.
+- Timing-sensitive additions should survive `./build/pagecore_tests` repeated
+  10-20 times and a `-DPAGECORE_SANITIZE=address,undefined` build, which runs
+  everything slower.
+
 ## WPT Smoke Subset
 
 `pagecore_wpt_smoke` runs a small offline WPT-style corpus from `tests/wpt`.

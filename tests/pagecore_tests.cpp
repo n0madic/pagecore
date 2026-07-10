@@ -1,5 +1,8 @@
+#include "async_loader.hpp"
 #include "base64_codec.hpp"
 #include "css_scan.hpp"
+#include "curl_async_loader.hpp"
+#include "event_loop.hpp"
 #include "page_activity_tracker.hpp"
 #include "script_type.hpp"
 #include "util.hpp"
@@ -31,6 +34,8 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -957,35 +962,61 @@ void test_wrapper_cache_prunes_only_on_forget()
 
 void test_timer_wait_budget()
 {
-    pagecore::LoadOptions options;
-    options.wait_until = pagecore::WaitUntil::Load;
-    options.wait_time = std::chrono::milliseconds(5);
+    // Real-time semantics: run_until_idle waits (wall-clock) up to wait_time
+    // for pending timers; a timer far beyond the budget stays pending.
+    {
+        pagecore::LoadOptions options;
+        options.wait_until = pagecore::WaitUntil::Load;
+        options.wait_time = std::chrono::milliseconds(0);
 
-    pagecore::Page page(options);
-    page.load_html(R"HTML(
+        pagecore::Page page(options);
+        page.load_html(R"HTML(
 <html><body>
   <div id="timer"></div>
   <script>
-    setTimeout(() => document.getElementById('timer').setAttribute('data-fired', 'yes'), 10);
+    setTimeout(() => document.getElementById('timer').setAttribute('data-fired', 'yes'), 5000);
   </script>
 </body></html>
 )HTML");
 
-    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
-            "wait-until=load should not run timer callbacks during load");
+        page.run_until_idle();
+        require(!page.outer_html("#timer[data-fired='yes']").has_value(),
+                "a zero wait budget must not wait for a delayed timer");
+    }
 
-    page.run_until_idle();
-    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
-            "timer should not fire before the configured wait budget");
+    {
+        pagecore::LoadOptions options;
+        options.wait_until = pagecore::WaitUntil::Load;
+        options.wait_time = std::chrono::milliseconds(200);
 
-    page.run_until_idle();
-    require(page.outer_html("#timer[data-fired='yes']").has_value(),
-            "timer should fire after enough wait budget has been advanced");
+        pagecore::Page page(options);
+        page.load_html(R"HTML(
+<html><body>
+  <div id="timer"></div>
+  <script>
+    setTimeout(() => document.getElementById('timer').setAttribute('data-fired', 'yes'), 20);
+    setTimeout(() => document.getElementById('timer').setAttribute('data-late', 'yes'), 10000);
+  </script>
+</body></html>
+)HTML");
+
+        require(!page.outer_html("#timer[data-fired='yes']").has_value(),
+                "wait-until=load should not run timer callbacks during load");
+
+        page.run_until_idle();
+        require(page.outer_html("#timer[data-fired='yes']").has_value(),
+                "a 20ms timer should fire within a 200ms wait budget");
+        require(!page.outer_html("#timer[data-late='yes']").has_value(),
+                "a 10s timer must stay pending after the wait budget is exhausted");
+    }
 }
 
-void test_zero_wait_does_not_run_timer_callbacks()
+void test_zero_wait_runs_ready_tasks_but_keeps_timers_pending()
 {
+    // wait_time=0 executes tasks that are ALREADY queued (0-delay) without
+    // blocking, but never waits for delayed timers.
     pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Load;
     options.wait_time = std::chrono::milliseconds(0);
 
     pagecore::Page page(options);
@@ -995,6 +1026,12 @@ void test_zero_wait_does_not_run_timer_callbacks()
   <script>
     document.getElementById('timer').setAttribute('data-sync', 'yes');
     setTimeout(() => document.getElementById('timer').setAttribute('data-fired', 'yes'), 0);
+    setTimeout(() => document.getElementById('timer').setAttribute('data-late', 'yes'), 100);
+    // Regression: a finite delay far beyond uint64 range must clamp
+    // (browser-style INT32_MAX ms), not hit undefined behavior in the
+    // double->uint64 cast. (Infinity/NaN normalize to 0 in the shim and
+    // never reach the cast.)
+    setTimeout(() => document.getElementById('timer').setAttribute('data-huge', 'yes'), 1e30);
   </script>
 </body></html>
 )HTML");
@@ -1005,16 +1042,20 @@ void test_zero_wait_does_not_run_timer_callbacks()
             "wait_time=0 must not run zero-delay timer callbacks during load");
 
     page.run_until_idle();
-    require(!page.outer_html("#timer[data-fired='yes']").has_value(),
-            "wait_time=0 run_until_idle must keep timer callbacks pending");
+    require(page.outer_html("#timer[data-fired='yes']").has_value(),
+            "wait_time=0 run_until_idle must execute already-ready zero-delay tasks");
+    require(!page.outer_html("#timer[data-late='yes']").has_value(),
+            "wait_time=0 run_until_idle must keep delayed timers pending");
+    require(!page.outer_html("#timer[data-huge='yes']").has_value(),
+            "an absurdly large timer delay must clamp and stay pending, not misfire");
 }
 
-void test_run_until_idle_logs_throwing_event_loop_snapshot()
+void test_run_until_idle_logs_throwing_task_hook()
 {
     std::vector<std::pair<std::string, std::string>> console_logs;
     pagecore::LoadOptions options;
     options.wait_until = pagecore::WaitUntil::Load;
-    options.wait_time = std::chrono::milliseconds(10);
+    options.wait_time = std::chrono::milliseconds(100);
     options.console_log = [&](std::string_view severity, std::string_view message) {
         console_logs.emplace_back(severity, message);
     };
@@ -1022,8 +1063,17 @@ void test_run_until_idle_logs_throwing_event_loop_snapshot()
     pagecore::Page page(options);
     page.load_html("<html><body></body></html>");
     page.eval(R"JS(
-      window.__pagecore_event_loop_snapshot = () => { throw new Error('snapshot boom'); };
+      const originalRunTask = window.__pagecore_run_task;
+      let boomed = false;
+      window.__pagecore_run_task = (id) => {
+        if (!boomed) {
+          boomed = true;
+          throw new Error('task hook boom');
+        }
+        return originalRunTask(id);
+      };
       setTimeout(() => document.body.setAttribute('data-timer', 'ran'), 0);
+      setTimeout(() => document.body.setAttribute('data-timer-late', 'ran'), 1);
     )JS");
 
     bool threw = false;
@@ -1033,12 +1083,15 @@ void test_run_until_idle_logs_throwing_event_loop_snapshot()
         threw = true;
     }
 
-    require(!threw, "run_until_idle should log throwing event-loop snapshot hooks instead of propagating");
+    require(!threw, "run_until_idle should log a throwing task hook instead of propagating");
     require(
         std::any_of(console_logs.begin(), console_logs.end(), [](const auto& entry) {
-            return entry.first == "error" && entry.second.find("snapshot boom") != std::string::npos;
+            return entry.first == "error" && entry.second.find("task hook boom") != std::string::npos;
         }),
-        "run_until_idle should report event-loop snapshot exceptions through console_log");
+        "run_until_idle should report task hook exceptions through console_log");
+    require(
+        page.outer_html("body[data-timer-late='ran']").has_value(),
+        "the event loop should keep running tasks after a throwing task hook");
 }
 
 void test_event_loop_ordering_contract()
@@ -2856,11 +2909,14 @@ void test_shared_cookie_jar_document_scripts_fetch_and_xhr()
         document.body.setAttribute('data-final-cookie', document.cookie);
       };
       xhr.send();
-    });
 
-    const dynamic = document.createElement('script');
-    dynamic.src = '/dynamic.js';
-    document.head.appendChild(dynamic);
+      // Insert the dynamic script only after the fetch has completed: requests
+      // snapshot cookies when the transfer STARTS (like a browser), so a script
+      // inserted while /api is still in flight would not see its Set-Cookie.
+      const dynamic = document.createElement('script');
+      dynamic.src = '/dynamic.js';
+      document.head.appendChild(dynamic);
+    });
   </script>
 </body></html>
 )HTML",
@@ -3978,17 +4034,19 @@ void test_js_resource_budgets_limit_count_bytes_and_time()
 
         pagecore::Page page(options);
         page.set_resource_loader(loader);
+        // The second fetch starts only after the first completes: byte budgets
+        // are recorded at completion, so concurrently STARTED transfers are
+        // bounded by the count budget and connection caps, not by bytes.
         page.load_html(R"HTML(
 <html><body>
   <script>
     fetch('/a.json').then(
       () => document.body.setAttribute('data-a', 'loaded'),
       () => document.body.setAttribute('data-a', 'blocked')
-    );
-    fetch('/b.json').then(
+    ).then(() => fetch('/b.json').then(
       () => document.body.setAttribute('data-b', 'loaded'),
       () => document.body.setAttribute('data-b', 'blocked')
-    );
+    ));
   </script>
 </body></html>
 )HTML", "https://example.test/index.html");
@@ -4100,7 +4158,7 @@ void test_non_javascript_script_types_are_not_executed()
             "non-JavaScript script types should be skipped instead of parsed by QuickJS");
 }
 
-void test_static_classic_async_defer_scripts_use_pagecore_dom_order()
+void test_static_classic_async_defer_scripts_follow_spec_order()
 {
     auto loader = std::make_shared<RecordingResourceLoader>();
     loader->add(
@@ -4128,15 +4186,70 @@ void test_static_classic_async_defer_scripts_use_pagecore_dom_order()
 </body></html>
 )HTML", "https://example.test/index.html");
 
-    require(page.eval("window.__staticOrder") == "1AD4",
-            "static classic async/defer scripts should follow PageCore DOM-order execution");
+    // Spec semantics: inline scripts run during parsing ('1','4'), the async
+    // script runs when its (memory-loader) completion task lands, the deferred
+    // script runs after parsing and before DOMContentLoaded. With the
+    // deterministic task queue the async completion (queued first) precedes
+    // the deferred execution: "14AD".
+    require(page.eval("window.__staticOrder") == "14AD",
+            "async runs off parse order; defer runs after parsing (spec order)");
     require(
-        page.outer_html("body[data-static-order-at-dcl='1AD4']").has_value(),
-        "DOMContentLoaded should fire after PageCore static script execution");
+        page.outer_html("body[data-static-order-at-dcl='14AD']").has_value(),
+        "DOMContentLoaded should fire after deferred scripts");
     require(has_request_kind(*loader, "https://example.test/async.js", pagecore::ResourceKind::Script),
             "static async classic script should still load as a script resource");
     require(has_request_kind(*loader, "https://example.test/defer.js", pagecore::ResourceKind::Script),
             "static defer classic script should still load as a script resource");
+}
+
+void test_defer_scripts_run_in_order_before_dcl_and_async_holds_load()
+{
+    auto loader = std::make_shared<RecordingResourceLoader>();
+    loader->add(
+        "https://example.test/defer-one.js",
+        "window.__deferOrder = (window.__deferOrder || '') + '1';"
+        "window.__readyAtDefer1 = document.readyState;",
+        "text/javascript");
+    loader->add(
+        "https://example.test/defer-two.js",
+        "window.__deferOrder = (window.__deferOrder || '') + '2';",
+        "text/javascript");
+    loader->add(
+        "https://example.test/async-late.js",
+        "window.__asyncRan = document.readyState;",
+        "text/javascript");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_html(R"HTML(
+<html><body>
+  <script defer src="/defer-one.js"></script>
+  <script async src="/async-late.js"></script>
+  <script defer src="/defer-two.js"></script>
+  <script>
+    window.__deferAtParse = window.__deferOrder || '';
+    document.addEventListener('DOMContentLoaded', () => {
+      document.body.setAttribute('data-defer-at-dcl', window.__deferOrder || '');
+    });
+    window.addEventListener('load', () => {
+      document.body.setAttribute('data-async-at-load', window.__asyncRan || 'missing');
+    });
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.eval("window.__deferAtParse") == "",
+            "deferred scripts must not run during parsing");
+    require(page.eval("window.__deferOrder") == "12",
+            "deferred scripts should run in document order");
+    require(page.outer_html("body[data-defer-at-dcl='12']").has_value(),
+            "DOMContentLoaded should fire after all deferred scripts ran");
+    require(page.eval("window.__readyAtDefer1") == "loading",
+            "deferred scripts should run before readyState leaves 'loading'");
+    // The async script fetched+executed before the load event fired.
+    const auto async_at_load = page.eval("document.body.getAttribute('data-async-at-load')");
+    require(async_at_load == "loading" || async_at_load == "interactive",
+            "the window load event should wait for parser-inserted async scripts");
 }
 
 void test_dynamic_script_insertion_executes_classic_scripts()
@@ -5102,6 +5215,545 @@ void test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths()
     }
 }
 #endif
+
+// Pumps the event loop (uv + one task per turn) until `done` holds or the
+// wall-clock budget expires. Returns whether `done` was reached.
+bool pump_event_loop_until(
+    pagecore::EventLoop& loop,
+    const std::function<bool()>& done,
+    std::chrono::milliseconds budget)
+{
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (!done()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        loop.poll();
+        if (loop.run_one_task()) {
+            continue;
+        }
+        loop.wait_for_activity(std::chrono::milliseconds(20));
+    }
+    return true;
+}
+
+void test_async_loader_data_and_file_urls()
+{
+    pagecore::EventLoop loop;
+    pagecore::ResourcePolicy policy;
+    auto loader = std::make_shared<pagecore::CurlResourceLoader>("pagecore-async-test", policy);
+    pagecore::CurlMultiAsyncLoader async_loader(loop, loader, "pagecore-async-test");
+
+    std::optional<pagecore::AsyncLoadResult> data_result;
+    async_loader.start(
+        pagecore::ResourceRequest{"data:text/plain,hello-async"},
+        [&](pagecore::AsyncLoadResult result) { data_result = std::move(result); });
+    require(!data_result.has_value(),
+            "async data: completion must be delivered as a queued task, not re-entrantly");
+
+    const std::string file_path = std::string(PAGECORE_BINARY_DIR) + "/async_loader_test.txt";
+    {
+        std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+        out << "file-async-body";
+    }
+    std::optional<pagecore::AsyncLoadResult> file_result;
+    async_loader.start(
+        pagecore::ResourceRequest{"file://" + file_path},
+        [&](pagecore::AsyncLoadResult result) { file_result = std::move(result); });
+
+    std::optional<pagecore::AsyncLoadResult> error_result;
+    async_loader.start(
+        pagecore::ResourceRequest{"file://" + file_path + ".does-not-exist"},
+        [&](pagecore::AsyncLoadResult result) { error_result = std::move(result); });
+
+    require(
+        pump_event_loop_until(
+            loop,
+            [&] { return data_result && file_result && error_result; },
+            std::chrono::milliseconds(2000)),
+        "async data:/file: loads should complete promptly");
+
+    require(!data_result->error && data_result->response.body == "hello-async"
+                && data_result->response.mime_type == "text/plain",
+            "async data: URL should decode through the async engine");
+    require(!file_result->error && file_result->response.body == "file-async-body",
+            "async file: URL should read through the async engine");
+    require(static_cast<bool>(error_result->error),
+            "a missing file should surface as an async error");
+
+    // A synchronous policy violation throws from start() (JS converts it into
+    // an async rejection).
+    bool threw = false;
+    try {
+        async_loader.start(
+            pagecore::ResourceRequest{"gopher://example.test/x"},
+            [](pagecore::AsyncLoadResult) {});
+    } catch (const pagecore::ResourceError&) {
+        threw = true;
+    }
+    require(threw, "a disallowed scheme should throw synchronously from start()");
+
+    // Regression: cancel() must also drop non-network (data:/file:) loads,
+    // whose completion is a queued task rather than a curl transfer.
+    bool cancelled_completed = false;
+    const std::uint64_t cancel_id = async_loader.start(
+        pagecore::ResourceRequest{"data:text/plain,cancelled"},
+        [&](pagecore::AsyncLoadResult) { cancelled_completed = true; });
+    async_loader.cancel(cancel_id);
+    (void) pump_event_loop_until(loop, [] { return false; }, std::chrono::milliseconds(50));
+    require(!cancelled_completed,
+            "a cancelled data: load must not deliver its completion");
+}
+
+#if !defined(_WIN32)
+void test_async_loader_http_transfer_and_cancel()
+{
+    const BoundTestServer bound = bind_loopback_test_server(4, "async http");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
+
+    // Serves two ordinary requests; further connections (the cancelled and the
+    // abandoned transfer) are accepted but never answered. The stuck sockets
+    // stay open until after the client-side assertions (closing them earlier
+    // would complete the "abandoned" transfer with a transport error).
+    std::vector<int> stuck_clients;
+    std::thread server([server_fd, &stuck_clients] {
+        for (int i = 0; i < 4; ++i) {
+            const int client = ::accept(server_fd, nullptr, nullptr);
+            if (client < 0) {
+                break;
+            }
+            std::string request;
+            std::array<char, 2048> buffer{};
+            while (request.find("\r\n\r\n") == std::string::npos) {
+                const ssize_t n = ::recv(client, buffer.data(), buffer.size(), 0);
+                if (n <= 0) {
+                    break;
+                }
+                request.append(buffer.data(), static_cast<std::size_t>(n));
+            }
+            if (request.find("GET /slow") != std::string::npos) {
+                // Leave the connection open without responding.
+                stuck_clients.push_back(client);
+                continue;
+            }
+            const std::string body = request.find("GET /a") != std::string::npos ? "alpha" : "beta";
+            const std::string response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                "Connection: close\r\n"
+                "\r\n" + body;
+            (void) ::send(client, response.data(), response.size(), 0);
+            ::close(client);
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::EventLoop loop;
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        auto loader = std::make_shared<pagecore::CurlResourceLoader>("pagecore-async-test", policy);
+        const std::string base = "http://127.0.0.1:" + std::to_string(port);
+
+        {
+            pagecore::CurlMultiAsyncLoader async_loader(loop, loader, "pagecore-async-test");
+
+            std::optional<pagecore::AsyncLoadResult> result_a;
+            std::optional<pagecore::AsyncLoadResult> result_b;
+            async_loader.start(
+                pagecore::ResourceRequest{base + "/a"},
+                [&](pagecore::AsyncLoadResult result) { result_a = std::move(result); });
+            async_loader.start(
+                pagecore::ResourceRequest{base + "/b"},
+                [&](pagecore::AsyncLoadResult result) { result_b = std::move(result); });
+            require(loop.external_work() == 2, "in-flight transfers should register as external work");
+
+            require(
+                pump_event_loop_until(
+                    loop,
+                    [&] { return result_a && result_b; },
+                    std::chrono::milliseconds(10000)),
+                "concurrent async HTTP transfers should complete");
+            require(!result_a->error && result_a->response.status == 200 && result_a->response.body == "alpha",
+                    "first async HTTP transfer should succeed");
+            require(!result_b->error && result_b->response.status == 200 && result_b->response.body == "beta",
+                    "second async HTTP transfer should succeed");
+            require(loop.external_work() == 0, "completed transfers should release external work");
+
+            // Cancel mid-transfer: the completion callback must never fire.
+            bool cancelled_completed = false;
+            const std::uint64_t cancel_id = async_loader.start(
+                pagecore::ResourceRequest{base + "/slow-cancel"},
+                [&](pagecore::AsyncLoadResult) { cancelled_completed = true; });
+            (void) pump_event_loop_until(loop, [] { return false; }, std::chrono::milliseconds(50));
+            async_loader.cancel(cancel_id);
+            require(loop.external_work() == 0, "cancel should release the transfer's external work");
+            (void) pump_event_loop_until(loop, [] { return false; }, std::chrono::milliseconds(50));
+            require(!cancelled_completed, "a cancelled transfer must not deliver a completion");
+
+            // Leave one transfer in flight; destroying the loader (and then the
+            // loop) with it pending must neither hang nor crash.
+            bool abandoned_completed = false;
+            async_loader.start(
+                pagecore::ResourceRequest{base + "/slow-abandon"},
+                [&](pagecore::AsyncLoadResult) { abandoned_completed = true; });
+            (void) pump_event_loop_until(loop, [] { return false; }, std::chrono::milliseconds(50));
+            async_loader.shutdown();
+            require(!abandoned_completed, "teardown with an in-flight transfer must not run its callback");
+        }
+        loop.shutdown();
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        for (const int client : stuck_clients) {
+            ::close(client);
+        }
+        throw;
+    }
+
+    if (server.joinable()) {
+        server.join();
+    }
+    for (const int client : stuck_clients) {
+        ::close(client);
+    }
+}
+#endif
+
+#if !defined(_WIN32)
+// End-to-end proof that page fetch() is truly asynchronous on the curl engine:
+// a slow transfer must not block a fast one or delay timers.
+void test_page_fetch_truly_async_over_http()
+{
+    const BoundTestServer bound = bind_loopback_test_server(4, "async page fetch");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
+
+    // Concurrent server: one thread per connection so /slow does not serialize
+    // /fast behind it.
+    std::thread server([server_fd] {
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 2; ++i) {
+            const int client = ::accept(server_fd, nullptr, nullptr);
+            if (client < 0) {
+                break;
+            }
+            workers.emplace_back([client] {
+                std::string request;
+                std::array<char, 2048> buffer{};
+                while (request.find("\r\n\r\n") == std::string::npos) {
+                    const ssize_t n = ::recv(client, buffer.data(), buffer.size(), 0);
+                    if (n <= 0) {
+                        break;
+                    }
+                    request.append(buffer.data(), static_cast<std::size_t>(n));
+                }
+                const bool slow = request.find("GET /slow") != std::string::npos;
+                if (slow) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                }
+                const std::string body = slow ? "slow" : "fast";
+                const std::string response =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                    "Connection: close\r\n"
+                    "\r\n" + body;
+                (void) ::send(client, response.data(), response.size(), 0);
+                ::close(client);
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        ::close(server_fd);
+    });
+
+    try {
+        pagecore::ResourcePolicy policy;
+        policy.block_private_hosts = false;
+        auto curl_loader = std::make_shared<pagecore::CurlResourceLoader>("pagecore-test", policy);
+
+        pagecore::LoadOptions options;
+        options.wait_until = pagecore::WaitUntil::Ready;
+        options.wait_time = std::chrono::milliseconds(10000);
+        options.stable_window = std::chrono::milliseconds(5);
+
+        pagecore::Page page(options);
+        page.set_resource_loader(curl_loader);
+        page.load_html(R"HTML(
+<html><body>
+  <script>
+    const order = [];
+    const check = () => {
+      if (order.length === 3) document.body.setAttribute('data-order', order.join(','));
+    };
+    fetch('/slow').then((r) => r.text()).then((t) => { order.push(t); check(); });
+    fetch('/fast').then((r) => r.text()).then((t) => { order.push(t); check(); });
+    setTimeout(() => { order.push('timer'); check(); }, 30);
+  </script>
+</body></html>
+)HTML", "http://127.0.0.1:" + std::to_string(port) + "/index.html");
+
+        // The 150ms transfer (started FIRST) must not block the instant fetch
+        // or the 30ms timer: everything completes, and 'slow' lands last. The
+        // relative order of 'fast' vs 'timer' is a network-vs-timer race and
+        // deliberately not asserted.
+        const std::string order = page.eval("document.body.getAttribute('data-order') || ''");
+        require(order == "fast,timer,slow" || order == "timer,fast,slow",
+                "a slow fetch must not block a fast fetch or a timer (truly async transfers); got: " + order);
+    } catch (...) {
+        if (server.joinable()) {
+            server.join();
+        }
+        throw;
+    }
+    if (server.joinable()) {
+        server.join();
+    }
+}
+
+void test_page_fetch_abort_and_teardown_with_inflight_transfer()
+{
+    const BoundTestServer bound = bind_loopback_test_server(4, "abort/teardown fetch");
+    const int server_fd = bound.fd;
+    const int port = bound.port;
+
+    // Accepts connections and never responds; sockets stay open until the end
+    // of the test. The loop ends when the listening socket is closed by the
+    // main thread (accept then fails), so a missing connection can never hang
+    // the test in join().
+    std::vector<int> stuck_clients;
+    std::mutex stuck_mutex;
+    std::thread server([server_fd, &stuck_clients, &stuck_mutex] {
+        for (;;) {
+            const int client = ::accept(server_fd, nullptr, nullptr);
+            if (client < 0) {
+                break;
+            }
+            std::lock_guard<std::mutex> lock(stuck_mutex);
+            stuck_clients.push_back(client);
+        }
+    });
+    auto finish_server = [&] {
+        // Shut down the listener; accept() in the server thread fails and the
+        // thread exits.
+        ::shutdown(server_fd, SHUT_RDWR);
+        ::close(server_fd);
+        if (server.joinable()) {
+            server.join();
+        }
+        std::lock_guard<std::mutex> lock(stuck_mutex);
+        for (const int client : stuck_clients) {
+            ::close(client);
+        }
+        stuck_clients.clear();
+    };
+
+    const std::string base = "http://127.0.0.1:" + std::to_string(port);
+    pagecore::ResourcePolicy policy;
+    policy.block_private_hosts = false;
+
+    try {
+        // Abort mid-transfer: the fetch rejects with AbortError and readiness
+        // completes (the cancelled transfer no longer holds the loop busy).
+        {
+            auto curl_loader = std::make_shared<pagecore::CurlResourceLoader>("pagecore-test", policy);
+            pagecore::LoadOptions options;
+            options.wait_until = pagecore::WaitUntil::Ready;
+            options.wait_time = std::chrono::milliseconds(10000);
+            options.stable_window = std::chrono::milliseconds(5);
+
+            pagecore::Page page(options);
+            page.set_resource_loader(curl_loader);
+            page.load_html(R"HTML(
+<html><body>
+  <script>
+    const controller = new AbortController();
+    fetch('/stuck-abort', { signal: controller.signal }).then(
+      () => document.body.setAttribute('data-abort', 'resolved'),
+      (error) => document.body.setAttribute('data-abort', error && error.name === 'AbortError' ? 'aborted' : 'other'));
+    setTimeout(() => controller.abort(), 30);
+  </script>
+</body></html>
+)HTML", base + "/index.html");
+
+            require(page.outer_html("body[data-abort='aborted']").has_value(),
+                    "aborting a fetch mid-transfer should reject with AbortError and unblock readiness");
+        }
+
+        // Teardown with an in-flight transfer: destroying the page while the
+        // server never answers must neither hang nor crash.
+        {
+            auto curl_loader = std::make_shared<pagecore::CurlResourceLoader>("pagecore-test", policy);
+            pagecore::LoadOptions options;
+            options.wait_until = pagecore::WaitUntil::Load;
+            options.wait_time = std::chrono::milliseconds(0);
+
+            pagecore::Page page(options);
+            page.set_resource_loader(curl_loader);
+            page.load_html(R"HTML(
+<html><body>
+  <script>
+    fetch('/stuck-teardown').then(() => {}, () => {});
+  </script>
+</body></html>
+)HTML", base + "/index.html");
+            // Give the transfer a moment to actually connect, then let `page`
+            // go out of scope with the transfer still pending.
+            page.run_until_ready(pagecore::PageReadinessOptions{
+                pagecore::WaitUntil::NetworkIdle,
+                std::chrono::milliseconds(50),
+                std::chrono::milliseconds(0),
+            });
+        }
+    } catch (...) {
+        finish_server();
+        throw;
+    }
+
+    finish_server();
+}
+#endif
+
+void test_request_animation_frame_real_frames()
+{
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Ready;
+    options.wait_time = std::chrono::milliseconds(5000);
+    // Generous stability window: the first ~16ms frame must land inside it
+    // even on slow (sanitizer) runs, so the frame chain provably runs before
+    // readiness completes.
+    options.stable_window = std::chrono::milliseconds(150);
+
+    pagecore::Page page(options);
+    const auto load_start = std::chrono::steady_clock::now();
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    window.__frames = [];
+    const cancelled = requestAnimationFrame(() => { window.__cancelledRan = true; });
+    cancelAnimationFrame(cancelled);
+    // Each frame mutates the DOM: rAF alone never blocks readiness, but its
+    // DOM mutations extend the stability window, so both frames run before
+    // the page is considered ready.
+    requestAnimationFrame((t1) => {
+      window.__frames.push(t1);
+      document.body.setAttribute('data-frame-one', 'done');
+      requestAnimationFrame((t2) => {
+        window.__frames.push(t2);
+        document.body.setAttribute('data-frames', 'done');
+      });
+    });
+    // performance.now() monotonicity across a real timer.
+    window.__now1 = performance.now();
+    setTimeout(() => { window.__now2 = performance.now(); }, 10);
+    // Anchor the stability window to the end of this script.
+    document.body.setAttribute('data-parsed', 'yes');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+    const auto load_elapsed = std::chrono::steady_clock::now() - load_start;
+
+    require(page.outer_html("body[data-frames='done']").has_value(),
+            "two chained animation frames should run during a ready wait");
+    require(page.eval("window.__cancelledRan === undefined") == "true",
+            "a cancelled animation frame callback must not run");
+    require(page.eval("window.__frames.length === 2 && window.__frames[0] > 0") == "true",
+            "animation frame timestamps should be positive");
+    require(page.eval("window.__frames[1] > window.__frames[0]") == "true",
+            "animation frame timestamps should be monotonic");
+    // Two consecutive frames should be roughly one frame interval apart
+    // (>=10ms allows scheduler slack around the 16ms cadence).
+    require(page.eval("(window.__frames[1] - window.__frames[0]) >= 10") == "true",
+            "consecutive animation frames should be ~16ms apart");
+    require(page.eval("window.__now2 > window.__now1") == "true",
+            "performance.now() should be monotonic across real timers");
+    // rAF alone must not hold readiness open for the whole wait budget.
+    require(load_elapsed < std::chrono::milliseconds(3000),
+            "animation frames alone must not hold run_until_ready open");
+}
+
+void test_animation_frame_loop_does_not_block_idle_or_ready()
+{
+    pagecore::LoadOptions options;
+    options.wait_until = pagecore::WaitUntil::Ready;
+    options.wait_time = std::chrono::milliseconds(4000);
+    // Wide enough for the ~16ms frames to land inside it on slow runs.
+    options.stable_window = std::chrono::milliseconds(150);
+
+    pagecore::Page page(options);
+    const auto load_start = std::chrono::steady_clock::now();
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    // A self-perpetuating rAF loop. The first three frames mutate the DOM
+    // (each mutation extends the stability window, so they are guaranteed to
+    // run before readiness); after that the loop keeps scheduling frames
+    // without mutating, and readiness must complete without waiting out the
+    // whole budget.
+    window.__frameCount = 0;
+    const tick = () => {
+      window.__frameCount++;
+      if (window.__frameCount <= 3) document.body.setAttribute('data-ticks', window.__frameCount);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    // Anchor the stability window to the end of this script.
+    document.body.setAttribute('data-parsed', 'yes');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+    const auto load_elapsed = std::chrono::steady_clock::now() - load_start;
+
+    require(load_elapsed < std::chrono::milliseconds(3000),
+            "a non-mutating rAF loop must not hold readiness open for the whole budget");
+    require(page.eval("window.__frameCount >= 3") == "true",
+            "DOM-mutating frames should all run before readiness completes");
+
+    // run_until_idle with a wait budget must also terminate: pending frames
+    // never count as pending work for idleness.
+    const auto idle_start = std::chrono::steady_clock::now();
+    page.run_until_idle();
+    require(std::chrono::steady_clock::now() - idle_start < std::chrono::milliseconds(3000),
+            "a rAF loop must not keep run_until_idle spinning for the whole budget");
+}
+
+void test_task_queue_async_loader_wraps_blocking_loader()
+{
+    pagecore::EventLoop loop;
+    auto memory = std::make_shared<pagecore::MemoryResourceLoader>();
+    memory->add("https://example.test/data.json", "{\"ok\":true}", "application/json");
+
+    pagecore::TaskQueueAsyncLoader async_loader(loop, memory);
+
+    std::optional<pagecore::AsyncLoadResult> hit;
+    std::optional<pagecore::AsyncLoadResult> miss;
+    async_loader.start(
+        pagecore::ResourceRequest{"https://example.test/data.json"},
+        [&](pagecore::AsyncLoadResult result) { hit = std::move(result); });
+    async_loader.start(
+        pagecore::ResourceRequest{"https://example.test/missing.json"},
+        [&](pagecore::AsyncLoadResult result) { miss = std::move(result); });
+
+    bool cancelled_completed = false;
+    const std::uint64_t cancel_id = async_loader.start(
+        pagecore::ResourceRequest{"https://example.test/data.json"},
+        [&](pagecore::AsyncLoadResult) { cancelled_completed = true; });
+    async_loader.cancel(cancel_id);
+
+    require(!hit.has_value(), "blocking-loader completions must be queued, not delivered from start()");
+    require(
+        pump_event_loop_until(loop, [&] { return hit && miss; }, std::chrono::milliseconds(2000)),
+        "task-queue async loads should complete");
+    require(!hit->error && hit->response.body == "{\"ok\":true}",
+            "task-queue async loader should deliver the blocking loader's response");
+    require(static_cast<bool>(miss->error), "a missing memory resource should surface as an async error");
+    require(!cancelled_completed, "a cancelled task-queue load must not deliver a completion");
+}
 
 void test_caching_loader_bounds_and_skips_errors()
 {
@@ -9570,13 +10222,8 @@ void test_perf_trace_records_document_and_initial_script_resources()
         "document load trace should report the effective URL");
     require(document_load->count > 0, "document load trace should report loaded bytes");
 
-    auto script_batch = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
-        return event.phase == pagecore::PerfPhase::ResourceLoad && event.name == "initial_script_load_all";
-    });
-    require(script_batch != events.end(), "perf trace should record the initial script batch load");
-    require(script_batch->property == "script", "initial script batch trace should identify script resources");
-    require(script_batch->count > 0, "initial script batch trace should report loaded bytes");
-
+    // Parser scripts fetch through the async engine now: there is no batched
+    // "initial_script_load_all" phase anymore, only per-response events.
     auto script_response = std::find_if(events.begin(), events.end(), [](const pagecore::PerfEvent& event) {
         return event.phase == pagecore::PerfPhase::ResourceLoad
             && event.name == "initial_script_response"
@@ -11595,8 +12242,8 @@ int main()
         test_inner_html_invalidates_stale_wrappers();
         test_wrapper_cache_prunes_only_on_forget();
         test_timer_wait_budget();
-        test_zero_wait_does_not_run_timer_callbacks();
-        test_run_until_idle_logs_throwing_event_loop_snapshot();
+        test_zero_wait_runs_ready_tasks_but_keeps_timers_pending();
+        test_run_until_idle_logs_throwing_task_hook();
         test_event_loop_ordering_contract();
         test_browser_like_web_api_shims();
         test_media_query_list_event_target_shims();
@@ -11670,7 +12317,8 @@ int main()
         test_js_resource_budgets_limit_count_bytes_and_time();
         test_xhr_event_handler_exceptions_are_reported();
         test_non_javascript_script_types_are_not_executed();
-        test_static_classic_async_defer_scripts_use_pagecore_dom_order();
+        test_static_classic_async_defer_scripts_follow_spec_order();
+        test_defer_scripts_run_in_order_before_dcl_and_async_holds_load();
         test_dynamic_script_insertion_executes_classic_scripts();
         test_dynamic_module_scripts_are_not_executed();
         test_resource_request_kind_and_cache();
@@ -11690,6 +12338,15 @@ int main()
         test_curl_loader_sends_request_cookie_across_same_host_redirect();
         test_curl_loader_sends_user_agent_and_sanitized_referer_on_network_paths();
 #endif
+        test_async_loader_data_and_file_urls();
+#if !defined(_WIN32)
+        test_async_loader_http_transfer_and_cancel();
+        test_page_fetch_truly_async_over_http();
+        test_page_fetch_abort_and_teardown_with_inflight_transfer();
+#endif
+        test_task_queue_async_loader_wraps_blocking_loader();
+        test_request_animation_frame_real_frames();
+        test_animation_frame_loop_does_not_block_idle_or_ready();
         test_caching_loader_bounds_and_skips_errors();
         test_resource_load_all_returns_in_order();
         test_resource_load_all_lenient_tolerates_failures();

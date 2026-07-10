@@ -17,7 +17,12 @@ layout geometry, without shipping a full browser.
   environment: `window`, `document`, `Node`/`Element`/`HTMLElement`, events,
   timers, forms and constraint validation, `fetch`/XHR, `URL`/`URLSearchParams`,
   CSSOM, streams, and `crypto` backed by the OS CSPRNG. Classic and ES-module
-  scripts are supported.
+  scripts are supported, including parser `async`/`defer` semantics.
+- **A real event loop.** Each page runs a libuv-backed event loop: real
+  wall-clock timers, truly asynchronous `fetch`/XHR/dynamic-script transfers
+  multiplexed through `curl_multi`, and `requestAnimationFrame` on a ~16ms
+  frame cadence. A slow response never blocks other transfers, timers, or
+  script execution.
 - **Rendering to PNG and PDF.** CSS layout via litehtml is rasterized through
   Cairo/PangoCairo with real font selection, shaping, and anti-aliased text.
   Supports background images (size/position/repeat), linear gradients,
@@ -86,14 +91,15 @@ Rendering (enabled by default):
 
 CMake resolves these through pkg-config and links static archives when a `.a` is
 available, falling back to shared libraries otherwise. Dependencies fetched from
-GitHub (Lexbor, QuickJS-NG, litehtml, woff2, lunasvg) are pinned to specific
-commits; if the build host cannot reach GitHub, pre-clone them and point CMake at
-the copies:
+GitHub (Lexbor, QuickJS-NG, libuv, litehtml, woff2, lunasvg) are pinned to
+specific commits/tags; if the build host cannot reach GitHub, pre-clone them and
+point CMake at the copies:
 
 ```sh
 cmake -S . -B build \
   -DFETCHCONTENT_SOURCE_DIR_LEXBOR=/path/to/lexbor \
   -DFETCHCONTENT_SOURCE_DIR_QUICKJS_NG=/path/to/quickjs \
+  -DFETCHCONTENT_SOURCE_DIR_LIBUV=/path/to/libuv \
   -DFETCHCONTENT_SOURCE_DIR_LITEHTML=/path/to/litehtml \
   -DFETCHCONTENT_SOURCE_DIR_WOFF2=/path/to/woff2 \
   -DFETCHCONTENT_SOURCE_DIR_LUNASVG=/path/to/lunasvg

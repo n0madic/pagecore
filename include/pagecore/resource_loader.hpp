@@ -146,6 +146,11 @@ public:
     const ResourcePolicy& policy() const noexcept;
     void set_policy(ResourcePolicy policy);
 
+    // Opaque libcurl share handle (CURLSH*) used for connection/DNS/TLS-session
+    // reuse. Internal plumbing for PageCore's async transfer engine, type-erased
+    // so this header stays curl-free; not part of the stable embedder API.
+    void* share_handle() const noexcept;
+
 private:
     ResourcePolicy snapshot_policy() const;
 
@@ -188,6 +193,13 @@ public:
         BatchErrorMode mode = BatchErrorMode::FailFast) override;
     void clear();
     std::size_t size() const noexcept;
+
+    // Synchronous cache probe / explicit store, keyed identically to load().
+    // Internal plumbing for PageCore's async transfer path (which cannot call
+    // the blocking load()): probe on start, store on completion. store()
+    // follows load()'s rules (error responses are never pinned).
+    std::optional<ResourceResponse> cached(const ResourceRequest& request);
+    void store(const ResourceRequest& request, const ResourceResponse& response);
 
 private:
     // Promote key to the most-recently-used end of order_. Caller holds mutex_.

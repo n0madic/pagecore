@@ -360,8 +360,19 @@ FetchContent_Declare(
     ${PAGECORE_FETCHCONTENT_EXCLUDE_FROM_ALL}
 )
 
+set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    libuv
+    GIT_REPOSITORY https://github.com/libuv/libuv.git
+    GIT_TAG v1.51.0
+    ${PAGECORE_FETCHCONTENT_EXCLUDE_FROM_ALL}
+)
+
 pagecore_fetchcontent_make_available_excluded(lexbor)
 pagecore_fetchcontent_make_available_excluded(quickjs_ng)
+pagecore_fetchcontent_make_available_excluded(libuv)
 
 # zlib is required separately below and linked transitively through CURL::libcurl.
 # Requesting it here as a CURL "component" is fragile: in CONFIG mode
@@ -536,8 +547,10 @@ add_library(pagecore
     src/base64_codec.cpp
     src/cookie_jar.cpp
     src/css_scan.cpp
+    src/curl_async_loader.cpp
     src/display_list_dump.cpp
     src/dom_document.cpp
+    src/event_loop.cpp
     src/image_io.cpp
     src/js_runtime.cpp
     src/page.cpp
@@ -598,6 +611,7 @@ target_link_libraries(pagecore
     PRIVATE
         $<BUILD_INTERFACE:lexbor_static>
         $<BUILD_INTERFACE:qjs>
+        $<BUILD_INTERFACE:uv_a>
         $<BUILD_INTERFACE:CURL::libcurl>
         $<BUILD_INTERFACE:ZLIB::ZLIB>
         $<BUILD_INTERFACE:pagecore_static_pkg_deps>
@@ -605,6 +619,7 @@ target_link_libraries(pagecore
     INTERFACE
         $<INSTALL_INTERFACE:PageCore::lexbor_static>
         $<INSTALL_INTERFACE:PageCore::qjs>
+        $<INSTALL_INTERFACE:PageCore::uv_a>
         $<INSTALL_INTERFACE:CURL::libcurl>
         $<INSTALL_INTERFACE:ZLIB::ZLIB>
         $<INSTALL_INTERFACE:PageCore::pagecore_static_pkg_deps>
@@ -738,7 +753,10 @@ if(PAGECORE_BUILD_TESTS)
             PAGECORE_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}"
     )
     target_include_directories(pagecore_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps pagecore_libpsl_deps)
+    # CURL::libcurl and uv_a are linked directly (not just through pagecore) so
+    # the tests can include the internal async-loader headers, which pull in
+    # <curl/curl.h> and <uv.h>.
+    target_link_libraries(pagecore_tests PRIVATE pagecore pagecore_static_pkg_deps pagecore_libpsl_deps CURL::libcurl uv_a)
     pagecore_apply_warnings(pagecore_tests)
     pagecore_strip_release_binary(pagecore_tests)
     add_test(NAME pagecore_tests COMMAND pagecore_tests)
@@ -891,6 +909,7 @@ set(PAGECORE_INSTALL_CMAKEDIR
 set(PAGECORE_INSTALL_DEPSDIR "${CMAKE_INSTALL_LIBDIR}/pagecore/deps")
 set(PAGECORE_LEXBOR_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}lexbor_static${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(PAGECORE_QJS_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}qjs${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(PAGECORE_UV_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}uv${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(PAGECORE_LITEHTML_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}litehtml${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(PAGECORE_GUMBO_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}gumbo${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(PAGECORE_WOFF2COMMON_STATIC_FILE "${CMAKE_STATIC_LIBRARY_PREFIX}woff2common${CMAKE_STATIC_LIBRARY_SUFFIX}")
@@ -909,6 +928,7 @@ install(
 install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 install(FILES "$<TARGET_FILE:lexbor_static>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_LEXBOR_STATIC_FILE}")
 install(FILES "$<TARGET_FILE:qjs>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_QJS_STATIC_FILE}")
+install(FILES "$<TARGET_FILE:uv_a>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_UV_STATIC_FILE}")
 
 if(PAGECORE_ENABLE_RENDERING)
     install(FILES "$<TARGET_FILE:litehtml>" DESTINATION "${PAGECORE_INSTALL_DEPSDIR}" RENAME "${PAGECORE_LITEHTML_STATIC_FILE}")

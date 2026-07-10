@@ -1,7 +1,9 @@
 #include "js_runtime.hpp"
 
+#include "async_loader.hpp"
 #include "base64_codec.hpp"
 #include "cookie_jar.hpp"
+#include "curl_async_loader.hpp"
 #include "dom_shim.hpp"
 #include "pagecore/resource_loader.hpp"
 
@@ -1099,53 +1101,203 @@ JSValue host_log(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+std::uint64_t task_id_from_js(JSContext* ctx, JSValueConst value)
+{
+    int64_t id = 0;
+    if (JS_ToInt64(ctx, &id, value) < 0 || id < 0) {
+        throw std::runtime_error("expected non-negative numeric task id");
+    }
+    return static_cast<std::uint64_t>(id);
+}
+
+// The host-visible shape of a completed resource load, shared by the blocking
+// loadResource binding and the async completion path.
+JSValue js_resource_response_object(JSContext* ctx, const ResourceResponse& response)
+{
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "url", js_string(ctx, response.url));
+    JS_SetPropertyStr(ctx, out, "body", js_string(ctx, response.body));
+    JS_SetPropertyStr(ctx, out, "mimeType", js_string(ctx, response.mime_type));
+    JS_SetPropertyStr(ctx, out, "kind", js_string(ctx, resource_kind_name(response.kind)));
+    JS_SetPropertyStr(ctx, out, "fromCache", JS_NewBool(ctx, response.from_cache));
+    JS_SetPropertyStr(ctx, out, "status", JS_NewInt32(ctx, response.status));
+    JS_SetPropertyStr(ctx, out, "statusText", js_string(ctx, response.status_text));
+    JS_SetPropertyStr(ctx, out, "headers", js_header_pairs(ctx, response.headers));
+    JS_SetPropertyStr(ctx, out, "redirectCount", JS_NewInt32(ctx, response.redirect_count));
+    return out;
+}
+
+// Parses the (url, kind, method, body, headers, credentials, referrer) tail
+// shared by loadResource and startResourceLoad, starting at argv[offset].
+struct JsResourceLoadArgs {
+    std::string url;
+    std::string kind = "other";
+    std::string method = "GET";
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string credentials = "same-origin";
+    std::string referrer = "about:client";
+};
+
+JsResourceLoadArgs resource_load_args(JSContext* ctx, int argc, JSValue* argv, int offset)
+{
+    JsResourceLoadArgs args;
+    if (argc <= offset) throw std::runtime_error("resource load requires url");
+    args.url = to_string(ctx, argv[offset]);
+    if (argc > offset + 1 && !JS_IsNull(argv[offset + 1]) && !JS_IsUndefined(argv[offset + 1])) {
+        args.kind = to_string(ctx, argv[offset + 1]);
+    }
+    if (argc > offset + 2 && !JS_IsNull(argv[offset + 2]) && !JS_IsUndefined(argv[offset + 2])) {
+        args.method = to_string(ctx, argv[offset + 2]);
+    }
+    if (argc > offset + 3 && !JS_IsNull(argv[offset + 3]) && !JS_IsUndefined(argv[offset + 3])) {
+        args.body = to_string(ctx, argv[offset + 3]);
+    }
+    if (argc > offset + 4) {
+        args.headers = headers_from_js_pairs(ctx, argv[offset + 4]);
+    }
+    if (argc > offset + 5 && !JS_IsNull(argv[offset + 5]) && !JS_IsUndefined(argv[offset + 5])) {
+        args.credentials = to_string(ctx, argv[offset + 5]);
+    }
+    if (argc > offset + 6 && !JS_IsNull(argv[offset + 6]) && !JS_IsUndefined(argv[offset + 6])) {
+        args.referrer = to_string(ctx, argv[offset + 6]);
+    }
+    return args;
+}
+
 JSValue host_load_resource(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return timed_bridge_call(ctx, "loadResource", [ctx, argc, argv](JsRuntime& js) {
-        if (argc < 1) throw std::runtime_error("loadResource requires url");
-        const std::string url = to_string(ctx, argv[0]);
-        const std::string kind = argc > 1 ? to_string(ctx, argv[1]) : "other";
-        std::string method = "GET";
-        if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
-            method = to_string(ctx, argv[2]);
-        }
-        std::string body;
-        if (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
-            body = to_string(ctx, argv[3]);
-        }
-        std::vector<std::pair<std::string, std::string>> headers;
-        if (argc > 4) {
-            headers = headers_from_js_pairs(ctx, argv[4]);
-        }
-        std::string credentials = "same-origin";
-        if (argc > 5 && !JS_IsNull(argv[5]) && !JS_IsUndefined(argv[5])) {
-            credentials = to_string(ctx, argv[5]);
-        }
-        std::string referrer = "about:client";
-        if (argc > 6 && !JS_IsNull(argv[6]) && !JS_IsUndefined(argv[6])) {
-            referrer = to_string(ctx, argv[6]);
-        }
+        JsResourceLoadArgs args = resource_load_args(ctx, argc, argv, 0);
         const auto response =
             js.load_resource(
-                url,
-                kind,
-                std::move(method),
-                std::move(body),
-                std::move(headers),
-                std::move(credentials),
-                std::move(referrer));
+                args.url,
+                args.kind,
+                std::move(args.method),
+                std::move(args.body),
+                std::move(args.headers),
+                std::move(args.credentials),
+                std::move(args.referrer));
+        return js_resource_response_object(ctx, response);
+    });
+}
 
-        JSValue out = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, out, "url", js_string(ctx, response.url));
-        JS_SetPropertyStr(ctx, out, "body", js_string(ctx, response.body));
-        JS_SetPropertyStr(ctx, out, "mimeType", js_string(ctx, response.mime_type));
-        JS_SetPropertyStr(ctx, out, "kind", js_string(ctx, resource_kind_name(response.kind)));
-        JS_SetPropertyStr(ctx, out, "fromCache", JS_NewBool(ctx, response.from_cache));
-        JS_SetPropertyStr(ctx, out, "status", JS_NewInt32(ctx, response.status));
-        JS_SetPropertyStr(ctx, out, "statusText", js_string(ctx, response.status_text));
-        JS_SetPropertyStr(ctx, out, "headers", js_header_pairs(ctx, response.headers));
-        JS_SetPropertyStr(ctx, out, "redirectCount", JS_NewInt32(ctx, response.redirect_count));
-        return out;
+JSValue host_start_resource_load(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return timed_bridge_call(ctx, "startResourceLoad", [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 2) throw std::runtime_error("startResourceLoad requires id and url");
+        const std::uint64_t js_id = task_id_from_js(ctx, argv[0]);
+        JsResourceLoadArgs args = resource_load_args(ctx, argc, argv, 1);
+        js.start_resource_load(
+            js_id,
+            args.url,
+            args.kind,
+            std::move(args.method),
+            std::move(args.body),
+            std::move(args.headers),
+            std::move(args.credentials),
+            std::move(args.referrer));
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_cancel_resource_load(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("cancelResourceLoad requires id");
+        js.cancel_resource_load(task_id_from_js(ctx, argv[0]));
+        return JS_UNDEFINED;
+    });
+}
+
+// Maps a shim task kind onto its HTML task source and readiness relevance.
+// Mirrors the shim's isReadinessRelevantKind predicate: timers and the
+// network-ish kinds gate readiness, everything else is misc background work.
+void task_kind_traits(std::string_view kind, TaskSource& source, bool& relevant)
+{
+    if (kind == "timer") {
+        source = TaskSource::Timers;
+        relevant = true;
+    } else if (kind == "xhr-fetch" || kind == "dynamic-script" || kind == "dom-resource") {
+        source = TaskSource::Networking;
+        relevant = true;
+    } else {
+        source = TaskSource::Misc;
+        relevant = false;
+    }
+}
+
+JSValue host_now(JSContext* ctx, JSValue, int, JSValue*)
+{
+    return bridge_call(ctx, [ctx](JsRuntime& js) {
+        return JS_NewFloat64(ctx, js.event_loop().now_ms());
+    });
+}
+
+JSValue host_schedule_timer(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 2) throw std::runtime_error("scheduleTimer requires id and delay");
+        const std::uint64_t id = task_id_from_js(ctx, argv[0]);
+        double delay = 0;
+        if (JS_ToFloat64(ctx, &delay, argv[1]) < 0) {
+            throw std::runtime_error("scheduleTimer delay must be numeric");
+        }
+        // Clamp BEFORE the double->uint64 cast: casting a value that does not
+        // fit (setTimeout(f, 1e30), Infinity, NaN) is undefined behavior. The
+        // ceiling matches the browser convention of INT32_MAX milliseconds.
+        constexpr double kMaxTimerDelayMs = 2147483647.0;
+        if (!(delay > 0)) {
+            delay = 0;
+        } else if (delay > kMaxTimerDelayMs) {
+            delay = kMaxTimerDelayMs;
+        }
+        const bool repeat = argc > 2 && JS_ToBool(ctx, argv[2]);
+        const bool relevant = argc > 3 && JS_ToBool(ctx, argv[3]);
+        js.event_loop().schedule_timer(id, static_cast<std::uint64_t>(delay), repeat, relevant);
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_cancel_timer(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("cancelTimer requires id");
+        js.event_loop().cancel_timer(task_id_from_js(ctx, argv[0]));
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_queue_task(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("queueTask requires id");
+        const std::uint64_t id = task_id_from_js(ctx, argv[0]);
+        const std::string kind = argc > 1 ? to_string(ctx, argv[1]) : "other";
+        TaskSource source = TaskSource::Misc;
+        bool relevant = false;
+        task_kind_traits(kind, source, relevant);
+        JsRuntime* runtime = &js;
+        js.event_loop().post(source, [runtime, id] { runtime->run_queued_task(id); }, relevant);
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_request_animation_frame(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("requestAnimationFrame requires id");
+        js.event_loop().request_animation_frame(task_id_from_js(ctx, argv[0]));
+        return JS_UNDEFINED;
+    });
+}
+
+JSValue host_cancel_animation_frame(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("cancelAnimationFrame requires id");
+        js.event_loop().cancel_animation_frame(task_id_from_js(ctx, argv[0]));
+        return JS_UNDEFINED;
     });
 }
 
@@ -1317,7 +1469,12 @@ JSModuleDef* JsRuntime::load_module(JSContext* ctx, const char* module_name, voi
     }
 }
 
-JsRuntime::JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr<ResourceLoader> loader, CookieJar* cookie_jar)
+JsRuntime::JsRuntime(
+    DomDocument& document,
+    LoadOptions options,
+    std::shared_ptr<ResourceLoader> loader,
+    CookieJar* cookie_jar,
+    std::shared_ptr<ResourceLoader> raw_loader)
     : document_(&document)
     , options_(std::move(options))
     , loader_(std::move(loader))
@@ -1343,10 +1500,38 @@ JsRuntime::JsRuntime(DomDocument& document, LoadOptions options, std::shared_ptr
 
     JS_SetContextOpaque(context_, this);
     activity_tracker_.reset(document_->mutation_version());
+    event_loop_ = std::make_unique<EventLoop>();
+    // Fired timers become queued Timers-source tasks; the task carries only the
+    // id, which the JS shim resolves through its registry.
+    event_loop_->set_timer_callback([this](std::uint64_t id) { run_queued_task(id); });
+
+    // Async engine selection: a curl-backed page gets the real
+    // curl_multi_socket_action engine (with an explicit JS resource cache);
+    // any other loader is adapted by blocking one queued task per transfer,
+    // which also preserves that loader's own caching behaviour.
+    if (auto curl_loader = std::dynamic_pointer_cast<CurlResourceLoader>(raw_loader)) {
+        async_loader_ = std::make_unique<CurlMultiAsyncLoader>(
+            *event_loop_, std::move(curl_loader), options_.user_agent);
+        js_resource_cache_ = std::dynamic_pointer_cast<CachingResourceLoader>(loader_);
+    } else if (loader_) {
+        async_loader_ = std::make_unique<TaskQueueAsyncLoader>(*event_loop_, loader_);
+    }
 }
 
 JsRuntime::~JsRuntime()
 {
+    // Teardown order matters: the async loader aborts in-flight transfers and
+    // closes its libuv handles (draining their close callbacks) first, then
+    // the event loop drops queued tasks and closes its own handles - all while
+    // the JS context is still alive. Only then is anything freed.
+    if (async_loader_) {
+        async_loader_->shutdown();
+    }
+    if (event_loop_) {
+        event_loop_->shutdown();
+    }
+    async_loader_.reset();
+    event_loop_.reset();
     if (context_ != nullptr) {
         JS_FreeContext(context_);
         context_ = nullptr;
@@ -1411,6 +1596,14 @@ void JsRuntime::install()
     set_function(context_, dom, "getElementById", bridge_get_element_by_id, 1);
     set_function(context_, host, "log", host_log, 1);
     set_function(context_, host, "loadResource", host_load_resource, 2);
+    set_function(context_, host, "startResourceLoad", host_start_resource_load, 3);
+    set_function(context_, host, "cancelResourceLoad", host_cancel_resource_load, 1);
+    set_function(context_, host, "now", host_now, 0);
+    set_function(context_, host, "scheduleTimer", host_schedule_timer, 4);
+    set_function(context_, host, "cancelTimer", host_cancel_timer, 1);
+    set_function(context_, host, "queueTask", host_queue_task, 2);
+    set_function(context_, host, "requestAnimationFrame", host_request_animation_frame, 1);
+    set_function(context_, host, "cancelAnimationFrame", host_cancel_animation_frame, 1);
     set_function(context_, host, "getCookieString", host_get_cookie_string, 1);
     set_function(context_, host, "setCookieString", host_set_cookie_string, 2);
     set_function(context_, host, "activityBegin", host_activity_begin, 1);
@@ -1549,40 +1742,35 @@ void JsRuntime::run_until_idle()
         return;
     }
 
-    const auto wait_time = options_.wait_time;
-    if (wait_time.count() > 0) {
-        EventLoopSnapshot initial;
-        try {
-            initial = event_loop_snapshot(wait_time);
-        } catch (const std::exception& error) {
-            log_console("error", error.what());
-            finish();
-            return;
-        }
-        const auto virtual_deadline = initial.now + wait_time;
-        constexpr int kMaxIdleIterations = 1000;
+    // Already-ready tasks (0-delay) always execute, even with wait_time=0;
+    // the budget only bounds how long we WAIT for future work (timers,
+    // in-flight transfers). Interval timers and animation frames never count
+    // toward idleness: the loop stops once only they remain (their ticks run
+    // only while something else keeps the loop pumping within the budget).
+    const auto wait_time = options_.wait_time.count() < 0
+        ? std::chrono::milliseconds{0}
+        : options_.wait_time;
+    const auto deadline = std::chrono::steady_clock::now() + wait_time;
+    constexpr int kMaxIdleIterations = 1000;
 
-        for (int i = 0; i < kMaxIdleIterations; ++i) {
-            EventLoopSnapshot snapshot;
-            try {
-                snapshot = event_loop_snapshot(wait_time);
-            } catch (const std::exception& error) {
-                log_console("error", error.what());
-                break;
-            }
-            if (!snapshot.next_task_delay) {
-                break;
-            }
-            auto remaining = virtual_deadline - snapshot.now;
-            if (remaining.count() < 0) {
-                break;
-            }
-            const int ran = run_event_loop_step(remaining);
-            ++iterations;
-            if (ran < 0 || ran == 0) {
-                break;
-            }
+    for (int i = 0; i < kMaxIdleIterations; ++i) {
+        const int ran = run_event_loop_turn();
+        if (ran < 0) {
+            break;
         }
+        if (ran > 0) {
+            ++iterations;
+            continue;
+        }
+        if (event_loop_->idle()) {
+            break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            break;
+        }
+        event_loop_->wait_for_activity(remaining);
     }
 
     finish();
@@ -1638,87 +1826,90 @@ void JsRuntime::run_microtask_checkpoint()
     }
 }
 
-int JsRuntime::run_event_loop_step(std::chrono::milliseconds advance)
+int JsRuntime::run_event_loop_turn()
 {
-    JSValue global = JS_GetGlobalObject(context_);
-    JSValue run_step = JS_GetPropertyStr(context_, global, "__pagecore_run_event_loop_step");
-    JS_FreeValue(context_, global);
-
-    if (!JS_IsFunction(context_, run_step)) {
-        JS_FreeValue(context_, run_step);
-        return 0;
+    event_loop_->poll();
+    int ran = 0;
+    if (event_loop_->run_one_task()) {
+        ran = 1;
+        if (run_microtask_checkpoint_logged() < 0) {
+            return -1;
+        }
     }
-
-    if (advance.count() < 0) {
-        advance = std::chrono::milliseconds{0};
-    }
-    JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(advance.count()))};
-    JSValue result = JS_Call(context_, run_step, JS_UNDEFINED, 1, args);
-    JS_FreeValue(context_, args[0]);
-    JS_FreeValue(context_, run_step);
-    try {
-        check_exception(result, "<event-loop-task>");
-    } catch (const std::exception& error) {
-        log_console("error", error.what());
-        JS_FreeValue(context_, result);
-        return -1;
-    }
-
-    int32_t ran = 0;
-    if (JS_ToInt32(context_, &ran, result) < 0) {
-        JS_FreeValue(context_, JS_GetException(context_));
-        ran = 0;
-    }
-    JS_FreeValue(context_, result);
-    if (ran > 0 && run_microtask_checkpoint_logged() < 0) {
-        return -1;
+    // Rendering phase: when the frame timer has fired, run every currently
+    // registered rAF callback once (callbacks registered during the frame go
+    // to the next frame), followed by its own microtask checkpoint.
+    if (event_loop_->animation_frame_due()) {
+        if (run_animation_frames() > 0) {
+            ran = 1;
+            if (run_microtask_checkpoint_logged() < 0) {
+                return -1;
+            }
+        }
     }
     return ran;
 }
 
-JsRuntime::EventLoopSnapshot JsRuntime::event_loop_snapshot(std::chrono::milliseconds horizon)
+int JsRuntime::run_animation_frames()
 {
-    EventLoopSnapshot snapshot;
+    const std::deque<std::uint64_t> ids = event_loop_->take_due_animation_frames();
+    if (ids.empty()) {
+        return 0;
+    }
 
+    start_deadline();
     JSValue global = JS_GetGlobalObject(context_);
-    JSValue event_loop_snapshot_fn = JS_GetPropertyStr(context_, global, "__pagecore_event_loop_snapshot");
+    JSValue run_raf = JS_GetPropertyStr(context_, global, "__pagecore_run_raf_callbacks");
     JS_FreeValue(context_, global);
-
-    if (!JS_IsFunction(context_, event_loop_snapshot_fn)) {
-        JS_FreeValue(context_, event_loop_snapshot_fn);
-        return snapshot;
+    if (!JS_IsFunction(context_, run_raf)) {
+        JS_FreeValue(context_, run_raf);
+        return 0;
     }
 
-    if (horizon.count() < 0) {
-        horizon = std::chrono::milliseconds{0};
+    JSValue id_array = JS_NewArray(context_);
+    uint32_t index = 0;
+    for (const std::uint64_t id : ids) {
+        JS_SetPropertyUint32(context_, id_array, index++, JS_NewFloat64(context_, static_cast<double>(id)));
     }
-    JSValue args[1] = {JS_NewInt64(context_, static_cast<int64_t>(horizon.count()))};
-    JSValue result = JS_Call(context_, event_loop_snapshot_fn, JS_UNDEFINED, 1, args);
+    JSValue args[2] = {id_array, JS_NewFloat64(context_, event_loop_->now_ms())};
+    JSValue result = JS_Call(context_, run_raf, JS_UNDEFINED, 2, args);
     JS_FreeValue(context_, args[0]);
-    JS_FreeValue(context_, event_loop_snapshot_fn);
-    check_exception(result, "<event-loop-snapshot>");
-
-    auto int_property = [this, result](const char* name) -> int64_t {
-        JSValue value = JS_GetPropertyStr(context_, result, name);
-        int64_t out = 0;
-        if (JS_ToInt64(context_, &out, value) < 0) {
-            JS_FreeValue(context_, JS_GetException(context_));
-            out = 0;
-        }
-        JS_FreeValue(context_, value);
-        return out;
-    };
-
-    const int64_t now = int_property("now");
-    const int64_t relevant = int_property("relevant");
-    const int64_t next_delay = int_property("nextDelay");
-    snapshot.now = std::chrono::milliseconds{std::max<int64_t>(0, now)};
-    snapshot.relevant_count = static_cast<std::size_t>(std::max<int64_t>(0, relevant));
-    if (next_delay >= 0) {
-        snapshot.next_task_delay = std::chrono::milliseconds{next_delay};
+    JS_FreeValue(context_, args[1]);
+    JS_FreeValue(context_, run_raf);
+    try {
+        check_exception(result, "<animation-frame>");
+    } catch (const std::exception& error) {
+        log_console("error", error.what());
     }
     JS_FreeValue(context_, result);
-    return snapshot;
+    return static_cast<int>(ids.size());
+}
+
+void JsRuntime::run_queued_task(std::uint64_t id)
+{
+    // Each task gets a fresh js_timeout budget (still clamped to the aggregate
+    // load deadline), matching how individual scripts are bounded.
+    start_deadline();
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue run_task = JS_GetPropertyStr(context_, global, "__pagecore_run_task");
+    JS_FreeValue(context_, global);
+
+    if (!JS_IsFunction(context_, run_task)) {
+        JS_FreeValue(context_, run_task);
+        return;
+    }
+
+    JSValue args[1] = {JS_NewFloat64(context_, static_cast<double>(id))};
+    JSValue result = JS_Call(context_, run_task, JS_UNDEFINED, 1, args);
+    JS_FreeValue(context_, args[0]);
+    JS_FreeValue(context_, run_task);
+    try {
+        check_exception(result, "<event-loop-task>");
+    } catch (const std::exception& error) {
+        // A throwing task is logged and the loop keeps going, like a browser.
+        log_console("error", error.what());
+    }
+    JS_FreeValue(context_, result);
 }
 
 bool JsRuntime::readiness_satisfied(WaitUntil wait_until, std::chrono::milliseconds stable_window) const
@@ -1727,6 +1918,11 @@ bool JsRuntime::readiness_satisfied(WaitUntil wait_until, std::chrono::milliseco
         return false;
     }
 
+    // A provably quiescent loop cannot mutate the DOM again, so the DOM is
+    // trivially stable without waiting out the (real-time) stability window.
+    const bool dom_stable = event_loop_->quiescent()
+        || activity_tracker_.dom_stable(stable_window);
+
     switch (wait_until) {
     case WaitUntil::Load:
         return true;
@@ -1734,10 +1930,10 @@ bool JsRuntime::readiness_satisfied(WaitUntil wait_until, std::chrono::milliseco
         return activity_tracker_.network_idle();
     case WaitUntil::DomStable:
         return activity_tracker_.snapshot().pending_relevant_timers == 0
-            && activity_tracker_.dom_stable(stable_window);
+            && dom_stable;
     case WaitUntil::Ready:
         return activity_tracker_.network_idle()
-            && activity_tracker_.dom_stable(stable_window);
+            && dom_stable;
     }
     return false;
 }
@@ -1765,16 +1961,11 @@ bool JsRuntime::run_until_ready(PageReadinessOptions options)
             break;
         }
 
-        EventLoopSnapshot event_loop;
-        try {
-            event_loop = event_loop_snapshot(options.stable_window);
-            activity_tracker_.set_clock(event_loop.now);
-            activity_tracker_.set_relevant_timers(event_loop.relevant_count);
-            activity_tracker_.sync_mutation_version(document_->mutation_version());
-        } catch (const std::exception& error) {
-            log_console("error", error.what());
-            break;
-        }
+        event_loop_->poll();
+        activity_tracker_.set_clock(event_loop_->now());
+        activity_tracker_.set_relevant_timers(
+            event_loop_->relevant_pending_count(options.stable_window));
+        activity_tracker_.sync_mutation_version(document_->mutation_version());
 
         if (readiness_satisfied(options.wait_until, options.stable_window)) {
             ready = true;
@@ -1789,12 +1980,19 @@ bool JsRuntime::run_until_ready(PageReadinessOptions options)
             break;
         }
 
+        if (event_loop_->has_ready_task() || event_loop_->animation_frame_due()) {
+            if (run_event_loop_turn() < 0) {
+                break;
+            }
+            continue;
+        }
+
+        // Next wake-up: the nearest timer, the moment the stability window
+        // would elapse, or the remaining wall-clock budget - whichever is
+        // soonest. uv_run(UV_RUN_ONCE) also wakes early on any loop activity.
         const bool wants_dom_stability = options.wait_until == WaitUntil::DomStable
             || options.wait_until == WaitUntil::Ready;
-        std::optional<std::chrono::milliseconds> advance;
-        if (event_loop.next_task_delay) {
-            advance = *event_loop.next_task_delay;
-        }
+        std::optional<std::chrono::milliseconds> advance = event_loop_->next_timer_delay();
         if (wants_dom_stability && !activity_tracker_.dom_stable(options.stable_window)) {
             const auto snapshot = activity_tracker_.snapshot();
             auto stable_remaining = options.stable_window - (snapshot.clock - snapshot.last_mutation_clock);
@@ -1806,17 +2004,19 @@ bool JsRuntime::run_until_ready(PageReadinessOptions options)
             }
         }
 
-        if (!advance) {
+        if (!advance && event_loop_->idle()) {
+            // No timers, no tasks, no in-flight work: nothing can change the
+            // readiness verdict anymore.
             break;
         }
 
-        const int ran = run_event_loop_step(*advance);
-        if (ran < 0) {
-            break;
+        const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
+            options.wait_time - elapsed);
+        auto wait = advance ? std::min(*advance, budget) : budget;
+        if (wait.count() < 1) {
+            wait = std::chrono::milliseconds{1};
         }
-        if (ran == 0 && advance->count() == 0) {
-            break;
-        }
+        event_loop_->wait_for_activity(wait);
     }
 
     clear_deadline();
@@ -1833,6 +2033,11 @@ DomDocument& JsRuntime::document()
 PageActivityTracker& JsRuntime::activity_tracker()
 {
     return activity_tracker_;
+}
+
+EventLoop& JsRuntime::event_loop()
+{
+    return *event_loop_;
 }
 
 void JsRuntime::set_computed_style_resolver(ComputedStyleResolver resolver)
@@ -1940,12 +2145,13 @@ std::optional<std::string> JsRuntime::js_resource_budget_block_reason() const
 
 void JsRuntime::record_js_resource_load(long long elapsed_us, std::size_t bytes)
 {
-    ++js_resource_load_count_;
+    // The load COUNT budget is spent at request start (see
+    // prepare_js_resource_request); only bytes/time are known at completion.
     js_resource_load_bytes_ += bytes;
     js_resource_load_elapsed_us_ += std::max<long long>(0, elapsed_us);
 }
 
-ResourceResponse JsRuntime::load_resource(
+JsRuntime::JsResourceRequestContext JsRuntime::prepare_js_resource_request(
     std::string_view url,
     std::string_view kind,
     std::string method,
@@ -1991,33 +2197,262 @@ ResourceResponse JsRuntime::load_resource(
             request.url,
             "JS resource load blocked by budget: " + *budget_reason);
     }
+    // Spend the count budget when the transfer STARTS: with truly async loads,
+    // several transfers can be in flight before any completion is recorded, so
+    // a completion-time count would let a page overshoot max_js_resource_loads.
+    ++js_resource_load_count_;
+
+    JsResourceRequestContext context;
+    context.credentials = cookie_credentials;
+    context.request_url = request.url;
+    if (cookie_jar_ != nullptr) {
+        request = cookie_jar_->with_cookie_header(std::move(request), cookie_credentials, base);
+    }
+    context.request = std::move(request);
+    return context;
+}
+
+ResourceResponse JsRuntime::load_resource(
+    std::string_view url,
+    std::string_view kind,
+    std::string method,
+    std::string body,
+    std::vector<std::pair<std::string, std::string>> headers,
+    std::string credentials,
+    std::string referrer)
+{
+    JsResourceRequestContext context = prepare_js_resource_request(
+        url, kind, std::move(method), std::move(body), std::move(headers),
+        std::move(credentials), std::move(referrer));
 
     const auto perf_start = std::chrono::steady_clock::now();
     try {
-        const std::string request_url = request.url;
+        auto response = loader_->load(context.request);
         if (cookie_jar_ != nullptr) {
-            request = cookie_jar_->with_cookie_header(std::move(request), cookie_credentials, base);
-        }
-        auto response = loader_->load(request);
-        if (cookie_jar_ != nullptr) {
-            cookie_jar_->store_from_response(request_url, response, cookie_credentials, base);
+            cookie_jar_->store_from_response(context.request_url, response, context.credentials, options_.base_url);
         }
         const long long elapsed_us = elapsed_us_since(perf_start);
         record_js_resource_load(elapsed_us, response.body.size());
         PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, response.body.size()};
-        event.property = resource_kind_name(request.kind);
-        event.url = request.url;
+        event.property = resource_kind_name(context.request.kind);
+        event.url = context.request.url;
         emit_perf_trace(options_.perf_trace, std::move(event));
         return response;
     } catch (...) {
         const long long elapsed_us = elapsed_us_since(perf_start);
         record_js_resource_load(elapsed_us, 0);
         PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, 0};
-        event.property = resource_kind_name(request.kind);
-        event.url = request.url;
+        event.property = resource_kind_name(context.request.kind);
+        event.url = context.request.url;
         emit_perf_trace(options_.perf_trace, std::move(event));
         throw;
     }
+}
+
+void JsRuntime::start_resource_load(
+    std::uint64_t js_id,
+    std::string_view url,
+    std::string_view kind,
+    std::string method,
+    std::string body,
+    std::vector<std::pair<std::string, std::string>> headers,
+    std::string credentials,
+    std::string referrer)
+{
+    if (!async_loader_) {
+        throw std::runtime_error("async resource loading is not available");
+    }
+    auto context = std::make_shared<JsResourceRequestContext>(prepare_js_resource_request(
+        url, kind, std::move(method), std::move(body), std::move(headers),
+        std::move(credentials), std::move(referrer)));
+    const auto perf_start = std::chrono::steady_clock::now();
+
+    // Synchronous cache probe on the curl path (the task-queue adapter hits the
+    // caching loader inside load() instead). Hits still complete as a queued
+    // Networking task so JS observes a uniform async contract.
+    if (js_resource_cache_) {
+        if (auto cached = js_resource_cache_->cached(context->request)) {
+            auto result = std::make_shared<AsyncLoadResult>();
+            result->response = std::move(*cached);
+            // Sentinel 0: no engine transfer behind this id, but the pending
+            // entry lets cancel_resource_load() drop the queued completion.
+            pending_resource_loads_[js_id] = 0;
+            event_loop_->post(
+                TaskSource::Networking,
+                [this, js_id, context, result, perf_start] {
+                    if (pending_resource_loads_.erase(js_id) == 0) {
+                        return; // cancelled before delivery
+                    }
+                    finish_resource_load(js_id, *context, std::move(*result), perf_start, /*store_in_cache=*/false);
+                },
+                /*readiness_relevant=*/true);
+            return;
+        }
+    }
+
+    const std::uint64_t async_id = async_loader_->start(
+        context->request,
+        [this, js_id, context, perf_start](AsyncLoadResult result) {
+            // Runs inside the queued Networking task the loader posted.
+            pending_resource_loads_.erase(js_id);
+            finish_resource_load(js_id, *context, std::move(result), perf_start, /*store_in_cache=*/true);
+        });
+    pending_resource_loads_[js_id] = async_id;
+}
+
+std::uint64_t JsRuntime::start_document_script_load(ResourceRequest request, AsyncLoadCallback callback)
+{
+    if (!async_loader_) {
+        throw std::runtime_error("async resource loading is not available");
+    }
+    const std::string base = request.base_url.empty() ? options_.base_url : request.base_url;
+    const std::string request_url = request.url;
+    if (cookie_jar_ != nullptr) {
+        request = cookie_jar_->with_cookie_header(std::move(request), CookieCredentials::SameOrigin, base);
+    }
+
+    // Same explicit cache handling as start_resource_load on the curl path
+    // (the task-queue adapter caches inside the blocking loader instead). The
+    // cache key includes the attached cookie header, matching the blocking
+    // CookieAware -> Caching pipeline this replaces.
+    if (js_resource_cache_) {
+        if (auto cached = js_resource_cache_->cached(request)) {
+            auto result = std::make_shared<AsyncLoadResult>();
+            result->response = std::move(*cached);
+            event_loop_->post(
+                TaskSource::Networking,
+                [callback = std::move(callback), result] { callback(std::move(*result)); },
+                /*readiness_relevant=*/true);
+            return 0;
+        }
+    }
+
+    auto shared_request = std::make_shared<ResourceRequest>(request);
+    return async_loader_->start(
+        *shared_request,
+        [this, request_url, base, shared_request, callback = std::move(callback)](AsyncLoadResult result) {
+            if (!result.error) {
+                if (cookie_jar_ != nullptr) {
+                    cookie_jar_->store_from_response(
+                        request_url, result.response, CookieCredentials::SameOrigin, base);
+                }
+                if (js_resource_cache_) {
+                    js_resource_cache_->store(*shared_request, result.response);
+                }
+            }
+            callback(std::move(result));
+        });
+}
+
+bool JsRuntime::run_event_loop_until(
+    const std::function<bool()>& condition,
+    std::chrono::steady_clock::time_point deadline)
+{
+    if (run_microtask_checkpoint_logged() < 0) {
+        return condition();
+    }
+    for (;;) {
+        if (condition()) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const int ran = run_event_loop_turn();
+        if (ran < 0) {
+            return condition();
+        }
+        if (ran == 0) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            event_loop_->wait_for_activity(remaining);
+        }
+    }
+}
+
+void JsRuntime::cancel_resource_load(std::uint64_t js_id)
+{
+    const auto found = pending_resource_loads_.find(js_id);
+    if (found == pending_resource_loads_.end()) {
+        return;
+    }
+    const std::uint64_t async_id = found->second;
+    pending_resource_loads_.erase(found);
+    // async_id 0 is the cache-hit sentinel: nothing to cancel in the engine,
+    // erasing the pending entry already drops the queued completion.
+    if (async_id != 0 && async_loader_) {
+        async_loader_->cancel(async_id);
+    }
+}
+
+void JsRuntime::finish_resource_load(
+    std::uint64_t js_id,
+    const JsResourceRequestContext& context,
+    AsyncLoadResult result,
+    std::chrono::steady_clock::time_point started,
+    bool store_in_cache)
+{
+    const long long elapsed_us = elapsed_us_since(started);
+    std::string error_message;
+    if (!result.error) {
+        if (cookie_jar_ != nullptr) {
+            cookie_jar_->store_from_response(
+                context.request_url, result.response, context.credentials, options_.base_url);
+        }
+        if (store_in_cache && js_resource_cache_) {
+            js_resource_cache_->store(context.request, result.response);
+        }
+        record_js_resource_load(elapsed_us, result.response.body.size());
+        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, result.response.body.size()};
+        event.property = resource_kind_name(context.request.kind);
+        event.url = context.request.url;
+        emit_perf_trace(options_.perf_trace, std::move(event));
+    } else {
+        record_js_resource_load(elapsed_us, 0);
+        PerfEvent event{PerfPhase::ResourceLoad, "js_load_resource", elapsed_us, 0};
+        event.property = resource_kind_name(context.request.kind);
+        event.url = context.request.url;
+        emit_perf_trace(options_.perf_trace, std::move(event));
+        try {
+            std::rethrow_exception(result.error);
+        } catch (const std::exception& error) {
+            error_message = error.what();
+        } catch (...) {
+            error_message = "resource load failed";
+        }
+    }
+
+    // Deliver to JS through the shim's completion registry. Each completion
+    // gets a fresh execution budget, like any other task.
+    start_deadline();
+    JSValue global = JS_GetGlobalObject(context_);
+    JSValue complete = JS_GetPropertyStr(context_, global, "__pagecore_resource_load_complete");
+    JS_FreeValue(context_, global);
+    if (!JS_IsFunction(context_, complete)) {
+        JS_FreeValue(context_, complete);
+        return;
+    }
+
+    JSValue args[3];
+    args[0] = JS_NewFloat64(context_, static_cast<double>(js_id));
+    if (!result.error) {
+        args[1] = js_resource_response_object(context_, result.response);
+        args[2] = JS_UNDEFINED;
+    } else {
+        args[1] = JS_NULL;
+        args[2] = js_string(context_, error_message);
+    }
+    JSValue call_result = JS_Call(context_, complete, JS_UNDEFINED, 3, args);
+    for (JSValue& arg : args) {
+        JS_FreeValue(context_, arg);
+    }
+    JS_FreeValue(context_, complete);
+    try {
+        check_exception(call_result, "<resource-load-complete>");
+    } catch (const std::exception& error) {
+        log_console("error", error.what());
+    }
+    JS_FreeValue(context_, call_result);
 }
 
 std::string JsRuntime::document_cookie(std::string_view url) const

@@ -16,7 +16,15 @@
     deps: ['core', 'events', 'dom', 'web', 'forms', 'streams', 'compat'],
     install(ctx, api) {
       const { global, host, bridge } = ctx;
-      const { defineValue, setDocumentReadyState, activityBegin, activityEnd, formatErrorForLog } = api.core;
+      const {
+        defineValue,
+        setDocumentReadyState,
+        activityBegin,
+        activityEnd,
+        formatErrorForLog,
+        cancelResourceLoad,
+        completeResourceLoad
+      } = api.core;
       const {
         DOMException,
         Window,
@@ -160,7 +168,7 @@
         Response,
         responseHeadersFromHost,
         bodyText,
-        loadHostResource,
+        loadHostResourceAsync,
         XMLHttpRequest,
         Storage,
         XMLSerializer,
@@ -176,11 +184,12 @@
         clearTask,
         setIntervalShim,
         requestAnimationFrameShim,
+        cancelAnimationFrameShim,
+        runAnimationFrames,
         requestIdleCallbackShim,
         performanceNow,
         queuePageTask,
-        runEventLoopStep,
-        eventLoopSnapshot
+        runTask
       } = api.web;
       const {
         FormData
@@ -544,7 +553,7 @@
         global.setInterval = setIntervalShim;
         global.clearInterval = clearTask;
         global.requestAnimationFrame = requestAnimationFrameShim;
-        global.cancelAnimationFrame = clearTask;
+        global.cancelAnimationFrame = cancelAnimationFrameShim;
         global.queueMicrotask = (callback) => Promise.resolve().then(callback);
         global.requestIdleCallback = requestIdleCallbackShim;
         global.cancelIdleCallback = clearTask;
@@ -609,31 +618,45 @@
           }
           activityBegin('xhr-fetch');
           return new Promise((resolve, reject) => {
-            queuePageTask(() => {
-              try {
-                if (signal && signal.aborted) {
-                  throw signal.reason || new DOMException('The operation was aborted.', 'AbortError');
-                }
-                const loaded = loadHostResource(request.url, 'other', {
-                  method: request.method,
-                  body: bodyText(request.body, request.headers),
-                  headers: request.headers,
-                  credentials: request.credentials,
-                  referrer: request.referrer
-                });
-                resolve(new Response(loaded.body || '', {
-                  status: loaded.status === undefined ? 200 : Number(loaded.status),
-                  statusText: loaded.statusText === undefined ? '' : String(loaded.statusText),
-                  headers: responseHeadersFromHost(loaded),
-                  url: loaded.url || request.url,
-                  redirected: Number(loaded.redirectCount || 0) > 0
-                }));
-              } catch (error) {
-                reject(error);
-              } finally {
-                activityEnd('xhr-fetch');
+            let loadId = null;
+            let settled = false;
+            let onAbort = null;
+            const settle = (settleFn, value) => {
+              if (settled) return;
+              settled = true;
+              // Detach the abort listener so a long-lived reused signal does
+              // not accumulate one retained closure per completed fetch.
+              if (onAbort && typeof signal.removeEventListener === 'function') {
+                signal.removeEventListener('abort', onAbort);
               }
-            }, 'xhr-fetch');
+              activityEnd('xhr-fetch');
+              settleFn(value);
+            };
+            if (signal && typeof signal.addEventListener === 'function') {
+              onAbort = () => {
+                // Abort mid-transfer: cancel the host load (its completion is
+                // then dropped) and reject immediately.
+                if (loadId != null) cancelResourceLoad(loadId);
+                settle(reject, signal.reason || new DOMException('The operation was aborted.', 'AbortError'));
+              };
+              signal.addEventListener('abort', onAbort);
+            }
+            loadHostResourceAsync(request.url, 'other', {
+              method: request.method,
+              body: bodyText(request.body, request.headers),
+              headers: request.headers,
+              credentials: request.credentials,
+              referrer: request.referrer,
+              onStarted: (id) => { loadId = id; }
+            }).then(
+              (loaded) => settle(resolve, new Response(loaded.body || '', {
+                status: loaded.status === undefined ? 200 : Number(loaded.status),
+                statusText: loaded.statusText === undefined ? '' : String(loaded.statusText),
+                headers: responseHeadersFromHost(loaded),
+                url: loaded.url || request.url,
+                redirected: Number(loaded.redirectCount || 0) > 0
+              })),
+              (error) => settle(reject, error));
           });
         };
         installWindowNamedPropertiesFromTree(document);
@@ -676,8 +699,9 @@
         }
 
         global.__pagecore_queue_task = queuePageTask;
-        global.__pagecore_run_event_loop_step = runEventLoopStep;
-        global.__pagecore_event_loop_snapshot = eventLoopSnapshot;
+        global.__pagecore_run_task = runTask;
+        global.__pagecore_run_raf_callbacks = runAnimationFrames;
+        global.__pagecore_resource_load_complete = completeResourceLoad;
         global.__pagecore_deliver_mutation_observers = deliverMutationObservers;
 
       return {};

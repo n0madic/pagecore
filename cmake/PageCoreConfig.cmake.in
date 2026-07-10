@@ -20,6 +20,13 @@ endfunction()
 
 _pagecore_import_static_dependency(PageCore::lexbor_static "@PAGECORE_LEXBOR_STATIC_FILE@")
 _pagecore_import_static_dependency(PageCore::qjs "@PAGECORE_QJS_STATIC_FILE@")
+_pagecore_import_static_dependency(PageCore::uv_a "@PAGECORE_UV_STATIC_FILE@")
+if(UNIX AND NOT APPLE)
+    # libuv's static archive needs the ambient threading/dl symbols on Linux.
+    set_property(TARGET PageCore::uv_a APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES pthread dl rt
+    )
+endif()
 
 if(PAGECORE_ENABLE_RENDERING)
     _pagecore_import_static_dependency(PageCore::litehtml "@PAGECORE_LITEHTML_STATIC_FILE@")
