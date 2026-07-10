@@ -68,20 +68,6 @@ bool skip_env_sensitive_tests()
     return skip;
 }
 
-// Some event-loop / readiness tests assert an exact outcome within a tight
-// wall-clock window (small wait_time/stable_window). A sanitizer build runs
-// several times slower, so those windows expire before the scheduled tasks run
-// and the tests flake. They validate scheduling logic, not memory safety, and
-// still run in the non-sanitized job, so skip them under AddressSanitizer.
-bool skip_timing_sensitive_tests()
-{
-#if defined(__SANITIZE_ADDRESS__)
-    return true;
-#else
-    return std::getenv("PAGECORE_SKIP_TIMING_SENSITIVE_TESTS") != nullptr;
-#endif
-}
-
 #if !defined(_WIN32)
 struct BoundTestServer {
     int fd = -1;
@@ -1057,9 +1043,6 @@ void test_run_until_idle_logs_throwing_event_loop_snapshot()
 
 void test_event_loop_ordering_contract()
 {
-    if (skip_timing_sensitive_tests()) {
-        return;
-    }
     auto loader = std::make_shared<RecordingResourceLoader>();
     loader->add("https://example.test/fetch.json", R"JSON({"value":"fetch"})JSON", "application/json");
     loader->add("https://example.test/xhr.json", R"JSON({"value":"xhr"})JSON", "application/json");

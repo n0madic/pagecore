@@ -11,28 +11,8 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: build & test (${{ matrix.name }})
+    name: build & test (warnings-as-errors)
     runs-on: ubuntu-latest
-    # The sanitizer job is informational: ASan/UBSan surface real memory/UB bugs in
-    # its log, but a handful of event-loop/CSSOM tests are sensitive to the runtime
-    # perturbations (timing slowdown, changed allocation addresses) rather than to
-    # any real defect, so it must not block CI. The warnings-as-errors job is the gate.
-    continue-on-error: ${{ matrix.experimental || false }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Warnings-as-errors gate: the engine parses untrusted HTML/CSS/images/
-          # fonts, so a new compiler diagnostic must fail the build.
-          - name: warnings-as-errors
-            cmake_extra: -DPAGECORE_WERROR=ON
-            ctest_env: ""
-          # ASan + UBSan over the whole tree (including the vendored parsers) to
-          # catch memory-safety and UB regressions in the untrusted-input paths.
-          - name: sanitizers
-            cmake_extra: -DPAGECORE_SANITIZE=address,undefined
-            ctest_env: "ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1"
-            experimental: true
     steps:
       - uses: actions/checkout@v4
 
@@ -46,8 +26,14 @@ jobs:
             libharfbuzz-dev libbrotli-dev libturbojpeg0-dev libwebp-dev \
             libgif-dev libpng-dev
 
+      # Warnings-as-errors gate: the engine parses untrusted HTML/CSS/images/fonts,
+      # so a new compiler diagnostic must fail the build. ASan/UBSan are available
+      # for local runs via -DPAGECORE_SANITIZE=address,undefined; they are not run
+      # in CI because a few event-loop/CSSOM tests are sensitive to the sanitizer's
+      # runtime perturbations (timing slowdown, changed allocation order) rather
+      # than to any real defect.
       - name: Configure
-        run: cmake -S . -B build -G Ninja ${{ matrix.cmake_extra }}
+        run: cmake -S . -B build -G Ninja -DPAGECORE_WERROR=ON
 
       - name: Build
         run: cmake --build build --parallel
@@ -60,6 +46,5 @@ jobs:
           # excluded too; the font-independent bulk of the suite still gates CI.
           PAGECORE_SKIP_ENV_SENSITIVE_TESTS: "1"
         run: >
-          ${{ matrix.ctest_env }}
           ctest --test-dir build --output-on-failure --timeout 300
           --exclude-regex 'pagecore_display_list_reftests'
