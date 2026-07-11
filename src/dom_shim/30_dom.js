@@ -667,13 +667,131 @@
           }
         }
 
-        class Text extends Node {
-          get data() { return this.textContent; }
-          set data(value) { this.textContent = value; }
-          get length() { return this.data.length; }
+        // WebIDL `unsigned long`, i.e. ToUint32: -1 becomes 4294967295 (which then
+        // trips the IndexSizeError bounds check) and -0x100000000 + 2 becomes 2.
+        // CharacterData's offsets are specified in terms of this conversion, and
+        // WPT tests the wraparound directly.
+        function toUnsignedLong(value) {
+          return Number(value) >>> 0;
         }
 
-        class Comment extends Text {}
+        function requireArguments(args, count, method) {
+          if (args.length < count) {
+            throw new TypeError(`Failed to execute '${method}' on 'CharacterData': ${count} argument${count === 1 ? '' : 's'} required, but only ${args.length} present.`);
+          }
+        }
+
+        // Text and Comment both derive from CharacterData, which owns the data
+        // mutation API. Comment used to derive from Text, which made
+        // `comment instanceof Text` wrongly true.
+        class CharacterData extends Node {
+          get data() { return this.textContent; }
+
+          // [LegacyNullToEmptyString]: `node.data = null` yields "", whereas the
+          // plain DOMString arguments below turn null into "null".
+          set data(value) { this.replaceData(0, this.length, value === null ? '' : String(value)); }
+
+          get length() { return this.data.length; }
+
+          substringData(offset, count) {
+            requireArguments(arguments, 2, 'substringData');
+            const data = this.data;
+            offset = toUnsignedLong(offset);
+            count = toUnsignedLong(count);
+            if (offset > data.length) {
+              throw new DOMException('The index is not in the allowed range.', 'IndexSizeError');
+            }
+            return offset + count > data.length ? data.slice(offset) : data.slice(offset, offset + count);
+          }
+
+          appendData(data) {
+            requireArguments(arguments, 1, 'appendData');
+            this.replaceData(this.length, 0, data);
+          }
+
+          insertData(offset, data) {
+            requireArguments(arguments, 2, 'insertData');
+            this.replaceData(offset, 0, data);
+          }
+
+          deleteData(offset, count) {
+            requireArguments(arguments, 2, 'deleteData');
+            this.replaceData(offset, count, '');
+          }
+
+          replaceData(offset, count, data) {
+            requireArguments(arguments, 3, 'replaceData');
+            const oldData = this.data;
+            offset = toUnsignedLong(offset);
+            count = toUnsignedLong(count);
+            data = String(data);
+            if (offset > oldData.length) {
+              throw new DOMException('The index is not in the allowed range.', 'IndexSizeError');
+            }
+            if (offset + count > oldData.length) count = oldData.length - offset;
+            this.textContent = oldData.slice(0, offset) + data + oldData.slice(offset + count);
+          }
+        }
+
+        // materializeNode() constructs wrappers from an existing node id, while page
+        // script constructs from data (`new Text("x")`). These cannot be told apart
+        // by argument type: `new Text(42)` is a valid page call that must stringify
+        // to "42", not adopt node id 42. So the internal path is marked explicitly.
+        const INTERNAL_NODE_ID = Symbol('pagecore.internalNodeId');
+
+        // Registering the fresh node in wrapperCache keeps wrapper identity stable,
+        // so that once inserted, `parent.lastChild === theConstructedNode`.
+        function createCharacterData(node, createNode, data) {
+          // `constructor(optional DOMString data = "")`: undefined selects the
+          // default "", while null goes through DOMString conversion to "null".
+          const id = createNode(data === undefined ? '' : String(data));
+          wrapperCache.set(id, node);
+          return id;
+        }
+
+        class Text extends CharacterData {
+          constructor(data, internalId) {
+            if (data === INTERNAL_NODE_ID) {
+              super(internalId);
+              return;
+            }
+            super();
+            attachNodeId(this, createCharacterData(this, bridge.createTextNode, data));
+          }
+
+          get wholeText() {
+            let start = this;
+            while (start.previousSibling && start.previousSibling.nodeType === 3) start = start.previousSibling;
+            let text = '';
+            for (let node = start; node && node.nodeType === 3; node = node.nextSibling) text += node.data;
+            return text;
+          }
+
+          splitText(offset) {
+            requireArguments(arguments, 1, 'splitText');
+            const data = this.data;
+            offset = toUnsignedLong(offset);
+            if (offset > data.length) {
+              throw new DOMException('The index is not in the allowed range.', 'IndexSizeError');
+            }
+            const tail = document.createTextNode(data.slice(offset));
+            const parent = this.parentNode;
+            if (parent) parent.insertBefore(tail, this.nextSibling);
+            this.textContent = data.slice(0, offset);
+            return tail;
+          }
+        }
+
+        class Comment extends CharacterData {
+          constructor(data, internalId) {
+            if (data === INTERNAL_NODE_ID) {
+              super(internalId);
+              return;
+            }
+            super();
+            attachNodeId(this, createCharacterData(this, bridge.createComment, data));
+          }
+        }
 
         function validateToken(token) {
           token = String(token);
@@ -3981,8 +4099,8 @@
         function materializeNode(id, type, tag) {
           let node;
           if (type === 9) node = new Document(id);
-          else if (type === 3) node = new Text(id);
-          else if (type === 8) node = new Comment(id);
+          else if (type === 3) node = new Text(INTERNAL_NODE_ID, id);
+          else if (type === 8) node = new Comment(INTERNAL_NODE_ID, id);
           else if (type === 1) {
             const tagName = (tag || '').toLowerCase();
             const Constructor = htmlElementConstructors[tagName] || (tagName.includes('-') ? HTMLElement : HTMLUnknownElement);
@@ -4168,6 +4286,7 @@
       const exports = {
         document,
         Node,
+        CharacterData,
         Text,
         Comment,
         Attr,

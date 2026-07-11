@@ -2040,6 +2040,56 @@ void test_comment_nodes_wrap_for_sibling_traversal()
         "comment sibling nodes should wrap as Comment instead of being treated as Elements");
 }
 
+void test_character_data_interface()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const checks = [];
+
+    // Text and Comment derive from CharacterData, and a Comment is not a Text.
+    const text = document.createTextNode('test');
+    const comment = document.createComment('test');
+    checks.push(text instanceof CharacterData);
+    checks.push(comment instanceof CharacterData);
+    checks.push(!(comment instanceof Text));
+    checks.push(Object.getPrototypeOf(Text.prototype) === CharacterData.prototype);
+
+    // The mutation API, including WebIDL unsigned-long wraparound: -1 becomes
+    // 4294967295, which is past the end and must throw rather than clamp.
+    text.appendData('ing');
+    checks.push(text.data === 'testing');
+    text.replaceData(0, 4, 'X');
+    checks.push(text.data === 'Xing');
+    checks.push(text.substringData(1, 2) === 'in');
+    let threw = false;
+    try { text.deleteData(-1, 0); } catch (error) { threw = error.name === 'IndexSizeError'; }
+    checks.push(threw);
+
+    // A number argument is data, not a node id: `new Text(42)` must stringify.
+    // Telling the internal (id-based) and page (data-based) constructor paths
+    // apart by argument type would silently adopt node 42 here.
+    checks.push(new Text(42).data === '42');
+    checks.push(new Text(undefined).data === '');
+    checks.push(new Text(null).data === 'null');
+    checks.push(new Comment(7).data === '7');
+
+    // A constructed node keeps its wrapper identity once inserted.
+    const constructed = new Text('tail');
+    document.body.appendChild(constructed);
+    checks.push(document.body.lastChild === constructed);
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/character-data.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "CharacterData should own the data mutation API and treat a numeric constructor argument as data");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -12410,6 +12460,7 @@ int main()
         test_document_write_external_script_and_open_close();
         test_document_write_escaped_script_text_remains_text();
         test_comment_nodes_wrap_for_sibling_traversal();
+        test_character_data_interface();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();

@@ -47,6 +47,7 @@
       const {
         document,
         Node,
+        CharacterData,
         Text,
         Comment,
         Attr,
@@ -238,6 +239,7 @@
         global.AbortController = AbortController;
         global.MutationObserver = MutationObserver;
         global.Node = Node;
+        global.CharacterData = CharacterData;
         global.Text = Text;
         global.Comment = Comment;
         global.Attr = Attr;
