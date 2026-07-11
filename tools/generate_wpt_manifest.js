@@ -142,6 +142,36 @@ function attributeValue(tag, name) {
   return match ? (match[1] || match[2] || match[3] || '') : '';
 }
 
+function hasLinkRel(source, rel) {
+  const linkPattern = /<link\b[^>]*>/gi;
+  let match;
+  while ((match = linkPattern.exec(source)) !== null) {
+    if (attributeValue(match[0], 'rel').toLowerCase().split(/\s+/).includes(rel)) return true;
+  }
+  return false;
+}
+
+function isCrashTestPath(relativePath) {
+  const segments = normalizeSlashes(relativePath).split('/');
+  const basename = segments[segments.length - 1];
+  return segments.slice(0, -1).includes('crashtests') || /-crash\.html$/.test(basename);
+}
+
+// An .html file that never loads testharness.js cannot report a harness result no
+// matter how complete the engine becomes, so keeping it in the manifest only
+// manufactures a permanent failure. WPT uses bare HTML for three such things:
+// reftests (verified by comparing rendering against a -ref file), crashtests
+// (which assert only "did not crash"), and data documents that a real test loads
+// as a fixture. .any.js/.window.js are exempt because the runner injects
+// testharness into the document it generates for them.
+function missingTestharnessReason(relativePath, source) {
+  if (!relativePath.endsWith('.html')) return null;
+  if (source.includes('testharness.js')) return null;
+  if (hasLinkRel(source, 'match') || hasLinkRel(source, 'mismatch')) return 'reftest';
+  if (isCrashTestPath(relativePath) || /\btest-wait\b/.test(source)) return 'crashtest';
+  return 'not a testharness test';
+}
+
 function localHtmlResourceReferences(source) {
   const references = scriptSourceReferences(source);
   const linkPattern = /<link\b[^>]*>/gi;
@@ -228,9 +258,14 @@ function generateManifest(options) {
     if (!matchesPrefixes(relativePath, options.prefixes)) continue;
 
     let reason = pathSkipReason(relativePath);
-    if (!reason && !options.includeUnsupported) {
+    if (!reason) {
       const source = fs.readFileSync(path.join(root, relativePath), 'utf8');
-      reason = missingLocalResourceReason(root, relativePath, source) || sourceSkipReason(source);
+      // Applies even under --include-unsupported: a file with no testharness is
+      // unrunnable by this runner regardless of which engine features exist.
+      reason = missingTestharnessReason(relativePath, source);
+      if (!reason && !options.includeUnsupported) {
+        reason = missingLocalResourceReason(root, relativePath, source) || sourceSkipReason(source);
+      }
     }
     if (reason) {
       skipped[reason] = (skipped[reason] || 0) + 1;
@@ -289,6 +324,7 @@ if (require.main === module) {
 module.exports = {
   generateManifest,
   manifestName,
+  missingTestharnessReason,
   normalizePrefix,
   parseArgs,
   pathSkipReason,

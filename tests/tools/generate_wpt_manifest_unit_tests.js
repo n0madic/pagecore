@@ -9,6 +9,7 @@ const path = require('path');
 const {
   generateManifest,
   manifestName,
+  missingTestharnessReason,
   normalizePrefix,
   pathSkipReason,
   sourceSkipReason
@@ -70,6 +71,69 @@ test('sourceSkipReason rejects unsupported WPT infrastructure', () => {
   assert.strictEqual(sourceSkipReason('document.createElement("iframe")'), 'iframe navigation');
   assert.strictEqual(sourceSkipReason('anchor.href = "javascript:globalThis.ok = true"'), 'javascript URL navigation');
 });
+
+test('missingTestharnessReason classifies HTML that can never report a harness result', () => {
+  assert.strictEqual(
+    missingTestharnessReason('css/cssom-view/inline-box.html', '<link rel="match" href="inline-box-ref.html">\n<div>x</div>'),
+    'reftest'
+  );
+  assert.strictEqual(
+    missingTestharnessReason('dom/crashtests/append-child-recurse.html', '<script>document.body.appendChild(document.body);</script>'),
+    'crashtest'
+  );
+  assert.strictEqual(
+    missingTestharnessReason('dom/abort/abort-signal-any-crash.html', '<html class=test-wait><script>go();</script>'),
+    'crashtest'
+  );
+  // A data document that a real test loads as a fixture (e.g. the encoding
+  // legacy-mb tables): no script at all, so it can only ever be a false failure.
+  assert.strictEqual(
+    missingTestharnessReason('encoding/legacy-mb-japanese/euc-jp/eucjp_chars.html', '<meta charset="euc-jp"><span data-cp="A5">x</span>'),
+    'not a testharness test'
+  );
+});
+
+test('missingTestharnessReason keeps real tests that only look like crashtests', () => {
+  // Named -crash.html but genuinely driven by testharness: the WPT naming
+  // convention alone would silently drop this real test.
+  assert.strictEqual(
+    missingTestharnessReason('dom/svg-insert-crash.html', '<script src="/resources/testharness.js"></script>\n<script>async_test(t => {});</script>'),
+    null
+  );
+  // Lives under crashtests/ but is a .any.js, so the runner injects testharness
+  // into the document it generates.
+  assert.strictEqual(
+    missingTestharnessReason('dom/observable/tentative/crashtests/observable-gc.any.js', "promise_test(async () => {}, 'gc');"),
+    null
+  );
+});
+
+test('generateManifest drops non-testharness HTML, including under --include-unsupported', () => withTempWptTree((root) => {
+  writeFile(root, 'resources/testharness.js', '');
+  writeFile(root, 'dom/real.html', '<script src="/resources/testharness.js"></script>\n<script>test(() => {}, "real");</script>');
+  writeFile(root, 'dom/pretty.html', '<link rel="match" href="pretty-ref.html">\n<div>x</div>');
+  writeFile(root, 'dom/crashtests/boom.html', '<script>boom();</script>');
+  writeFile(root, 'dom/fixture.html', '<span data-cp="A5">x</span>');
+
+  for (const includeUnsupported of [false, true]) {
+    const manifest = generateManifest({
+      root,
+      prefixes: ['dom/'],
+      requiresRenderingPrefixes: [],
+      includeUnsupported,
+      limit: null
+    });
+
+    assert.deepStrictEqual(
+      manifest.tests.map((entry) => entry.path),
+      ['/dom/real.html'],
+      `a file with no testharness is unrunnable regardless of includeUnsupported=${includeUnsupported}`
+    );
+    assert.strictEqual(manifest.skipped.reftest, 1);
+    assert.strictEqual(manifest.skipped.crashtest, 1);
+    assert.strictEqual(manifest.skipped['not a testharness test'], 1);
+  }
+}));
 
 test('generateManifest emits sorted all-pass tests and rendering markers', () => withTempWptTree((root) => {
   writeFile(root, 'resources/testharness.js', '');

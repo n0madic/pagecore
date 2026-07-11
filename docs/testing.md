@@ -156,8 +156,20 @@ window-variant `.any.js` tests. The generator filters out common unsupported WPT
 infrastructure such as workers, service workers, Python handlers, wptserve
 template substitutions, iframe navigation, JavaScript URL navigation, persistent
 network APIs, cross-origin helpers, and HTML tests that reference missing local
-script or stylesheet resources in the selected WPT checkout. It does not
-implement WPT's full
+script or stylesheet resources in the selected WPT checkout.
+
+It also drops `.html` files that never load `testharness.js`, because they can
+never report a harness result and would otherwise be permanent false failures.
+WPT uses bare HTML for reftests (`<link rel=match>`, verified by comparing
+rendering), crashtests (which only assert "did not crash"), and data documents
+that a real test loads as a fixture — the `encoding/legacy-mb-*` byte tables are
+the largest group. The check is content-based, not name-based, on purpose: WPT
+has files named `-crash.html` that *are* driven by testharness, and `.any.js`
+files under `crashtests/` that are ordinary `promise_test`s, and both must be
+kept. `.any.js`/`.window.js` are exempt because the runner injects testharness
+into the document it generates for them.
+
+The generator does not implement WPT's full
 manifest discovery, workers, service workers, Python handlers, websockets,
 HTTPS certificates, the full wptserve feature set, or cross-origin/multi-origin
 requests — every test is served from the single synthetic origin
