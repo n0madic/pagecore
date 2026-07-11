@@ -1,0 +1,21 @@
+{
+  "root": ".",
+  "tests": [
+    {
+      "name": "cluster-a",
+      "path": "/cluster-a.window.js",
+      "expected": { "harness": "OK", "subtests": "all-pass" }
+    },
+    {
+      "name": "cluster-b",
+      "path": "/cluster-b.window.js",
+      "expected": { "harness": "OK", "subtests": "all-pass" }
+    },
+    {
+      "name": "zero-wait",
+      "path": "/good-zero-wait.window.js",
+      "waitMs": 0,
+      "expected": { "harness": "OK", "subtests": { "ok subtest": "PASS" } }
+    }
+  ]
+}

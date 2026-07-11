@@ -51,6 +51,51 @@ The manifest is authoritative. Each test lists expected harness and subtest
 statuses; known failures should be represented there, so both unexpected
 failures and unexpected passes are visible.
 
+## Running a subset in parallel (`--jobs`)
+
+`run_wpt_subset.js` runs up to `--jobs N` case runners concurrently, defaulting
+to the machine's available parallelism. Each WPT test is already an isolated
+process against an offline corpus, so the workload parallelizes well: a 127-test
+sample takes 127s with `--jobs 1` and 37s with `--jobs 8`; a 1268-test corpus
+drops from roughly 21 minutes to about 3 minutes.
+
+Results are still emitted in manifest order — a finished test is only printed
+once every earlier test has printed — so raising `--jobs` never reorders output
+or makes a run less reproducible. Pass `--jobs 1` when you want strictly
+sequential execution.
+
+Runtime is dominated by a small tail of outliers (a few very large reflection
+tests, and tests where a testharness subtest hits its own internal timeout, at
+~30s each) rather than by the typical test (~0.5s). Tests that never call
+`done()` are *not* slow: they exit as soon as the page quiesces, without
+consuming the `--wait-ms` budget.
+
+## Failure reports (`--report`)
+
+`--report PATH` writes a structured JSON report: per-test harness status,
+subtest statuses and messages, per-test durations, the slowest tests, and
+failures grouped into clusters by cause.
+
+```sh
+node tools/run_wpt_subset.js \
+  --case-runner build/pagecore_wpt_case \
+  --manifest /tmp/pagecore-wpt-generated.json \
+  --root /path/to/wpt \
+  --jobs 8 --report /tmp/pagecore-wpt-report.json
+```
+
+Clustering normalizes each failure line (quoted strings and numbers are folded
+away) so that one underlying defect reported across hundreds of tests with
+different values collapses into a single cause. It is deliberately value-based
+rather than a hardcoded taxonomy of subsystems, which would rot as the engine
+changes. The top clusters are also printed at the end of a failing run, so
+"what is failing and why" is answered by the run itself instead of by ad-hoc
+post-processing.
+
+Note that the summary line counts *test files* for `pass`/`fail`/`skip`, and
+reports `failureLines` separately, because one failing file can contribute many
+failing subtests.
+
 ## Extended WPT
 
 The extended WPT path is opt-in and reads tests from a local upstream

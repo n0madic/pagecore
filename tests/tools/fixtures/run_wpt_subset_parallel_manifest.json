@@ -1,0 +1,25 @@
+{
+  "root": ".",
+  "tests": [
+    {
+      "name": "barrier-1",
+      "path": "/barrier-1.window.js",
+      "expected": { "harness": "OK", "subtests": { "barrier subtest": "PASS" } }
+    },
+    {
+      "name": "barrier-2",
+      "path": "/barrier-2.window.js",
+      "expected": { "harness": "OK", "subtests": { "barrier subtest": "PASS" } }
+    },
+    {
+      "name": "barrier-3",
+      "path": "/barrier-3.window.js",
+      "expected": { "harness": "OK", "subtests": { "barrier subtest": "PASS" } }
+    },
+    {
+      "name": "barrier-4",
+      "path": "/barrier-4.window.js",
+      "expected": { "harness": "OK", "subtests": { "barrier subtest": "PASS" } }
+    }
+  ]
+}
