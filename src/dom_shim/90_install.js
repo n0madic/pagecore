@@ -74,6 +74,11 @@
         HTMLDialogElement,
         HTMLDivElement,
         HTMLDListElement,
+        HTMLDirectoryElement,
+        HTMLFontElement,
+        HTMLFrameElement,
+        HTMLFrameSetElement,
+        HTMLMarqueeElement,
         HTMLEmbedElement,
         HTMLFieldSetElement,
         HTMLFormElement,
@@ -271,6 +276,11 @@
         global.HTMLDetailsElement = HTMLDetailsElement;
         global.HTMLDialogElement = HTMLDialogElement;
         global.HTMLDivElement = HTMLDivElement;
+        global.HTMLDirectoryElement = HTMLDirectoryElement;
+        global.HTMLFontElement = HTMLFontElement;
+        global.HTMLFrameElement = HTMLFrameElement;
+        global.HTMLFrameSetElement = HTMLFrameSetElement;
+        global.HTMLMarqueeElement = HTMLMarqueeElement;
         global.HTMLDListElement = HTMLDListElement;
         global.HTMLEmbedElement = HTMLEmbedElement;
         global.HTMLFieldSetElement = HTMLFieldSetElement;

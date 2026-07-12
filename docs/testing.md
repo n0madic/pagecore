@@ -64,6 +64,13 @@ once every earlier test has printed — so raising `--jobs` never reorders outpu
 or makes a run less reproducible. Pass `--jobs 1` when you want strictly
 sequential execution.
 
+`--wait-ms` also raises the per-script and aggregate JavaScript deadlines when it
+exceeds their defaults (30s and 60s). Without that, a large generated test — the
+`html/dom/reflection-*` files drive thousands of subtests from a single inline
+script and take tens of seconds — is interrupted mid-script no matter how long
+you asked to wait, and reports as "WPT did not complete" instead of as a result.
+A shorter `--wait-ms` never lowers those deadlines.
+
 Runtime is dominated by a small tail of outliers (a few very large reflection
 tests, and tests where a testharness subtest hits its own internal timeout, at
 ~30s each) rather than by the typical test (~0.5s). Tests that never call

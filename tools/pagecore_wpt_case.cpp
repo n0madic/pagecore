@@ -487,6 +487,19 @@ int main(int argc, char** argv)
         pagecore::LoadOptions load_options;
         load_options.base_url = page_url;
         load_options.wait_time = std::chrono::milliseconds(options.wait_ms);
+
+        // --wait-ms is how long the caller is willing to wait for this test, so the
+        // script budgets have to track it. Otherwise a big generated test (the
+        // html/dom/reflection-* files run thousands of subtests from a single inline
+        // script, taking tens of seconds) is killed by the default 30s per-script
+        // deadline no matter how long --wait-ms says to wait, and reports as
+        // "WPT did not complete" rather than as a result. Never lower the defaults:
+        // a short --wait-ms should not make scripts *more* likely to be interrupted.
+        const auto wait = std::chrono::milliseconds(options.wait_ms);
+        load_options.js_timeout = std::max(load_options.js_timeout, wait);
+        if (load_options.max_load_time) {
+            load_options.max_load_time = std::max(*load_options.max_load_time, wait);
+        }
         load_options.console_log = [](std::string_view severity, std::string_view message) {
             std::cerr << "console." << severity << ": " << message << "\n";
         };

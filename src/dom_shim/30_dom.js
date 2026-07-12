@@ -3449,6 +3449,234 @@
             return offsetParentFor(this);
           }
         }
+
+        // ---- IDL attribute reflection ----------------------------------------
+        // HTML exposes content attributes as IDL properties with per-type coercion
+        // rules. Only a handful were hand-written (className, hidden), so most were
+        // missing entirely. A table keeps them consistent and cheap to extend.
+
+        const MAX_LONG = 2147483647;
+        const MIN_LONG = -2147483648;
+        const MAX_UNSIGNED_LONG = 4294967295;
+
+        // The HTML "rules for parsing integers": leading ASCII whitespace, an
+        // optional sign, then digits — and nothing else is inspected, so "5%" and
+        // "+100" and " \t 7" all have well-defined outcomes. Returns null on failure,
+        // which callers turn into the attribute's default value.
+        function parseHtmlInteger(input) {
+          const text = String(input);
+          let position = 0;
+          while (position < text.length && ' \t\n\f\r'.includes(text[position])) position++;
+          let sign = 1;
+          if (text[position] === '-') {
+            sign = -1;
+            position++;
+          } else if (text[position] === '+') {
+            position++;
+          }
+          const start = position;
+          while (position < text.length && text[position] >= '0' && text[position] <= '9') position++;
+          if (position === start) return null;
+          const value = sign * Number(text.slice(start, position));
+          // "-0" parses to -0, but the reflected value is the integer zero: without
+          // this, tabIndex="-0" reads back as -0 and fails assert_equals against 0.
+          return value === 0 ? 0 : value;
+        }
+
+        function defineReflected(prototype, idlName, descriptor) {
+          Object.defineProperty(prototype, idlName, {
+            configurable: true,
+            enumerable: true,
+            get: descriptor.get,
+            set: descriptor.set
+          });
+        }
+
+        function reflectString(prototype, idlName, attributeName) {
+          defineReflected(prototype, idlName, {
+            get() {
+              const value = this.getAttribute(attributeName);
+              return value === null ? '' : value;
+            },
+            set(value) { this.setAttribute(attributeName, String(value)); }
+          });
+        }
+
+        // Nullable DOMString (the ARIA surface): absent reads back as null, and both
+        // null and undefined remove the attribute rather than stringifying.
+        function reflectNullableString(prototype, idlName, attributeName) {
+          defineReflected(prototype, idlName, {
+            get() { return this.getAttribute(attributeName); },
+            set(value) {
+              if (value === null || value === undefined) this.removeAttribute(attributeName);
+              else this.setAttribute(attributeName, String(value));
+            }
+          });
+        }
+
+        function reflectBoolean(prototype, idlName, attributeName) {
+          defineReflected(prototype, idlName, {
+            get() { return this.hasAttribute(attributeName); },
+            set(value) {
+              if (value) this.setAttribute(attributeName, '');
+              else this.removeAttribute(attributeName);
+            }
+          });
+        }
+
+        function reflectLong(prototype, idlName, attributeName, defaultValue) {
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null) return defaultValue;
+              const parsed = parseHtmlInteger(raw);
+              if (parsed === null || parsed > MAX_LONG || parsed < MIN_LONG) return defaultValue;
+              return parsed;
+            },
+            // WebIDL `long` is ToInt32, so 1.5 becomes 1 and NaN becomes 0.
+            set(value) { this.setAttribute(attributeName, String(Number(value) | 0)); }
+          });
+        }
+
+        // Reflected unsigned longs are capped at MAX_LONG, not at the IDL type's
+        // 4294967295: HTML requires the parsed value to be "in the range of the IDL
+        // attribute's type", and anything above 2147483647 falls back to the default.
+        function reflectUnsignedLong(prototype, idlName, attributeName, defaultValue = 0) {
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null) return defaultValue;
+              const parsed = parseHtmlInteger(raw);
+              if (parsed === null || parsed < 0 || parsed > MAX_LONG) return defaultValue;
+              return parsed;
+            },
+            set(value) { this.setAttribute(attributeName, String(Number(value) >>> 0)); }
+          });
+        }
+
+        // "Limited to only non-negative numbers": a negative assignment is an error
+        // rather than something to clamp, and an absent/invalid attribute reads back
+        // as the default (-1 when the spec gives none).
+        function reflectLimitedLong(prototype, idlName, attributeName, defaultValue = -1) {
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null) return defaultValue;
+              const parsed = parseHtmlInteger(raw);
+              if (parsed === null || parsed < 0 || parsed > MAX_LONG) return defaultValue;
+              return parsed;
+            },
+            set(value) {
+              const number = Number(value) | 0;
+              if (number < 0) throw new DOMException('The index is not in the allowed range.', 'IndexSizeError');
+              this.setAttribute(attributeName, String(number));
+            }
+          });
+        }
+
+        function reflectLimitedUnsignedLong(prototype, idlName, attributeName, defaultValue) {
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null) return defaultValue;
+              const parsed = parseHtmlInteger(raw);
+              // Zero is not allowed either: the spec's "limited to only positive
+              // numbers" falls back to the default for it.
+              if (parsed === null || parsed <= 0 || parsed > MAX_UNSIGNED_LONG) return defaultValue;
+              return parsed;
+            },
+            set(value) {
+              const number = Number(value) >>> 0;
+              if (number === 0) throw new DOMException('The index is not in the allowed range.', 'IndexSizeError');
+              this.setAttribute(attributeName, String(number));
+            }
+          });
+        }
+
+        // A URL-valued attribute reads back *resolved* against the document base URL,
+        // not as the literal attribute text.
+        //
+        // form.action and formAction carry an extra rule: a missing *or empty* value
+        // reads back as the document's own URL, because submitting with no action
+        // targets the current page.
+        function reflectUrl(prototype, idlName, attributeName, emptyIsDocumentUrl = false) {
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null || (emptyIsDocumentUrl && raw === '')) {
+                return emptyIsDocumentUrl ? document.URL : '';
+              }
+              const resolved = absoluteURL(raw);
+              return resolved || raw;
+            },
+            set(value) { this.setAttribute(attributeName, String(value)); }
+          });
+        }
+
+        // An enumerated attribute maps to its canonical keyword ASCII-case-
+        // insensitively; anything unrecognized (or absent) falls back to a default.
+        function reflectEnum(prototype, idlName, attributeName, keywords, defaultValue = '', invalidValue = defaultValue) {
+          const canonical = new Map(keywords.map((keyword) => [asciiLowercase(keyword), keyword]));
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null) return defaultValue;
+              const match = canonical.get(asciiLowercase(raw));
+              return match === undefined ? invalidValue : match;
+            },
+            set(value) { this.setAttribute(attributeName, String(value)); }
+          });
+        }
+
+        // A nullable enumerated attribute (crossOrigin): absent reads back as null,
+        // and assigning null removes the attribute instead of stringifying it.
+        function reflectNullableEnum(prototype, idlName, attributeName, keywords, invalidValue) {
+          const canonical = new Map(keywords.map((keyword) => [asciiLowercase(keyword), keyword]));
+          defineReflected(prototype, idlName, {
+            get() {
+              const raw = this.getAttribute(attributeName);
+              if (raw === null) return null;
+              const match = canonical.get(asciiLowercase(raw));
+              return match === undefined ? invalidValue : match;
+            },
+            set(value) {
+              if (value === null || value === undefined) this.removeAttribute(attributeName);
+              else this.setAttribute(attributeName, String(value));
+            }
+          });
+        }
+
+        // Global attributes, reflected on every HTML element.
+        reflectString(HTMLElement.prototype, 'title', 'title');
+        reflectString(HTMLElement.prototype, 'lang', 'lang');
+        reflectString(HTMLElement.prototype, 'accessKey', 'accesskey');
+        reflectString(HTMLElement.prototype, 'nonce', 'nonce');
+        reflectBoolean(HTMLElement.prototype, 'autofocus', 'autofocus');
+        reflectEnum(HTMLElement.prototype, 'dir', 'dir', ['ltr', 'rtl', 'auto']);
+        reflectEnum(HTMLElement.prototype, 'autocapitalize', 'autocapitalize', ['none', 'off', 'sentences', 'on', 'words', 'characters']);
+        reflectEnum(HTMLElement.prototype, 'enterKeyHint', 'enterkeyhint', ['enter', 'done', 'go', 'next', 'previous', 'search', 'send']);
+        reflectEnum(HTMLElement.prototype, 'inputMode', 'inputmode', ['none', 'text', 'tel', 'url', 'email', 'numeric', 'decimal', 'search']);
+        // tabIndex's missing-value default depends on whether the element is
+        // focusable, which is mostly a SHOULD; WPT deliberately does not test it.
+        reflectLong(HTMLElement.prototype, 'tabIndex', 'tabindex', 0);
+
+        // ARIAMixin lives on Element, not HTMLElement, so SVG and MathML elements
+        // reflect it too.
+        reflectNullableString(Element.prototype, 'role', 'role');
+        // String-valued only. aria-activedescendant reflects an *Element* reference,
+        // not a string, so it is deliberately not in this list.
+        const ARIA_REFLECTED = [
+          'Atomic', 'AutoComplete', 'BrailleLabel', 'BrailleRoleDescription',
+          'Busy', 'Checked', 'ColCount', 'ColIndex', 'ColIndexText', 'ColSpan', 'Current', 'Description',
+          'Disabled', 'Expanded', 'HasPopup', 'Hidden', 'Invalid', 'KeyShortcuts', 'Label', 'Level',
+          'Live', 'Modal', 'MultiLine', 'MultiSelectable', 'Orientation', 'Placeholder', 'PosInSet',
+          'Pressed', 'ReadOnly', 'Relevant', 'Required', 'RoleDescription', 'RowCount', 'RowIndex',
+          'RowIndexText', 'RowSpan', 'Selected', 'SetSize', 'Sort', 'ValueMax', 'ValueMin', 'ValueNow',
+          'ValueText'
+        ];
+        for (const suffix of ARIA_REFLECTED) {
+          reflectNullableString(Element.prototype, `aria${suffix}`, `aria-${asciiLowercase(suffix)}`);
+        }
         class HTMLFormControlElement extends HTMLElement {
           get form() { return formOwner(this); }
           get name() { return this.getAttribute('name') || ''; }
@@ -3851,8 +4079,115 @@
         class SVGTitleElement extends SVGElement {}
         class SVGDescElement extends SVGElement {}
 
+        // Obsolete elements still have real interfaces in every browser; without
+        // them these tags fell back to HTMLUnknownElement and reflected nothing.
+        class HTMLMarqueeElement extends HTMLElement {}
+        class HTMLFontElement extends HTMLElement {}
+        class HTMLDirectoryElement extends HTMLElement {}
+        class HTMLFrameElement extends HTMLElement {}
+        class HTMLFrameSetElement extends HTMLElement {}
+
+        // Per-element reflected attributes. Applied to the prototypes after the
+        // classes exist, which also lets a table entry replace an earlier hand-written
+        // accessor (input.minLength/maxLength used plain Number() parsing, which does
+        // not follow the HTML integer rules and never applied the -1 default).
+        reflectString(HTMLInputElement.prototype, 'accept', 'accept');
+        reflectString(HTMLInputElement.prototype, 'alt', 'alt');
+        reflectString(HTMLInputElement.prototype, 'autocomplete', 'autocomplete');
+        reflectString(HTMLInputElement.prototype, 'dirName', 'dirname');
+        reflectString(HTMLInputElement.prototype, 'max', 'max');
+        reflectString(HTMLInputElement.prototype, 'min', 'min');
+        reflectString(HTMLInputElement.prototype, 'pattern', 'pattern');
+        reflectString(HTMLInputElement.prototype, 'placeholder', 'placeholder');
+        reflectString(HTMLInputElement.prototype, 'step', 'step');
+        reflectString(HTMLInputElement.prototype, 'align', 'align');
+        reflectString(HTMLInputElement.prototype, 'useMap', 'usemap');
+        reflectString(HTMLInputElement.prototype, 'formTarget', 'formtarget');
+        reflectBoolean(HTMLInputElement.prototype, 'multiple', 'multiple');
+        reflectBoolean(HTMLInputElement.prototype, 'readOnly', 'readonly');
+        reflectBoolean(HTMLInputElement.prototype, 'required', 'required');
+        reflectBoolean(HTMLInputElement.prototype, 'formNoValidate', 'formnovalidate');
+        reflectUrl(HTMLInputElement.prototype, 'formAction', 'formaction', true);
+        reflectUrl(HTMLInputElement.prototype, 'src', 'src');
+        reflectUnsignedLong(HTMLInputElement.prototype, 'height', 'height');
+        reflectUnsignedLong(HTMLInputElement.prototype, 'width', 'width');
+        reflectLimitedLong(HTMLInputElement.prototype, 'maxLength', 'maxlength');
+        reflectLimitedLong(HTMLInputElement.prototype, 'minLength', 'minlength');
+        reflectLimitedUnsignedLong(HTMLInputElement.prototype, 'size', 'size', 20);
+        // formenctype/formmethod have no missing-value default (an absent attribute
+        // means "defer to the form"), but they do have an invalid-value default.
+        reflectEnum(HTMLInputElement.prototype, 'formEnctype', 'formenctype',
+          ['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain'], '', 'application/x-www-form-urlencoded');
+        reflectEnum(HTMLInputElement.prototype, 'formMethod', 'formmethod', ['get', 'post'], '', 'get');
+
+        reflectUrl(HTMLButtonElement.prototype, 'formAction', 'formaction', true);
+        reflectUrl(HTMLFormElement.prototype, 'action', 'action', true);
+        reflectString(HTMLButtonElement.prototype, 'formTarget', 'formtarget');
+        reflectBoolean(HTMLButtonElement.prototype, 'formNoValidate', 'formnovalidate');
+        reflectEnum(HTMLButtonElement.prototype, 'formEnctype', 'formenctype',
+          ['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain'], '', 'application/x-www-form-urlencoded');
+        reflectEnum(HTMLButtonElement.prototype, 'formMethod', 'formmethod', ['get', 'post', 'dialog'], '', 'get');
+
+        reflectString(HTMLMarqueeElement.prototype, 'bgColor', 'bgcolor');
+        reflectString(HTMLMarqueeElement.prototype, 'height', 'height');
+        reflectString(HTMLMarqueeElement.prototype, 'width', 'width');
+        reflectBoolean(HTMLMarqueeElement.prototype, 'trueSpeed', 'truespeed');
+        reflectUnsignedLong(HTMLMarqueeElement.prototype, 'hspace', 'hspace');
+        reflectUnsignedLong(HTMLMarqueeElement.prototype, 'vspace', 'vspace');
+        reflectUnsignedLong(HTMLMarqueeElement.prototype, 'scrollAmount', 'scrollamount', 6);
+        reflectUnsignedLong(HTMLMarqueeElement.prototype, 'scrollDelay', 'scrolldelay', 85);
+
+        reflectString(HTMLFontElement.prototype, 'color', 'color');
+        reflectString(HTMLFontElement.prototype, 'face', 'face');
+        reflectString(HTMLFontElement.prototype, 'size', 'size');
+
+        reflectBoolean(HTMLDirectoryElement.prototype, 'compact', 'compact');
+
+        reflectString(HTMLFrameElement.prototype, 'name', 'name');
+        reflectString(HTMLFrameElement.prototype, 'scrolling', 'scrolling');
+        reflectString(HTMLFrameElement.prototype, 'frameBorder', 'frameborder');
+        reflectString(HTMLFrameElement.prototype, 'marginHeight', 'marginheight');
+        reflectString(HTMLFrameElement.prototype, 'marginWidth', 'marginwidth');
+        reflectBoolean(HTMLFrameElement.prototype, 'noResize', 'noresize');
+        reflectUrl(HTMLFrameElement.prototype, 'longDesc', 'longdesc');
+
+        reflectString(HTMLFrameSetElement.prototype, 'cols', 'cols');
+        reflectString(HTMLFrameSetElement.prototype, 'rows', 'rows');
+
+        // Metadata elements: <link>/<meta>/<base> carry most of what a scraper reads
+        // out of <head>, so these matter well beyond the WPT score.
+        const REFERRER_POLICIES = ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin',
+          'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'];
+        const LINK_DESTINATIONS = ['fetch', 'audio', 'document', 'embed', 'font', 'image', 'manifest', 'object',
+          'report', 'script', 'sharedworker', 'style', 'track', 'video', 'worker', 'xslt'];
+
+        for (const name of ['media', 'integrity', 'hreflang', 'charset', 'rev', 'target', 'nonce']) {
+          reflectString(HTMLLinkElement.prototype, name, name);
+        }
+        reflectEnum(HTMLLinkElement.prototype, 'as', 'as', LINK_DESTINATIONS);
+        reflectEnum(HTMLLinkElement.prototype, 'referrerPolicy', 'referrerpolicy', REFERRER_POLICIES);
+        // "" is not a keyword, so it falls through to the invalid-value default.
+        reflectNullableEnum(HTMLLinkElement.prototype, 'crossOrigin', 'crossorigin', ['anonymous', 'use-credentials'], 'anonymous');
+        reflectBoolean(HTMLLinkElement.prototype, 'disabled', 'disabled');
+
+        reflectString(HTMLBaseElement.prototype, 'target', 'target');
+
+        reflectString(HTMLMetaElement.prototype, 'name', 'name');
+        reflectString(HTMLMetaElement.prototype, 'content', 'content');
+        reflectString(HTMLMetaElement.prototype, 'media', 'media');
+        reflectString(HTMLMetaElement.prototype, 'scheme', 'scheme');
+        reflectString(HTMLMetaElement.prototype, 'httpEquiv', 'http-equiv');
+
+        reflectString(HTMLStyleElement.prototype, 'media', 'media');
+        reflectString(HTMLStyleElement.prototype, 'nonce', 'nonce');
+
         const htmlElementConstructors = {
           a: HTMLAnchorElement,
+          marquee: HTMLMarqueeElement,
+          font: HTMLFontElement,
+          dir: HTMLDirectoryElement,
+          frame: HTMLFrameElement,
+          frameset: HTMLFrameSetElement,
           area: HTMLAreaElement,
           audio: HTMLAudioElement,
           base: HTMLBaseElement,
@@ -4522,6 +4857,11 @@
         HTMLDialogElement,
         HTMLDivElement,
         HTMLDListElement,
+        HTMLDirectoryElement,
+        HTMLFontElement,
+        HTMLFrameElement,
+        HTMLFrameSetElement,
+        HTMLMarqueeElement,
         HTMLEmbedElement,
         HTMLFieldSetElement,
         HTMLFormElement,

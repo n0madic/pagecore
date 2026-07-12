@@ -2091,6 +2091,90 @@ void test_character_data_interface()
         "CharacterData should own the data mutation API and treat a numeric constructor argument as data");
 }
 
+void test_idl_attribute_reflection()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="d"></div>
+  <input id="i">
+  <link id="l" rel="preload">
+  <script>
+    const checks = [];
+    const div = document.getElementById('d');
+    const input = document.getElementById('i');
+    const link = document.getElementById('l');
+
+    // Global attributes reflect on every HTML element.
+    div.title = 'hi';
+    checks.push(div.getAttribute('title') === 'hi');
+    div.setAttribute('lang', 'en');
+    checks.push(div.lang === 'en');
+
+    // Enumerated: canonicalized case-insensitively, invalid falls back to "".
+    div.setAttribute('dir', 'RTL');
+    checks.push(div.dir === 'rtl');
+    div.setAttribute('dir', 'sideways');
+    checks.push(div.dir === '');
+
+    // long, parsed by the HTML integer rules rather than Number(). Those rules stop
+    // at the first non-digit and ignore the remainder, so "5%" is 5 (not NaN and not
+    // an error), while a *leading* non-digit is invalid and yields the default.
+    div.setAttribute('tabindex', '5%');
+    checks.push(div.tabIndex === 5);
+    div.setAttribute('tabindex', '%5');
+    checks.push(div.tabIndex === 0);
+    div.setAttribute('tabindex', ' 7');
+    checks.push(div.tabIndex === 7);
+    // "-0" parses to the integer zero, not to -0.
+    div.setAttribute('tabindex', '-0');
+    checks.push(Object.is(div.tabIndex, 0));
+
+    // ARIA reflects as nullable strings: absent is null, and null removes.
+    checks.push(div.ariaLabel === null);
+    div.ariaLabel = 'label';
+    checks.push(div.getAttribute('aria-label') === 'label');
+    div.ariaLabel = null;
+    checks.push(!div.hasAttribute('aria-label') && div.ariaLabel === null);
+
+    // A reflected unsigned long is capped at 2147483647, not at 2^32-1.
+    input.setAttribute('height', '2147483648');
+    checks.push(input.height === 0);
+    input.setAttribute('height', '120');
+    checks.push(input.height === 120);
+
+    // size is limited to positive values, with a default of 20.
+    checks.push(input.size === 20);
+    input.setAttribute('size', '0');
+    checks.push(input.size === 20);
+
+    // maxLength is a "limited long": a negative assignment throws.
+    let threw = false;
+    try { input.maxLength = -1; } catch (error) { threw = error.name === 'IndexSizeError'; }
+    checks.push(threw);
+
+    // formAction reads back the document URL when missing or empty.
+    checks.push(input.formAction === document.URL);
+    input.setAttribute('formaction', '');
+    checks.push(input.formAction === document.URL);
+
+    // crossOrigin is a nullable enum: absent is null, invalid maps to "anonymous".
+    checks.push(link.crossOrigin === null);
+    link.setAttribute('crossorigin', 'bogus');
+    checks.push(link.crossOrigin === 'anonymous');
+    link.setAttribute('as', 'SCRIPT');
+    checks.push(link.as === 'script');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/reflection.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "content attributes should reflect as IDL properties with the per-type HTML coercion rules");
+}
+
 void test_live_collections()
 {
     pagecore::Page page;
@@ -12573,6 +12657,7 @@ int main()
         test_document_write_escaped_script_text_remains_text();
         test_comment_nodes_wrap_for_sibling_traversal();
         test_character_data_interface();
+        test_idl_attribute_reflection();
         test_live_collections();
         test_dom_interface_globals();
         test_create_comment_nodes_are_not_visible_text();
