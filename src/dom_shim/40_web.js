@@ -94,10 +94,192 @@
           get [Symbol.toStringTag]() { return 'DOMRectList'; }
         }
 
+        function isCharacterDataNode(node) {
+          return node != null && typeof node.data === 'string';
+        }
+
         function nodeLength(node) {
           if (!node) return 0;
-          if (node.nodeType === 3) return node.data.length;
+          // Any CharacterData (Text, Comment, CDATASection, ProcessingInstruction),
+          // not just Text -- a Comment's "length" is its data length too.
+          if (isCharacterDataNode(node)) return node.data.length;
           return node.childNodes.length;
+        }
+
+        function nodeIndexOf(node) {
+          let index = 0;
+          for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) index++;
+          return index;
+        }
+
+        // Preorder "next node", unbounded (returns null past the last node in
+        // the tree). Combined with a stop condition, this walks exactly the
+        // nodes between two points without needing a dedicated tree-walker.
+        function nextNodeInTreeOrder(node) {
+          if (node.firstChild) return node.firstChild;
+          let current = node;
+          while (current) {
+            if (current.nextSibling) return current.nextSibling;
+            current = current.parentNode;
+          }
+          return null;
+        }
+
+        // The node immediately after `node`'s entire subtree ends, i.e. skips
+        // over its descendants (unlike nextNodeInTreeOrder, which would visit
+        // them). Used to bound a walk to "just this subtree".
+        function nodeAfterSubtree(node) {
+          let current = node;
+          while (current) {
+            if (current.nextSibling) return current.nextSibling;
+            current = current.parentNode;
+          }
+          return null;
+        }
+
+        // https://dom.spec.whatwg.org/#concept-range-bp-position -- returns -1
+        // if (nodeA, offsetA) is before (nodeB, offsetB), 0 if equal, 1 if after.
+        // Built on the already-tested compareDocumentPosition() rather than a
+        // second, parallel tree-order implementation.
+        function comparePointPosition(nodeA, offsetA, nodeB, offsetB) {
+          if (nodeA === nodeB) return offsetA < offsetB ? -1 : offsetA > offsetB ? 1 : 0;
+          const CONTAINS = 8, CONTAINED_BY = 16, PRECEDING = 2;
+          const position = nodeA.compareDocumentPosition(nodeB);
+          if (position & CONTAINED_BY) {
+            // nodeA is an ancestor of nodeB.
+            let child = nodeB;
+            while (child.parentNode !== nodeA) child = child.parentNode;
+            return nodeIndexOf(child) < offsetA ? 1 : -1;
+          }
+          if (position & CONTAINS) {
+            // nodeB is an ancestor of nodeA.
+            let child = nodeA;
+            while (child.parentNode !== nodeB) child = child.parentNode;
+            return nodeIndexOf(child) < offsetB ? -1 : 1;
+          }
+          return (position & PRECEDING) ? 1 : -1;
+        }
+
+        // A node is "partially contained" in range if it is an inclusive
+        // ancestor of exactly one of range's two boundary-point containers.
+        function isPartiallyContained(node, range) {
+          const startInside = node.contains(range._startContainer);
+          const endInside = node.contains(range._endContainer);
+          return startInside !== endInside;
+        }
+
+        // A node is "fully contained" if its entire content sits strictly
+        // between range's boundary points.
+        function isFullyContained(node, range) {
+          return comparePointPosition(node, 0, range._startContainer, range._startOffset) > 0
+            && comparePointPosition(node, nodeLength(node), range._endContainer, range._endOffset) < 0;
+        }
+
+        function commonAncestorContainerOf(range) {
+          let node = range._startContainer;
+          while (!node.contains(range._endContainer)) node = node.parentNode;
+          return node;
+        }
+
+        // Shared by extractContents() (clone=false) and cloneContents() (clone=true):
+        // https://dom.spec.whatwg.org/#concept-range-extract
+        // https://dom.spec.whatwg.org/#concept-range-clone
+        function rangeExtractOrClone(range, clone) {
+          const fragment = document.createDocumentFragment();
+          if (range.collapsed) return fragment;
+
+          const originalStartNode = range._startContainer;
+          const originalStartOffset = range._startOffset;
+          const originalEndNode = range._endContainer;
+          const originalEndOffset = range._endOffset;
+
+          if (originalStartNode === originalEndNode && isCharacterDataNode(originalStartNode)) {
+            const clonedNode = originalStartNode.cloneNode(false);
+            clonedNode.data = originalStartNode.substringData(originalStartOffset, originalEndOffset - originalStartOffset);
+            fragment.appendChild(clonedNode);
+            if (!clone) originalStartNode.replaceData(originalStartOffset, originalEndOffset - originalStartOffset, '');
+            return fragment;
+          }
+
+          const commonAncestor = commonAncestorContainerOf(range);
+
+          let firstPartiallyContainedChild = null;
+          if (!originalStartNode.contains(originalEndNode)) {
+            for (const child of commonAncestor.childNodes) {
+              if (isPartiallyContained(child, range)) { firstPartiallyContainedChild = child; break; }
+            }
+          }
+
+          let lastPartiallyContainedChild = null;
+          if (!originalEndNode.contains(originalStartNode)) {
+            const children = [...commonAncestor.childNodes];
+            for (let i = children.length - 1; i >= 0; i--) {
+              if (isPartiallyContained(children[i], range)) { lastPartiallyContainedChild = children[i]; break; }
+            }
+          }
+
+          const containedChildren = [...commonAncestor.childNodes].filter((child) => isFullyContained(child, range));
+          if (containedChildren.some((child) => child.nodeType === 10)) {
+            throw new DOMException('A DocumentType cannot be extracted or cloned.', 'HierarchyRequestError');
+          }
+
+          let newNode, newOffset;
+          if (originalStartNode.contains(originalEndNode)) {
+            newNode = originalStartNode;
+            newOffset = originalStartOffset;
+          } else {
+            let referenceNode = originalStartNode;
+            while (referenceNode.parentNode && !referenceNode.parentNode.contains(originalEndNode)) {
+              referenceNode = referenceNode.parentNode;
+            }
+            newNode = referenceNode.parentNode;
+            newOffset = nodeIndexOf(referenceNode) + 1;
+          }
+
+          if (firstPartiallyContainedChild && isCharacterDataNode(firstPartiallyContainedChild)) {
+            const clonedNode = originalStartNode.cloneNode(false);
+            clonedNode.data = originalStartNode.substringData(originalStartOffset, nodeLength(originalStartNode) - originalStartOffset);
+            fragment.appendChild(clonedNode);
+            if (!clone) originalStartNode.replaceData(originalStartOffset, nodeLength(originalStartNode) - originalStartOffset, '');
+          } else if (firstPartiallyContainedChild) {
+            const clonedChild = firstPartiallyContainedChild.cloneNode(false);
+            fragment.appendChild(clonedChild);
+            const subrange = new Range();
+            subrange._startContainer = originalStartNode;
+            subrange._startOffset = originalStartOffset;
+            subrange._endContainer = firstPartiallyContainedChild;
+            subrange._endOffset = nodeLength(firstPartiallyContainedChild);
+            clonedChild.appendChild(rangeExtractOrClone(subrange, clone));
+          }
+
+          for (const child of containedChildren) {
+            fragment.appendChild(clone ? child.cloneNode(true) : child);
+          }
+
+          if (lastPartiallyContainedChild && isCharacterDataNode(lastPartiallyContainedChild)) {
+            const clonedNode = originalEndNode.cloneNode(false);
+            clonedNode.data = originalEndNode.substringData(0, originalEndOffset);
+            fragment.appendChild(clonedNode);
+            if (!clone) originalEndNode.replaceData(0, originalEndOffset, '');
+          } else if (lastPartiallyContainedChild) {
+            const clonedChild = lastPartiallyContainedChild.cloneNode(false);
+            fragment.appendChild(clonedChild);
+            const subrange = new Range();
+            subrange._startContainer = lastPartiallyContainedChild;
+            subrange._startOffset = 0;
+            subrange._endContainer = originalEndNode;
+            subrange._endOffset = originalEndOffset;
+            clonedChild.appendChild(rangeExtractOrClone(subrange, clone));
+          }
+
+          if (!clone) {
+            range._startContainer = newNode;
+            range._startOffset = newOffset;
+            range._endContainer = newNode;
+            range._endOffset = newOffset;
+          }
+
+          return fragment;
         }
 
         class Range {
@@ -113,7 +295,7 @@
           get endContainer() { return this._endContainer; }
           get endOffset() { return this._endOffset; }
           get collapsed() { return this._startContainer === this._endContainer && this._startOffset === this._endOffset; }
-          get commonAncestorContainer() { return this._startContainer; }
+          get commonAncestorContainer() { return commonAncestorContainerOf(this); }
 
           setStart(node, offset) {
             assertRangeBoundary(node, offset);
@@ -190,15 +372,185 @@
             }
             return new DOMRectList([]);
           }
+          // https://dom.spec.whatwg.org/#dom-range-stringifier -- concatenates
+          // partial Text data from the boundary containers plus the full data
+          // of every fully-contained Text node in between, in tree order. Not
+          // simply this._startContainer.textContent: that would include text
+          // from outside the range entirely for a multi-node range.
           toString() {
-            if (this._startContainer === this._endContainer && this._startContainer.nodeType === 3) {
-              return this._startContainer.data.slice(this._startOffset, this._endOffset);
+            const start = this._startContainer;
+            const end = this._endContainer;
+            if (start === end && start.nodeType === 3) {
+              return start.data.slice(this._startOffset, this._endOffset);
             }
-            return this._startContainer.textContent || '';
+            let result = '';
+            if (start.nodeType === 3) result += start.data.slice(this._startOffset);
+            const boundary = nodeAfterSubtree(end);
+            for (let node = start; node && node !== boundary; node = nextNodeInTreeOrder(node)) {
+              if (node.nodeType === 3 && isFullyContained(node, this)) result += node.data;
+            }
+            if (end.nodeType === 3) result += end.data.slice(0, this._endOffset);
+            return result;
           }
 
           createContextualFragment(html) {
             return fragmentFromHTML(html);
+          }
+
+          compareBoundaryPoints(how, sourceRange) {
+            if (how !== 0 && how !== 1 && how !== 2 && how !== 3) {
+              throw new DOMException(
+                "The comparison method provided must be one of 'START_TO_START', 'START_TO_END', 'END_TO_END', or 'END_TO_START'.",
+                'NotSupportedError');
+            }
+            if (this._startContainer.getRootNode() !== sourceRange._startContainer.getRootNode()) {
+              throw new DOMException('The two Ranges are not in the same tree.', 'WrongDocumentError');
+            }
+            let thisNode, thisOffset, otherNode, otherOffset;
+            if (how === 0) { thisNode = this._startContainer; thisOffset = this._startOffset; otherNode = sourceRange._startContainer; otherOffset = sourceRange._startOffset; }
+            else if (how === 1) { thisNode = this._endContainer; thisOffset = this._endOffset; otherNode = sourceRange._startContainer; otherOffset = sourceRange._startOffset; }
+            else if (how === 2) { thisNode = this._endContainer; thisOffset = this._endOffset; otherNode = sourceRange._endContainer; otherOffset = sourceRange._endOffset; }
+            else { thisNode = this._startContainer; thisOffset = this._startOffset; otherNode = sourceRange._endContainer; otherOffset = sourceRange._endOffset; }
+            return comparePointPosition(thisNode, thisOffset, otherNode, otherOffset);
+          }
+
+          comparePoint(node, offset) {
+            if (node.getRootNode() !== this._startContainer.getRootNode()) {
+              throw new DOMException('The given Node and the Range are not in the same tree.', 'WrongDocumentError');
+            }
+            if (node.nodeType === 10) throw new DOMException('DocumentType is not allowed.', 'InvalidNodeTypeError');
+            const numericOffset = Number(offset) >>> 0;
+            if (numericOffset > nodeLength(node)) {
+              throw new DOMException("The offset is larger than the node's length.", 'IndexSizeError');
+            }
+            if (comparePointPosition(node, numericOffset, this._startContainer, this._startOffset) < 0) return -1;
+            if (comparePointPosition(node, numericOffset, this._endContainer, this._endOffset) > 0) return 1;
+            return 0;
+          }
+
+          isPointInRange(node, offset) {
+            if (node.getRootNode() !== this._startContainer.getRootNode()) {
+              throw new DOMException('The given Node and the Range are not in the same tree.', 'WrongDocumentError');
+            }
+            if (node.nodeType === 10) throw new DOMException('DocumentType is not allowed.', 'InvalidNodeTypeError');
+            const numericOffset = Number(offset) >>> 0;
+            if (numericOffset > nodeLength(node)) {
+              throw new DOMException("The offset is larger than the node's length.", 'IndexSizeError');
+            }
+            if (comparePointPosition(node, numericOffset, this._startContainer, this._startOffset) < 0) return false;
+            if (comparePointPosition(node, numericOffset, this._endContainer, this._endOffset) > 0) return false;
+            return true;
+          }
+
+          intersectsNode(node) {
+            if (node.getRootNode() !== this._startContainer.getRootNode()) return false;
+            const parent = node.parentNode;
+            if (!parent) return true;
+            const offset = nodeIndexOf(node);
+            return comparePointPosition(parent, offset, this._endContainer, this._endOffset) < 0
+              && comparePointPosition(parent, offset + 1, this._startContainer, this._startOffset) > 0;
+          }
+
+          cloneContents() { return rangeExtractOrClone(this, true); }
+          extractContents() { return rangeExtractOrClone(this, false); }
+
+          deleteContents() {
+            if (this.collapsed) return;
+            const originalStartNode = this._startContainer;
+            const originalStartOffset = this._startOffset;
+            const originalEndNode = this._endContainer;
+            const originalEndOffset = this._endOffset;
+
+            if (originalStartNode === originalEndNode && isCharacterDataNode(originalStartNode)) {
+              originalStartNode.replaceData(originalStartOffset, originalEndOffset - originalStartOffset, '');
+              return;
+            }
+
+            // Collect the topmost fully-contained nodes (a node whose parent is
+            // also fully contained is skipped -- removing the parent already
+            // removes it, and it must not be listed twice for removal).
+            const nodesToRemove = [];
+            const endBoundary = nodeAfterSubtree(originalEndNode);
+            for (let node = originalStartNode; node && node !== endBoundary; node = nextNodeInTreeOrder(node)) {
+              if (isFullyContained(node, this) && !(node.parentNode && isFullyContained(node.parentNode, this))) {
+                nodesToRemove.push(node);
+              }
+            }
+
+            let newNode, newOffset;
+            if (originalStartNode.contains(originalEndNode)) {
+              newNode = originalStartNode;
+              newOffset = originalStartOffset;
+            } else {
+              let referenceNode = originalStartNode;
+              while (referenceNode.parentNode && !referenceNode.parentNode.contains(originalEndNode)) {
+                referenceNode = referenceNode.parentNode;
+              }
+              newNode = referenceNode.parentNode;
+              newOffset = nodeIndexOf(referenceNode) + 1;
+            }
+
+            if (isCharacterDataNode(originalStartNode)) {
+              originalStartNode.replaceData(originalStartOffset, nodeLength(originalStartNode) - originalStartOffset, '');
+            }
+            for (const node of nodesToRemove) node.parentNode.removeChild(node);
+            if (isCharacterDataNode(originalEndNode)) {
+              originalEndNode.replaceData(0, originalEndOffset, '');
+            }
+
+            this._startContainer = newNode;
+            this._startOffset = newOffset;
+            this._endContainer = newNode;
+            this._endOffset = newOffset;
+          }
+
+          insertNode(node) {
+            const startNode = this._startContainer;
+            const startOffset = this._startOffset;
+            if (startNode.nodeType === 7 || startNode.nodeType === 8
+              || (startNode.nodeType === 3 && !startNode.parentNode)
+              || node === startNode) {
+              throw new DOMException('Invalid start node for insertNode.', 'HierarchyRequestError');
+            }
+
+            let referenceNode = startNode.nodeType === 3 ? startNode : ([...startNode.childNodes][startOffset] || null);
+            const parent = referenceNode ? referenceNode.parentNode : startNode;
+
+            if (startNode.nodeType === 3) referenceNode = startNode.splitText(startOffset);
+            if (node === referenceNode) referenceNode = referenceNode.nextSibling;
+            if (node.parentNode) node.parentNode.removeChild(node);
+
+            let newOffset = referenceNode ? nodeIndexOf(referenceNode) : nodeLength(parent);
+            newOffset += node.nodeType === 11 ? nodeLength(node) : 1;
+
+            parent.insertBefore(node, referenceNode);
+
+            if (this.collapsed) {
+              this._endContainer = parent;
+              this._endOffset = newOffset;
+            }
+          }
+
+          surroundContents(newParent) {
+            // Walk the common ancestor's whole subtree: any non-Text node that
+            // is only partially inside the range makes a well-formed wrapping
+            // impossible (it would have to be split, which surroundContents()
+            // never does for anything but the boundary Text nodes).
+            const commonAncestor = this.commonAncestorContainer;
+            const boundary = nodeAfterSubtree(commonAncestor);
+            for (let node = commonAncestor; node && node !== boundary; node = nextNodeInTreeOrder(node)) {
+              if (node.nodeType !== 3 && isPartiallyContained(node, this)) {
+                throw new DOMException('The Range partially contains a non-Text node.', 'InvalidStateError');
+              }
+            }
+            if (newParent.nodeType === 9 || newParent.nodeType === 10 || newParent.nodeType === 11) {
+              throw new DOMException('Invalid element type for surroundContents.', 'InvalidNodeTypeError');
+            }
+            const fragment = this.extractContents();
+            while (newParent.firstChild) newParent.removeChild(newParent.firstChild);
+            this.insertNode(newParent);
+            newParent.appendChild(fragment);
+            this.selectNode(newParent);
           }
         }
 

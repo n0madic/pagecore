@@ -2662,6 +2662,125 @@ void test_node_move_before()
         "(shared root, movable node type, NotFoundError reference child) and actually relocate the node");
 }
 
+void test_range_content_methods()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!DOCTYPE html>
+<html><body>
+  <div id="a">Hello <b>cruel</b> world</div>
+  <div id="siblings"><span id="s1">one</span><span id="s2">two</span></div>
+  <script>
+    const checks = [];
+    const a = document.getElementById('a');
+
+    // commonAncestorContainer used to be a stub returning startContainer; it
+    // must compute the real nearest inclusive-ancestor-of-both container.
+    const r = new Range();
+    r.setStart(a.firstChild, 3);
+    r.setEnd(a.lastChild, 3);
+    checks.push(r.commonAncestorContainer === a);
+
+    // cloneContents(): partial text at both edges, the fully-contained <b>
+    // element cloned deeply in the middle; the original tree is untouched.
+    const cloned = r.cloneContents();
+    checks.push(cloned.childNodes.length === 3);
+    checks.push(cloned.firstChild.data === 'lo ');
+    checks.push(cloned.childNodes[1].outerHTML === '<b>cruel</b>');
+    checks.push(cloned.lastChild.data === ' wo');
+    checks.push(a.textContent === 'Hello cruel world');
+
+    // extractContents(): same content, but removed from the original tree,
+    // and the range collapses to a single point at the removal site.
+    const r2 = new Range();
+    r2.setStart(a.firstChild, 3);
+    r2.setEnd(a.lastChild, 3);
+    const extracted = r2.extractContents();
+    checks.push(extracted.childNodes.length === 3 && extracted.childNodes[1].outerHTML === '<b>cruel</b>');
+    checks.push(a.textContent === 'Helrld');
+    checks.push(r2.collapsed && r2.startContainer === a);
+
+    // toString(): concatenates partial boundary text with fully-contained
+    // Text node data in tree order -- not simply startContainer.textContent.
+    const p = document.createElement('p');
+    p.append('Test div', document.createElement('br'), 'Another div');
+    document.body.appendChild(p);
+    const r3 = new Range();
+    r3.setStart(p.firstChild, 0);
+    r3.setEnd(p.lastChild, p.lastChild.data.length);
+    checks.push(r3.toString() === 'Test divAnother div');
+
+    // deleteContents(): same tree effect as extractContents(), no fragment.
+    const q = document.createElement('p');
+    q.textContent = 'Hello cruel world';
+    document.body.appendChild(q);
+    const r4 = new Range();
+    r4.setStart(q.firstChild, 6);
+    r4.setEnd(q.firstChild, 12);
+    r4.deleteContents();
+    checks.push(q.textContent === 'Hello world');
+
+    // insertNode(): splits the start Text node at the boundary and inserts
+    // before the split point.
+    const ins = document.createElement('p');
+    ins.textContent = 'Hello world';
+    document.body.appendChild(ins);
+    const r5 = new Range();
+    r5.setStart(ins.firstChild, 6);
+    r5.collapse(true);
+    const bold = document.createElement('b');
+    bold.textContent = 'NEW ';
+    r5.insertNode(bold);
+    checks.push(ins.innerHTML === 'Hello <b>NEW </b>world');
+
+    // surroundContents(): wraps a fully-Text-contained range in newParent.
+    const sur = document.createElement('p');
+    sur.textContent = 'Hello world';
+    document.body.appendChild(sur);
+    const r6 = new Range();
+    r6.setStart(sur.firstChild, 6);
+    r6.setEnd(sur.firstChild, 11);
+    r6.surroundContents(document.createElement('em'));
+    checks.push(sur.innerHTML === 'Hello <em>world</em>');
+
+    // surroundContents() throws InvalidStateError when a non-Text node is
+    // only partially inside the range.
+    const partial = document.createElement('p');
+    partial.innerHTML = '<span>abc</span><span>def</span>';
+    document.body.appendChild(partial);
+    const r7 = new Range();
+    r7.setStart(partial.firstChild.firstChild, 1);
+    r7.setEnd(partial.lastChild.firstChild, 1);
+    let threw = false;
+    try { r7.surroundContents(document.createElement('em')); } catch (error) { threw = error.name === 'InvalidStateError'; }
+    checks.push(threw);
+
+    // compareBoundaryPoints/comparePoint/intersectsNode: ordering across
+    // disjoint sibling subtrees.
+    const siblings = document.getElementById('siblings');
+    const s1 = document.getElementById('s1');
+    const s2 = document.getElementById('s2');
+    const rA = new Range(); rA.selectNode(s1);
+    const rB = new Range(); rB.selectNode(s2);
+    checks.push(rA.compareBoundaryPoints(Range.START_TO_START, rB) === -1);
+    checks.push(rA.compareBoundaryPoints(Range.END_TO_START, rB) === -1);
+    checks.push(rA.comparePoint(s2.firstChild, 0) === 1);
+    checks.push(rA.intersectsNode(s1) === true);
+    checks.push(rA.intersectsNode(s2) === false);
+    checks.push(rA.isPointInRange(s1.firstChild, 1) === true);
+    checks.push(rA.isPointInRange(s2.firstChild, 1) === false);
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/range-content.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "Range's content methods (cloneContents/extractContents/deleteContents/insertNode/surroundContents), "
+        "toString(), commonAncestorContainer, and the boundary-point comparisons should follow the DOM spec");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -13044,6 +13163,7 @@ int main()
         test_url_hostname_idna();
         test_text_decoder_encoding_support();
         test_node_move_before();
+        test_range_content_methods();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();
