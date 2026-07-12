@@ -2589,6 +2589,79 @@ void test_text_decoder_encoding_support()
         "recover cleanly from fatal errors, and stream BOM detection across chunk boundaries");
 }
 
+void test_node_move_before()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!DOCTYPE html>
+<html><body>
+  <script>
+    const checks = [];
+    const nameOf = (fn) => { try { fn(); return 'no throw'; } catch (error) { return error.name; } };
+
+    // moveBefore() is a ParentNode member, not a Node member: absent (not just
+    // throwing) on non-parent types.
+    checks.push(!('moveBefore' in document.createTextNode('x')));
+    checks.push(!('moveBefore' in new Comment('c')));
+    checks.push(!('moveBefore' in document.doctype));
+    checks.push(typeof document.body.moveBefore === 'function');
+
+    // WebIDL argument validation: both parameters are required (not optional)
+    // Node-or-null references.
+    checks.push(nameOf(() => document.body.moveBefore(null, null)) === 'TypeError');
+    checks.push(nameOf(() => document.body.moveBefore(document.createTextNode('x'))) === 'TypeError');
+    checks.push(nameOf(() => document.body.moveBefore(document.createTextNode('x'), {})) === 'TypeError');
+
+    // Ordinary move: returns undefined (unlike insertBefore) and actually
+    // relocates the node.
+    const a = document.body.appendChild(document.createElement('div'));
+    const b = a.appendChild(document.createElement('div'));
+    const c = a.appendChild(document.createElement('div'));
+    checks.push(a.moveBefore(c, b) === undefined);
+    checks.push(a.firstChild === c && a.lastChild === b);
+
+    // Moving a node before itself is a no-op, not an error.
+    a.moveBefore(c, c);
+    checks.push(a.firstChild === c && a.lastChild === b);
+
+    // node must be an inclusive-ancestor-free, Element-or-CharacterData node:
+    // a DocumentFragment or the document's own doctype cannot be moved.
+    checks.push(nameOf(() => document.body.moveBefore(new DocumentFragment(), null)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => document.body.moveBefore(document.doctype, null)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => a.moveBefore(a, null)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => c.moveBefore(a, null)) === 'HierarchyRequestError');
+
+    // A reference child that isn't this parent's own child is a NotFoundError,
+    // not a HierarchyRequestError.
+    const other = document.body.appendChild(document.createElement('div'));
+    checks.push(nameOf(() => a.moveBefore(b, other)) === 'NotFoundError');
+
+    // Pre-move validity is about a *shared* root, not literal connectedness to
+    // the main document: two disconnected nodes in the very same detached
+    // subtree may move between each other...
+    const disconnectedRoot = document.createElement('div');
+    const disconnectedBranch = disconnectedRoot.appendChild(document.createElement('div'));
+    const disconnectedLeaf = disconnectedRoot.appendChild(document.createElement('p'));
+    disconnectedBranch.moveBefore(disconnectedLeaf, null);
+    checks.push(disconnectedBranch.firstChild === disconnectedLeaf);
+    // ...but moving between two *unrelated* disconnected trees still throws,
+    // and so does moving between a connected and a disconnected tree.
+    const unrelatedDisconnected = document.createElement('div');
+    checks.push(nameOf(() => unrelatedDisconnected.moveBefore(disconnectedLeaf, null)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => document.body.moveBefore(disconnectedLeaf, null)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => disconnectedRoot.moveBefore(document.body.firstChild, null)) === 'HierarchyRequestError');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/move-before.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "Node.moveBefore should be a ParentNode-only method enforcing pre-move validity "
+        "(shared root, movable node type, NotFoundError reference child) and actually relocate the node");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -12970,6 +13043,7 @@ int main()
         test_url_search_params_robustness();
         test_url_hostname_idna();
         test_text_decoder_encoding_support();
+        test_node_move_before();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();

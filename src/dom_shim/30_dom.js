@@ -619,6 +619,92 @@
           ensureInsertionValidity(node, parent, replacedChild, replacedChild);
         }
 
+        // "Element or CharacterData node" -- moveBefore()'s node restriction is
+        // narrower than plain insertion's (no DocumentFragment or DocumentType).
+        const MOVABLE_NODE_TYPES = new Set([
+          ELEMENT_NODE, TEXT_NODE, CDATA_SECTION_NODE, PROCESSING_INSTRUCTION_NODE, COMMENT_NODE
+        ]);
+
+        // https://dom.spec.whatwg.org/#concept-node-ensure-pre-move-validity --
+        // distinct from (and stricter than) ensure pre-insertion validity: parent
+        // and node must already share a shadow-including root (not merely both be
+        // connected to *a* document -- two disconnected nodes in the very same
+        // detached subtree may freely move between each other), and node must be
+        // an Element or CharacterData (not a DocumentFragment or DocumentType).
+        // Ordinary pre-insertion validity (single element child, doctype-before-
+        // element ordering, ...) still applies underneath and is left to the
+        // insertBefore() call this feeds into.
+        function ensurePreMoveValidity(node, parent, child) {
+          if (parent.getRootNode({ composed: true }) !== node.getRootNode({ composed: true })) {
+            throw hierarchyRequestError("The node and the new parent must share a shadow-including root.");
+          }
+          const parentType = nodeTypeOf(parent);
+          if (!PARENT_NODE_TYPES.has(parentType)) {
+            throw hierarchyRequestError('This node type does not support this method.');
+          }
+          if (isInclusiveAncestor(node, parent)) {
+            throw hierarchyRequestError('The new child element contains the parent.');
+          }
+          if (!MOVABLE_NODE_TYPES.has(nodeTypeOf(node))) {
+            throw hierarchyRequestError('Only an Element or CharacterData node may be moved.');
+          }
+          if (child !== null && child.parentNode !== parent) {
+            throw new DOMException('The node before which the moved node is to be inserted is not a child of this node.', 'NotFoundError');
+          }
+        }
+
+        // Unlike a fresh insertBefore() (which must assume its argument might be
+        // unparsed/unexecuted content and so reruns script execution, resource
+        // loading, and custom-element upgrade), a move only repositions a node
+        // that -- if connected before -- already went through all of that once.
+        // Rerunning script execution in particular is an observable bug, not a
+        // no-op: a <script> moved via moveBefore() must not execute a second
+        // time. connectCustomElementTree() stays because it is idempotent
+        // (invokeCustomElementConnected no-ops once __customElementConnected is
+        // set) and still needs to run for the disconnected -> connected case.
+        function performMove(parent, node, child) {
+          const referenceId = child == null ? 0 : liveId(child);
+          const id = bridge.insertBefore(parent._liveId(), liveId(node), referenceId);
+          const moved = wrapNode(id) || node;
+          connectCustomElementTree(moved);
+          afterMutation(moved, {
+            type: 'childList',
+            target: parent,
+            addedNodes: [node],
+            removedNodes: [],
+            previousSibling: null,
+            nextSibling: child || null,
+            attributeName: null
+          });
+          installWindowNamedPropertiesFromTree(moved);
+        }
+
+        // Shared by Document/Element/DocumentFragment's moveBefore(): validate,
+        // then perform the actual move. moveBefore() itself returns undefined,
+        // unlike insertBefore().
+        function nodeMoveBefore(parent, node, child) {
+          // Not isNodeWrapper(): several Node-*like* things this must still
+          // recognize as "a Node" for the TypeError gate (only to be rejected
+          // by the movable-node-type check just below, matching spec) have no
+          // bridge id -- DocumentFragment and DetachedHTMLDocument among them.
+          if (!node || typeof node.nodeType !== 'number') {
+            throw new TypeError("Failed to execute 'moveBefore' on 'Node': parameter 1 is not of type 'Node'.");
+          }
+          if (child !== null && !isNodeWrapper(child)) {
+            throw new TypeError("Failed to execute 'moveBefore' on 'Node': parameter 2 is not of type 'Node'.");
+          }
+          ensurePreMoveValidity(node, parent, child);
+          // A DocumentFragment parent has no bridge id and its own (side-
+          // effect-free) array-based insertBefore(), which is exactly right
+          // for a move too.
+          if (isDocumentFragment(parent)) {
+            parent.insertBefore(node, child);
+            return;
+          }
+          if (node && node.__fragmentParent) node.__fragmentParent.removeChild(node);
+          performMove(parent, node, child);
+        }
+
         class Node extends EventTarget {
           constructor(id) {
             super();
@@ -1106,6 +1192,18 @@
             super();
             attachNodeId(this, createCharacterData(this, bridge.createComment, data));
           }
+        }
+
+        // Only materialized for a doctype already present in the parsed tree
+        // (e.g. `<!DOCTYPE html>`) -- there is no bridge call to construct a
+        // detached one (DOMImplementation.createDocumentType()), so publicId/
+        // systemId are not wired to Lexbor's parsed values yet and read as ''.
+        // name/nodeType/parentNode/isConnected are all correct, being bridge-
+        // driven like every other Node subtype.
+        class DocumentType extends Node {
+          get name() { return this.nodeName; }
+          get publicId() { return ''; }
+          get systemId() { return ''; }
         }
 
         // The two failure modes are distinct DOMExceptions: an empty token is a
@@ -1632,6 +1730,12 @@
             for (const child of [...this.childNodes]) this.removeChild(child);
             this.append(...nodes);
           }
+
+          // A DocumentFragment has no isConnected getter (always undefined, so
+          // ensurePreMoveValidity's first check always fails) -- a fragment's
+          // shadow-including root is itself, never a document, so it can never
+          // legitimately be a moveBefore() destination.
+          moveBefore(node, child) { nodeMoveBefore(this, node, child); }
 
           get adoptedStyleSheets() { return this._adoptedStyleSheets.slice(); }
           set adoptedStyleSheets(value) {
@@ -3608,6 +3712,11 @@
             this.remove();
           }
 
+          // Unlike insertBefore()/appendChild(), moveBefore() is a ParentNode
+          // member, not a Node member: it must not exist at all on non-parent
+          // types (Text, Comment, DocumentType, ProcessingInstruction).
+          moveBefore(node, child) { nodeMoveBefore(this, node, child); }
+
           focus() { activeElement = this; this.dispatchEvent(new Event('focus')); }
           blur() {
             if (activeElement === this) activeElement = document.body;
@@ -4668,7 +4777,11 @@
           get documentElement() { return wrapNode(bridge.documentElement()); }
           get head() { return wrapNode(bridge.head()); }
           get body() { return wrapNode(bridge.body()); }
+          get doctype() {
+            return [...this.childNodes].find((node) => node.nodeType === DOCUMENT_TYPE_NODE) || null;
+          }
           get activeElement() { return activeElement || this.body || this.documentElement; }
+          moveBefore(node, child) { nodeMoveBefore(this, node, child); }
           get readyState() { return ctx.documentReadyState; }
           set readyState(value) { setDocumentReadyState(value); }
           get characterSet() { return 'UTF-8'; }
@@ -4825,6 +4938,15 @@
           get firstChild() { return this.documentElement; }
           get lastChild() { return this.documentElement; }
           get children() { return [this.documentElement]; }
+          // A document's shadow-including root is itself, so it is trivially
+          // "connected" by definition even while detached from any browsing
+          // context.
+          get isConnected() { return true; }
+          getRootNode() { return this; }
+          // Two distinct DetachedHTMLDocuments are always distinct roots, so
+          // this can never actually reach the insertBefore() delegation --
+          // ensurePreMoveValidity's shared-root check always throws first.
+          moveBefore(node, child) { nodeMoveBefore(this, node, child); }
           get activeElement() { return this.body; }
           get baseURI() { return global.location.href || ''; }
           get URL() { return this.baseURI; }
@@ -4931,6 +5053,7 @@
           if (type === 9) node = new Document(id);
           else if (type === 3) node = new Text(INTERNAL_NODE_ID, id);
           else if (type === 8) node = new Comment(INTERNAL_NODE_ID, id);
+          else if (type === 10) node = new DocumentType(id);
           else if (type === 1) {
             const tagName = (tag || '').toLowerCase();
             const Constructor = htmlElementConstructors[tagName] || (tagName.includes('-') ? HTMLElement : HTMLUnknownElement);
@@ -5119,6 +5242,7 @@
         CharacterData,
         Text,
         Comment,
+        DocumentType,
         NodeList,
         HTMLCollection,
         DOMStringMap,
