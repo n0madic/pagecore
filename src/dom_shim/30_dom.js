@@ -962,12 +962,49 @@
           }
         }
 
+        // The two failure modes are distinct DOMExceptions: an empty token is a
+        // SyntaxError, whereas a token containing ASCII whitespace is an
+        // InvalidCharacterError.
         function validateToken(token) {
           token = String(token);
-          if (token.length === 0 || /\s/.test(token)) {
-            throw new DOMException('Invalid token', 'SyntaxError');
+          if (token.length === 0) {
+            throw new DOMException('The token provided must not be empty.', 'SyntaxError');
+          }
+          if (/[ \t\n\f\r]/.test(token)) {
+            throw new DOMException(`The token provided ('${token}') contains HTML space characters, which are not valid in tokens.`, 'InvalidCharacterError');
           }
           return token;
+        }
+
+        // Validates a whole argument list in spec order: every token is checked for
+        // emptiness first, and only then is any of them checked for whitespace.
+        function validateTokens(tokens) {
+          const values = tokens.map((token) => String(token));
+          for (const token of values) {
+            if (token.length === 0) {
+              throw new DOMException('The token provided must not be empty.', 'SyntaxError');
+            }
+          }
+          for (const token of values) {
+            if (/[ \t\n\f\r]/.test(token)) {
+              throw new DOMException(`The token provided ('${token}') contains HTML space characters, which are not valid in tokens.`, 'InvalidCharacterError');
+            }
+          }
+          return values;
+        }
+
+        // A DOMTokenList is backed by an *ordered set*, so duplicates collapse:
+        // class="a a" has length 1. The attribute text itself is untouched, which is
+        // why `value` reads the attribute verbatim rather than re-joining the tokens.
+        function parseTokenSet(value) {
+          const tokens = [];
+          const seen = new Set();
+          for (const token of String(value ?? '').split(/[ \t\n\f\r]+/)) {
+            if (!token || seen.has(token)) continue;
+            seen.add(token);
+            tokens.push(token);
+          }
+          return tokens;
         }
 
         class DOMTokenList {
@@ -977,45 +1014,143 @@
           }
 
           _tokens() {
-            return (this.element.getAttribute(this.attribute) || '').split(/\s+/).filter(Boolean);
+            return parseTokenSet(this.element.getAttribute(this.attribute));
           }
 
+          // Callers pass an already-deduplicated ordered set. Per the spec's update
+          // steps, an empty set on an element that never had the attribute leaves it
+          // absent rather than creating an empty one.
           _write(tokens) {
-            this.element.setAttribute(this.attribute, [...new Set(tokens)].join(' '));
+            if (tokens.length === 0 && !this.element.hasAttribute(this.attribute)) return;
+            this.element.setAttribute(this.attribute, tokens.join(' '));
           }
 
-          contains(token) { return this._tokens().includes(validateToken(token)); }
-          add(...tokens) { this._write([...this._tokens(), ...tokens.map(validateToken)]); }
+          contains(token) { return this._tokens().includes(String(token)); }
+
+          add(...tokens) {
+            const validated = validateTokens(tokens);
+            const current = this._tokens();
+            for (const token of validated) {
+              if (!current.includes(token)) current.push(token);
+            }
+            this._write(current);
+          }
+
           remove(...tokens) {
-            const remove = new Set(tokens.map(validateToken));
+            const remove = new Set(validateTokens(tokens));
             this._write(this._tokens().filter((token) => !remove.has(token)));
           }
+
           toggle(token, force = undefined) {
             token = validateToken(token);
             const has = this.contains(token);
-            if (force === true || (!has && force !== false)) {
-              this.add(token);
-              return true;
+            if (has) {
+              // force=true on a token that is already present is a no-op: it must not
+              // rewrite the attribute, so class="a a a" survives untouched.
+              if (force === true) return true;
+              this.remove(token);
+              return false;
             }
-            if (has && force !== true) this.remove(token);
-            return false;
-          }
-          replace(oldToken, newToken) {
-            oldToken = validateToken(oldToken);
-            newToken = validateToken(newToken);
-            if (!this.contains(oldToken)) return false;
-            this._write(this._tokens().map((token) => token === oldToken ? newToken : token));
+            if (force === false) return false;
+            this.add(token);
             return true;
           }
-          item(index) { return this._tokens()[Number(index)] || null; }
+
+          replace(oldToken, newToken) {
+            // The spec checks *both* tokens for emptiness before it checks either for
+            // whitespace, so replace(" ", "") is a SyntaxError, not an
+            // InvalidCharacterError.
+            validateTokens([oldToken, newToken]);
+            oldToken = String(oldToken);
+            newToken = String(newToken);
+            const tokens = this._tokens();
+            if (!tokens.includes(oldToken)) return false;
+
+            // Ordered-set replace: the first occurrence of *either* token takes the
+            // new value and every other occurrence of either is dropped, so
+            // ["c","b","a"] with c -> a becomes ["a","b"], not ["a","b","a"].
+            const first = tokens.findIndex((token) => token === oldToken || token === newToken);
+            const replaced = [];
+            for (let index = 0; index < tokens.length; index++) {
+              const token = tokens[index];
+              if (index === first) replaced.push(newToken);
+              else if (token !== oldToken && token !== newToken) replaced.push(token);
+            }
+            // The update steps always run when replace() returns true, even when the
+            // tokens are equal: the attribute is re-serialized from the token set.
+            this._write(replaced);
+            return true;
+          }
+
+          // classList has no supported-tokens list, so feature queries on it are a
+          // TypeError rather than a silent false.
+          supports() {
+            throw new TypeError(`Failed to execute 'supports' on 'DOMTokenList': attribute "${this.attribute}" does not define supported tokens.`);
+          }
+
+          item(index) {
+            const tokens = this._tokens();
+            const offset = Number(index) >>> 0;
+            return offset < tokens.length ? tokens[offset] : null;
+          }
+
           get length() { return this._tokens().length; }
-          get value() { return this._tokens().join(' '); }
-          set value(value) { this._write(String(value).split(/\s+/).filter(Boolean).map(validateToken)); }
+          // Verbatim attribute text, not the re-serialized token set.
+          get value() {
+            const value = this.element.getAttribute(this.attribute);
+            return value === null ? '' : value;
+          }
+          set value(value) { this.element.setAttribute(this.attribute, String(value)); }
+
           forEach(callback, thisArg = undefined) {
             this._tokens().forEach((token, index) => callback.call(thisArg, token, index, this));
           }
+
+          keys() { return this._tokens().keys(); }
+          values() { return this._tokens().values(); }
+          entries() { return this._tokens().entries(); }
           toString() { return this.value; }
           [Symbol.iterator]() { return this._tokens()[Symbol.iterator](); }
+          get [Symbol.toStringTag]() { return 'DOMTokenList'; }
+        }
+
+        // Indexed access (list[0]) is not a real own property, so it needs a Proxy,
+        // exactly like the node collections above.
+        function makeTokenList(element, attribute) {
+          const list = new DOMTokenList(element, attribute);
+          return new Proxy(list, {
+            get(target, property, receiver) {
+              if (typeof property === 'string' && collectionIndex.test(property)) {
+                const tokens = target._tokens();
+                const offset = Number(property);
+                return offset < tokens.length ? tokens[offset] : undefined;
+              }
+              return Reflect.get(target, property, receiver);
+            },
+            has(target, property) {
+              if (typeof property === 'string' && collectionIndex.test(property)) {
+                return Number(property) < target._tokens().length;
+              }
+              return Reflect.has(target, property);
+            },
+            ownKeys(target) {
+              const tokens = target._tokens();
+              const keys = tokens.map((_token, index) => String(index));
+              for (const key of Reflect.ownKeys(target)) {
+                if (!keys.includes(key)) keys.push(key);
+              }
+              return keys;
+            },
+            getOwnPropertyDescriptor(target, property) {
+              if (typeof property === 'string' && collectionIndex.test(property)) {
+                const tokens = target._tokens();
+                const offset = Number(property);
+                if (offset >= tokens.length) return undefined;
+                return { value: tokens[offset], writable: false, enumerable: true, configurable: true };
+              }
+              return Reflect.getOwnPropertyDescriptor(target, property);
+            }
+          });
         }
 
         const NodeFilter = Object.freeze({
@@ -3074,7 +3209,9 @@
           set nonce(value) { this.setAttribute('nonce', String(value)); }
           get hidden() { return this.hasAttribute('hidden'); }
           set hidden(value) { this.toggleAttribute('hidden', Boolean(value)); }
-          get classList() { return memo(this, '__classList', () => new DOMTokenList(this, 'class')); }
+          get classList() { return memo(this, '__classList', () => makeTokenList(this, 'class')); }
+          // [PutForwards=value]: assigning to classList writes the class attribute.
+          set classList(value) { this.setAttribute('class', String(value)); }
           get attributes() { return memo(this, '__attributes', () => namedNodeMap(this)); }
           get dataset() { return memo(this, '__dataset', () => datasetFor(this)); }
           get children() { return memo(this, '__childrenList', () => liveCollection(HTMLCollection, () => liveChildElementList(this))); }

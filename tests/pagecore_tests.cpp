@@ -2091,6 +2091,61 @@ void test_character_data_interface()
         "CharacterData should own the data mutation API and treat a numeric constructor argument as data");
 }
 
+void test_dom_token_list_is_an_ordered_set()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="d" class="a a b"></div>
+  <div id="e"></div>
+  <script>
+    const checks = [];
+    const d = document.getElementById('d');
+    const e = document.getElementById('e');
+
+    // The token set is an ordered set, so duplicates collapse...
+    checks.push(d.classList.length === 2);
+    checks.push(d.classList[0] === 'a' && d.classList[1] === 'b');
+    // ...but `value` is the verbatim attribute text, not the re-serialized set.
+    checks.push(d.classList.value === 'a a b');
+
+    // toggle(force=true) on a token that is already present is a no-op: it must not
+    // rewrite (and thereby normalize) the attribute.
+    d.classList.toggle('a', true);
+    checks.push(d.getAttribute('class') === 'a a b');
+
+    // Ordered-set replace: the first occurrence of either token takes the new value
+    // and other occurrences are dropped, so "c b a" with c -> a becomes "a b".
+    e.setAttribute('class', 'c b a');
+    checks.push(e.classList.replace('c', 'a') === true);
+    checks.push(e.getAttribute('class') === 'a b');
+
+    // remove() on an element with no class attribute must not create one.
+    const f = document.createElement('div');
+    f.classList.remove('a');
+    checks.push(!f.hasAttribute('class'));
+
+    // Empty is a SyntaxError; whitespace is an InvalidCharacterError. Emptiness is
+    // checked across all arguments first, so replace(" ", "") is a SyntaxError.
+    const nameOf = (fn) => { try { fn(); return 'no throw'; } catch (error) { return error.name; } };
+    checks.push(nameOf(() => d.classList.add('')) === 'SyntaxError');
+    checks.push(nameOf(() => d.classList.add('a b')) === 'InvalidCharacterError');
+    checks.push(nameOf(() => d.classList.replace(' ', '')) === 'SyntaxError');
+
+    // [PutForwards=value]: assigning to classList writes the class attribute.
+    e.classList = 'x y';
+    checks.push(e.getAttribute('class') === 'x y');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/tokenlist.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "DOMTokenList should behave as an ordered set with spec-ordered validation errors");
+}
+
 void test_idl_attribute_reflection()
 {
     pagecore::Page page;
@@ -12657,6 +12712,7 @@ int main()
         test_document_write_escaped_script_text_remains_text();
         test_comment_nodes_wrap_for_sibling_traversal();
         test_character_data_interface();
+        test_dom_token_list_is_an_ordered_set();
         test_idl_attribute_reflection();
         test_live_collections();
         test_dom_interface_globals();
