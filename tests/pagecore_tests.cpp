@@ -2903,6 +2903,65 @@ void test_dom_implementation_create_methods()
         "(Name/QName validation, XMLDocument container, HTML-document NotSupportedError gate)");
 }
 
+void test_detached_html_document_appendchild_and_doctype()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!DOCTYPE html>
+<html><body>
+  <script>
+    const checks = [];
+    const nameOf = (fn) => { try { fn(); return 'no throw'; } catch (error) { return error.name; } };
+
+    // createHTMLDocument() creates its own implicit "html" doctype, per spec
+    // -- it did not exist at all before this fix.
+    const foreignDoc = document.implementation.createHTMLDocument('title');
+    checks.push(foreignDoc.doctype !== null);
+    checks.push(foreignDoc.doctype.name === 'html');
+    checks.push(foreignDoc.doctype.publicId === '' && foreignDoc.doctype.systemId === '');
+    checks.push(foreignDoc.doctype.parentNode === foreignDoc);
+    checks.push(foreignDoc.doctype.nodeType === Node.DOCUMENT_TYPE_NODE);
+
+    // childNodes/firstChild/lastChild put the doctype before documentElement.
+    checks.push(foreignDoc.childNodes.length === 2);
+    checks.push(foreignDoc.childNodes[0] === foreignDoc.doctype);
+    checks.push(foreignDoc.childNodes[1] === foreignDoc.documentElement);
+    checks.push(foreignDoc.firstChild === foreignDoc.doctype);
+    checks.push(foreignDoc.lastChild === foreignDoc.documentElement);
+
+    // appendChild()/removeChild() on the document object itself -- this is
+    // exactly what WPT's dom/ranges/common.js fixture does
+    // (foreignDoc.appendChild(foreignComment)) and previously threw
+    // "foreignDoc.appendChild is not a function".
+    const foreignComment = foreignDoc.createComment('hello');
+    checks.push(foreignDoc.appendChild(foreignComment) === foreignComment);
+    checks.push(foreignComment.parentNode === foreignDoc);
+    checks.push(foreignDoc.lastChild === foreignComment);
+    checks.push(foreignDoc.childNodes.length === 3);
+
+    checks.push(foreignDoc.removeChild(foreignComment) === foreignComment);
+    checks.push(foreignComment.parentNode === null);
+    checks.push(foreignDoc.childNodes.length === 2);
+    checks.push(nameOf(() => foreignDoc.removeChild(foreignComment)) === 'NotFoundError');
+
+    // Document-level pre-insertion validity still applies: a second doctype
+    // or a second element child is a HierarchyRequestError, reusing the same
+    // validity gate the real document/XMLDocument already enforce.
+    const anotherDoctype = document.implementation.createDocumentType('x', '', '');
+    checks.push(nameOf(() => foreignDoc.appendChild(anotherDoctype)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => foreignDoc.appendChild(document.createElement('div'))) === 'HierarchyRequestError');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/detached-document-appendchild.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "createHTMLDocument()'s result should have an implicit doctype and a working "
+        "appendChild()/removeChild() enforcing the same Document pre-insertion validity as a real document");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -13287,6 +13346,7 @@ int main()
         test_node_move_before();
         test_range_content_methods();
         test_dom_implementation_create_methods();
+        test_detached_html_document_appendchild_and_doctype();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();

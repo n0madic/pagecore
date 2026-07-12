@@ -5056,18 +5056,79 @@
             this.location = global.location;
             this.defaultView = global;
 
-            this.documentElement = document.createElement('html');
+            // "Append a new doctype, with html as its name" -- per spec,
+            // createHTMLDocument() creates this doctype itself; it is not
+            // materialized from parsed markup, so it goes straight through
+            // the same native bridge.createDocumentType() DOMImplementation
+            // .createDocumentType() uses. `_children` is the document's real
+            // ordered child list (doctype, then documentElement, then
+            // anything appended later): documentElement lives in here too,
+            // not as a separate fixed slot, so that removing it (a real WPT
+            // idiom -- several dom/ranges/*.html tests build a reference
+            // document via `createHTMLDocument()` then
+            // `removeChild(documentElement)`) behaves correctly. `head`/
+            // `body` stay as directly cached element references, since
+            // nothing else on this class needs them to track removal.
+            const doctypeNode = wrapNode(bridge.createDocumentType('html', '', ''));
+            const html = document.createElement('html');
             this.head = document.createElement('head');
             this.body = document.createElement('body');
-            this.documentElement.appendChild(this.head);
-            this.documentElement.appendChild(this.body);
+            html.appendChild(this.head);
+            html.appendChild(this.body);
+            this._children = [doctypeNode, html];
+            defineValue(doctypeNode, '__fragmentParent', this);
+            defineValue(html, '__fragmentParent', this);
             this.title = String(title ?? '');
           }
 
-          get childNodes() { return [this.documentElement]; }
-          get firstChild() { return this.documentElement; }
-          get lastChild() { return this.documentElement; }
-          get children() { return [this.documentElement]; }
+          get doctype() { return this._children.find((node) => node.nodeType === DOCUMENT_TYPE_NODE) || null; }
+          get documentElement() { return this._children.find((node) => node.nodeType === ELEMENT_NODE) || null; }
+          get childNodes() { return [...this._children]; }
+          get firstChild() { return this._children[0] || null; }
+          get lastChild() { return this._children[this._children.length - 1] || null; }
+          get children() { return this._children.filter((node) => node.nodeType === ELEMENT_NODE); }
+
+          appendChild(child) {
+            ensurePreInsertionValidity(child, this, null);
+            if (isDocumentFragment(child)) {
+              const addedNodes = [...child.childNodes];
+              for (const node of addedNodes) this.appendChild(node);
+              child.childNodes.length = 0;
+              return child;
+            }
+            if (child.parentNode) child.parentNode.removeChild(child);
+            const existing = this._children.indexOf(child);
+            if (existing >= 0) this._children.splice(existing, 1);
+            this._children.push(child);
+            defineValue(child, '__fragmentParent', this);
+            return child;
+          }
+
+          insertBefore(child, referenceChild) {
+            ensureInsertionValidity(child, this, referenceChild ?? null);
+            if (isDocumentFragment(child)) {
+              const addedNodes = [...child.childNodes];
+              for (const node of addedNodes) this.insertBefore(node, referenceChild);
+              child.childNodes.length = 0;
+              return child;
+            }
+            if (child.parentNode) child.parentNode.removeChild(child);
+            const existing = this._children.indexOf(child);
+            if (existing >= 0) this._children.splice(existing, 1);
+            const index = referenceChild == null ? -1 : this._children.indexOf(referenceChild);
+            if (index < 0) this._children.push(child);
+            else this._children.splice(index, 0, child);
+            defineValue(child, '__fragmentParent', this);
+            return child;
+          }
+
+          removeChild(child) {
+            const index = this._children.indexOf(child);
+            if (index < 0) throw new DOMException('The node to be removed is not a child of this node.', 'NotFoundError');
+            this._children.splice(index, 1);
+            if (child.__fragmentParent === this) defineValue(child, '__fragmentParent', null);
+            return child;
+          }
           // A document's shadow-including root is itself, so it is trivially
           // "connected" by definition even while detached from any browsing
           // context.
