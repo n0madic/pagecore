@@ -13,10 +13,12 @@ function defaultJobs() {
 
 function usage() {
   console.error([
-    'usage: run_wpt_subset.js --case-runner PATH --manifest PATH [--root PATH] [--wait-ms N]',
+    'usage: run_wpt_subset.js --case-runner PATH --manifest PATH [--root PATH ...] [--wait-ms N]',
     '                        [--jobs N] [--report PATH]',
     '',
     'Options:',
+    '  --root PATH   WPT corpus root; repeatable, first listed wins on a resource',
+    '                path collision (matches pagecore_wpt_case\'s own --root order)',
     '  --jobs N      run up to N case runners concurrently (default: available parallelism)',
     '  --report PATH write a structured JSON result/failure report to PATH',
     '',
@@ -41,7 +43,8 @@ function parseArgs(argv) {
   const args = {
     waitMs: 15000,
     jobs: defaultJobs(),
-    report: null
+    report: null,
+    roots: []
   };
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -52,7 +55,7 @@ function parseArgs(argv) {
 
     if (arg === '--case-runner') args.caseRunner = next();
     else if (arg === '--manifest') args.manifest = next();
-    else if (arg === '--root') args.root = next();
+    else if (arg === '--root') args.roots.push(next());
     else if (arg === '--wait-ms') args.waitMs = Number(next());
     else if (arg === '--jobs') args.jobs = Number(next());
     else if (arg === '--report') args.report = next();
@@ -86,12 +89,15 @@ function renderingEnabled() {
 // requiresRendering test from failing when the binary genuinely can't render.
 const RENDERING_UNAVAILABLE_PATTERN = /rendering is not available/;
 
-function runCase(caseRunner, root, test, waitMs) {
-  const runnerArgs = [
-    '--root', root,
+function runCase(caseRunner, roots, test, waitMs) {
+  const runnerArgs = [];
+  for (const root of roots) {
+    runnerArgs.push('--root', root);
+  }
+  runnerArgs.push(
     '--path', test.path,
     '--wait-ms', String(test.waitMs ?? waitMs)
-  ];
+  );
   if (test.url) {
     runnerArgs.push('--url', test.url);
   }
@@ -258,7 +264,7 @@ function buildReport(context, results) {
     generatedAt: new Date().toISOString(),
     caseRunner: context.caseRunner,
     manifest: context.manifest,
-    root: context.root,
+    roots: context.roots,
     jobs: context.jobs,
     wallClockMs: context.wallClockMs,
     summary: {
@@ -316,7 +322,7 @@ async function runAll(tests, context) {
     const startedAt = Date.now();
     let actual;
     try {
-      actual = await runCase(context.caseRunner, context.root, test, context.waitMs);
+      actual = await runCase(context.caseRunner, context.roots, test, context.waitMs);
     } catch (error) {
       const durationMs = Date.now() - startedAt;
       if (test.requiresRendering && RENDERING_UNAVAILABLE_PATTERN.test(error.message)) {
@@ -359,7 +365,9 @@ async function main() {
   const args = parseArgs(process.argv);
   const manifestPath = path.resolve(args.manifest);
   const manifest = readJson(manifestPath);
-  const root = path.resolve(args.root || path.resolve(path.dirname(manifestPath), manifest.root || '.'));
+  const roots = args.roots.length > 0
+    ? args.roots.map((root) => path.resolve(root))
+    : [path.resolve(path.dirname(manifestPath), manifest.root || '.')];
   const tests = Array.isArray(manifest.tests) ? manifest.tests : [];
   if (tests.length === 0) {
     if (manifest.allowEmpty) {
@@ -368,14 +376,16 @@ async function main() {
     }
     throw new Error(`manifest has no tests: ${manifestPath}`);
   }
-  if (!fs.existsSync(root)) {
-    throw new Error(`WPT root does not exist: ${root}`);
+  for (const root of roots) {
+    if (!fs.existsSync(root)) {
+      throw new Error(`WPT root does not exist: ${root}`);
+    }
   }
 
   const context = {
     caseRunner: args.caseRunner,
     manifest: manifestPath,
-    root,
+    roots,
     waitMs: args.waitMs,
     jobs: args.jobs
   };

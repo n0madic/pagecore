@@ -95,6 +95,21 @@ test('CLI: a crashing test does not abort the rest of the manifest, and waitMs:0
   assert.strictEqual(result.status, 1, 'overall exit code must reflect the real failures without swallowing the rest of the run');
 });
 
+// --- --root: repeatable, first listed wins on a resource-path collision ---
+
+test('CLI: --root is repeatable, and the first listed root wins on a resource-path collision', () => {
+  const result = childProcess.spawnSync(process.execPath, [
+    RUNNER_SCRIPT,
+    '--case-runner', CASE_RUNNER,
+    '--manifest', fixtureManifest('run_wpt_subset_multiroot_manifest.json'),
+    '--root', fixtureManifest('overlay-root-a'),
+    '--root', fixtureManifest('overlay-root-b')
+  ], { encoding: 'utf8' });
+
+  assert.strictEqual(result.status, 0, `expected the first --root's content to win, got:\n${result.stdout}\n${result.stderr}`);
+  assert.ok(/PASS overlay-resolution/.test(result.stdout), `expected the overlay test to pass, got:\n${result.stdout}`);
+});
+
 // --- --jobs: real concurrency, stable output order ---
 
 test('CLI: --jobs actually runs cases concurrently', () => {

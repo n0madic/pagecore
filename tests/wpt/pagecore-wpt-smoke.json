@@ -52,6 +52,19 @@
           "document.cookie stores and exposes same-page cookies": "PASS"
         }
       }
+    },
+    {
+      "name": "dom/events/testdriver-click",
+      "path": "/dom/events/pagecore-testdriver-click.window.js",
+      "requiresRendering": true,
+      "expected": {
+        "harness": "OK",
+        "subtests": {
+          "test_driver.click() dispatches a real pointer/mouse/click event sequence": "PASS",
+          "test_driver.send_keys() types into a focused text input": "PASS",
+          "test_driver.Actions() synthesizes a single-pointer-source click": "PASS"
+        }
+      }
     }
   ]
 }

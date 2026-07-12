@@ -738,6 +738,12 @@ if(PAGECORE_BUILD_TESTS)
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/run_wpt_subset.js"
                     --case-runner $<TARGET_FILE:pagecore_wpt_case>
                     --manifest "${PAGECORE_WPT_EXTENDED_MANIFEST}"
+                    # Only the single-file vendor-overlay root is listed ahead of the
+                    # real checkout, not all of tests/wpt: tests/wpt/resources also has
+                    # PageCore's own from-scratch testharness.js, and shadowing that
+                    # would silently swap out the real corpus's test harness instead of
+                    # just supplying test_driver_internal.
+                    --root "${CMAKE_CURRENT_SOURCE_DIR}/tests/wpt/vendor-overlay"
                     --root "${PAGECORE_WPT_ROOT}"
             )
             set_tests_properties(pagecore_wpt_extended PROPERTIES TIMEOUT 300)

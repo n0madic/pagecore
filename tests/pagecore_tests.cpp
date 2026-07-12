@@ -3074,6 +3074,78 @@ void test_wpt_completion_callback_registration_waits_for_harness_initialization(
         "WPT hook should receive completion from an upstream-style harness");
 }
 
+// P0.1: test_driver_internal.click() must dispatch a real pointerdown/mousedown/
+// pointerup/mouseup/click sequence (not just a single synthetic click), with
+// the given coordinates and button, and focus a focusable target -- the
+// real vendored testdriver.js's click() computes coordinates itself and
+// always passes them through, so explicit coords here match its contract.
+void test_wpt_driver_click_dispatches_real_event_sequence()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(<html><body>
+  <input id="target" type="text">
+  <script>
+    const target = document.getElementById('target');
+    window.__events = [];
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      target.addEventListener(type, (event) => {
+        window.__events.push(`${type}:${event.clientX},${event.clientY},${event.button}`);
+      });
+    }
+
+    test_driver_internal = {};
+    test_driver_internal.click(target, { x: 12, y: 34 }).then(() => {
+      window.__done = true;
+      window.__focused = document.activeElement === target;
+    });
+  </script>
+</body></html>)HTML");
+
+    require(page.eval("String(window.__done)") == "true", "test_driver_internal.click() promise should resolve");
+    require(page.eval("String(window.__focused)") == "true",
+            "test_driver_internal.click() should focus a focusable target");
+    require(page.eval("String(window.__events.join('|'))")
+                == "pointerdown:12,34,0|mousedown:12,34,0|pointerup:12,34,0|mouseup:12,34,0|click:12,34,0",
+            "test_driver_internal.click() should dispatch pointerdown, mousedown, pointerup, mouseup and click "
+            "in order with the given coordinates and button");
+}
+
+// P0.1: test_driver_internal.send_keys() must focus the element and, per
+// character, dispatch keydown -> keypress -> input (with the character
+// appended to .value) -> keyup -- matching the one in-scope corpus file's
+// plain-character usage (no WebDriver special-key codepoints).
+void test_wpt_driver_send_keys_dispatches_keydown_input_keyup()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(<html><body>
+  <input id="target" type="text">
+  <script>
+    const target = document.getElementById('target');
+    window.__events = [];
+    for (const type of ['keydown', 'keypress', 'input', 'keyup']) {
+      target.addEventListener(type, (event) => {
+        window.__events.push(type + (event.key ? ':' + event.key : ''));
+      });
+    }
+
+    test_driver_internal = {};
+    test_driver_internal.send_keys(target, 'ab').then(() => {
+      window.__done = true;
+      window.__focused = document.activeElement === target;
+    });
+  </script>
+</body></html>)HTML");
+
+    require(page.eval("String(window.__done)") == "true", "test_driver_internal.send_keys() promise should resolve");
+    require(page.eval("String(window.__focused)") == "true",
+            "test_driver_internal.send_keys() should focus the target element");
+    require(page.eval("String(document.getElementById('target').value)") == "ab",
+            "test_driver_internal.send_keys() should type the given characters into the target's value");
+    require(page.eval("String(window.__events.join('|'))")
+                == "keydown:a|keypress:a|input|keyup:a|keydown:b|keypress:b|input|keyup:b",
+            "test_driver_internal.send_keys() should dispatch keydown, keypress, input and keyup per character in order");
+}
+
 void test_custom_elements_registry_shim()
 {
     pagecore::Page page;
@@ -13371,6 +13443,47 @@ void test_hit_testing()
     require(page.eval("String(window.__caretOk)") == "true",
             "caretPositionFromPoint should resolve to the text-containing element's first Text descendant");
 }
+
+// P0.1: test_driver_internal.action_sequence() with a single pointer source
+// (pointerMove over an element, pointerDown, pointerUp -- the exact shape
+// used by all three in-scope test_driver.Actions() corpus files) must
+// resolve the pointerDown/pointerUp target through real hit-testing
+// (document.elementFromPoint(), like real WebDriver Actions do) and fire a
+// click once the down and up targets match. Needs rendering, same as
+// elementFromPoint/elementsFromPoint themselves.
+void test_wpt_driver_action_sequence_pointer_source()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="target" style="position:absolute;left:10px;top:10px;width:50px;height:50px;"></div>
+  <script>
+    const target = document.getElementById('target');
+    window.__clicked = false;
+    target.addEventListener('click', () => { window.__clicked = true; });
+
+    test_driver_internal = {};
+    const actionsByInput = [{
+      type: 'pointer',
+      id: '0',
+      parameters: { pointerType: 'mouse' },
+      actions: [
+        { type: 'pointerMove', x: 0, y: 0, origin: target },
+        { type: 'pointerDown', button: 0 },
+        { type: 'pointerUp', button: 0 }
+      ]
+    }];
+    test_driver_internal.action_sequence(actionsByInput).then(() => {
+      window.__done = true;
+    });
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.eval("String(window.__done)") == "true", "test_driver_internal.action_sequence() promise should resolve");
+    require(page.eval("String(window.__clicked)") == "true",
+            "a pointerMove+pointerDown+pointerUp Actions sequence over an element should fire a click on it");
+}
 #endif
 
 } // namespace
@@ -13435,6 +13548,8 @@ int main()
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();
+        test_wpt_driver_click_dispatches_real_event_sequence();
+        test_wpt_driver_send_keys_dispatches_keydown_input_keyup();
         test_custom_elements_registry_shim();
         test_shadow_root_and_element_internals_shims();
         test_shadow_root_builds_tree_from_inner_html();
@@ -13709,6 +13824,7 @@ int main()
         test_render_reflects_settled_dom_regardless_of_read_history();
         test_computed_style_reacts_to_class_driven_width_change();
         test_hit_testing();
+        test_wpt_driver_action_sequence_pointer_source();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";

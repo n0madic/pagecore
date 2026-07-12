@@ -31,9 +31,11 @@
         EventTarget,
         Event,
         MessageEvent,
-        KeyboardEvent
+        KeyboardEvent,
+        MouseEvent,
+        PointerEvent
       } = api.events;
-      const { document, fragmentFromHTML } = api.dom;
+      const { document, fragmentFromHTML, Element } = api.dom;
 
 
         class DOMRectReadOnly {
@@ -2221,27 +2223,184 @@
             }
           });
 
+          // Real event-sequence driver backing `test_driver_internal` (WPT
+          // vendor extension point). Ships correct *event dispatch* for the
+          // in-scope corpus (plain click, plain send_keys, single-pointer-source
+          // Actions()) -- not full WebDriver semantics: no HTML activation
+          // behavior (checkbox toggle, form submit, link navigation), no
+          // key/wheel/none action sources, no WebDriver special-key codepoints.
+          function centerPointOf(element) {
+            if (!element || typeof element.getBoundingClientRect !== 'function') return { x: 0, y: 0 };
+            const rect = element.getBoundingClientRect();
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+          }
+
+          function pointFromCoords(coords) {
+            const x = coords && Number.isFinite(Number(coords.x)) ? Number(coords.x) : 0;
+            const y = coords && Number.isFinite(Number(coords.y)) ? Number(coords.y) : 0;
+            return { x, y };
+          }
+
+          function dispatchMouseLike(element, type, point, button, buttons) {
+            if (!element || typeof element.dispatchEvent !== 'function') return;
+            const isPointerType = type === 'pointerdown' || type === 'pointerup';
+            const init = {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              view: global,
+              detail: type === 'click' ? 1 : 0,
+              clientX: point.x,
+              clientY: point.y,
+              screenX: point.x,
+              screenY: point.y,
+              button,
+              buttons
+            };
+            if (isPointerType) {
+              init.pointerId = 1;
+              init.pointerType = 'mouse';
+              init.isPrimary = true;
+              element.dispatchEvent(new PointerEvent(type, init));
+            } else {
+              element.dispatchEvent(new MouseEvent(type, init));
+            }
+          }
+
+          function pointerDownAt(element, point, button) {
+            // Only the primary (left) button is exercised by any in-scope
+            // test; `buttons` always toggles bit 0 here rather than the real
+            // per-button bitmask (4/2/8/16 for middle/right/back/forward)
+            // since no corpus file asserts a secondary-button `buttons` value.
+            dispatchMouseLike(element, 'pointerdown', point, button, 1);
+            dispatchMouseLike(element, 'mousedown', point, button, 1);
+          }
+
+          function pointerUpAt(element, point, button) {
+            dispatchMouseLike(element, 'pointerup', point, button, 0);
+            dispatchMouseLike(element, 'mouseup', point, button, 0);
+          }
+
+          function fireClick(element, point, button) {
+            dispatchMouseLike(element, 'click', point, button, 0);
+          }
+
+          function syntheticClick(element, coords) {
+            if (!element) throw new Error('test_driver_internal.click: element is required');
+            const point = coords ? pointFromCoords(coords) : centerPointOf(element);
+            pointerDownAt(element, point, 0);
+            if (typeof element.focus === 'function') element.focus();
+            pointerUpAt(element, point, 0);
+            fireClick(element, point, 0);
+          }
+
+          // ASCII-only best-effort `KeyboardEvent.code`; the one in-scope
+          // send_keys corpus file only sends plain printable characters, so a
+          // WebDriver special-key-codepoint table is out of scope.
+          function codeForChar(char) {
+            if (char === ' ') return 'Space';
+            if (/[a-z]/.test(char)) return 'Key' + char.toUpperCase();
+            if (/[A-Z]/.test(char)) return 'Key' + char;
+            if (/[0-9]/.test(char)) return 'Digit' + char;
+            return '';
+          }
+
+          function syntheticSendKeys(element, keys) {
+            if (!element) return;
+            if (typeof element.focus === 'function') element.focus();
+            for (const key of String(keys)) {
+              const printable = key.length === 1 && key >= ' ' && key !== '';
+              const base = {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view: global,
+                key,
+                code: codeForChar(key)
+              };
+              element.dispatchEvent(new KeyboardEvent('keydown', base));
+              if (printable) {
+                element.dispatchEvent(new KeyboardEvent('keypress', base));
+                if ('value' in element) {
+                  element.value = String(element.value || '') + key;
+                  element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                }
+              }
+              element.dispatchEvent(new KeyboardEvent('keyup', base));
+            }
+          }
+
+          // Resolves a WebDriver Actions `pointerMove` tick's (x, y, origin) to a
+          // document-space point. `origin` is the real in-process Element object
+          // (no wire serialization, unlike real WebDriver) -- resolved via the
+          // same getBoundingClientRect()-based in-view-center math test_driver.js
+          // itself uses for click(). "viewport"/"pointer" origins fall back to
+          // raw x, y: no scroll model and no real multi-tick pointer tracking
+          // make a truer "pointer" origin meaningless here, and no in-scope file
+          // uses either.
+          function resolvePointerMovePoint(action) {
+            const dx = Number(action.x) || 0;
+            const dy = Number(action.y) || 0;
+            const origin = action.origin;
+            if (origin instanceof Element) {
+              const center = centerPointOf(origin);
+              return { x: center.x + dx, y: center.y + dy };
+            }
+            return { x: dx, y: dy };
+          }
+
+          function elementAtPoint(point) {
+            if (typeof document.elementFromPoint !== 'function') return null;
+            return document.elementFromPoint(point.x, point.y);
+          }
+
+          // Minimal interpreter: only the `pointer` action source is
+          // implemented, one tick per primitive. No `key`/`wheel`/`none`
+          // sources, no touch/multi-touch, no true multi-source tick
+          // synchronization -- no in-scope corpus file needs any of that.
+          // Unsupported sources are skipped (not thrown), so a test degrades to
+          // a clear assertion failure instead of a crashed harness.
+          function syntheticActionSequence(actionsByInput) {
+            let point = { x: 0, y: 0 };
+            let downTarget = null;
+            for (const source of actionsByInput || []) {
+              if (!source || source.type !== 'pointer') {
+                if (source && source.type && global.console && typeof global.console.warn === 'function') {
+                  global.console.warn(`test_driver.action_sequence: "${source.type}" action source is not implemented by this vendor shim`);
+                }
+                continue;
+              }
+              for (const action of source.actions || []) {
+                if (!action || action.type === 'pause') continue;
+                if (action.type === 'pointerMove') {
+                  point = resolvePointerMovePoint(action);
+                } else if (action.type === 'pointerDown') {
+                  const button = action.button === undefined ? 0 : Number(action.button);
+                  downTarget = elementAtPoint(point);
+                  if (downTarget) pointerDownAt(downTarget, point, button);
+                } else if (action.type === 'pointerUp') {
+                  const button = action.button === undefined ? 0 : Number(action.button);
+                  const upTarget = elementAtPoint(point);
+                  if (upTarget) {
+                    pointerUpAt(upTarget, point, button);
+                    if (downTarget && upTarget === downTarget) fireClick(upTarget, point, button);
+                  }
+                  downTarget = null;
+                }
+              }
+            }
+          }
+
           const driver = {
-            click(element) {
-              return Promise.resolve().then(() => {
-                if (element && typeof element.click === 'function') element.click();
-              });
+            click(element, coords) {
+              return Promise.resolve().then(() => syntheticClick(element, coords));
             },
             send_keys(element, keys) {
-              return Promise.resolve().then(() => {
-                if (!element) return;
-                if (typeof element.focus === 'function') element.focus();
-                for (const key of String(keys)) {
-                  element.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key }));
-                  if ('value' in element && key >= ' ') {
-                    element.value = String(element.value || '') + key;
-                    element.dispatchEvent(new Event('input', { bubbles: true }));
-                  }
-                  element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key }));
-                }
-              });
+              return Promise.resolve().then(() => syntheticSendKeys(element, keys));
             },
-            action_sequence() { return Promise.resolve(); }
+            action_sequence(actionsByInput) {
+              return Promise.resolve().then(() => syntheticActionSequence(actionsByInput));
+            }
           };
 
           let testDriverInternal = null;

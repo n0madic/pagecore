@@ -1,0 +1,10 @@
+{
+  "root": ".",
+  "tests": [
+    {
+      "name": "overlay-resolution",
+      "path": "/overlay",
+      "expected": { "harness": "OK", "subtests": { "first --root wins": "PASS" } }
+    }
+  ]
+}

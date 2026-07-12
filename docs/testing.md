@@ -121,6 +121,21 @@ ctest --test-dir build -R pagecore_wpt_extended --output-on-failure
 does this via `PAGECORE_WPT_ROOT`) when invoking the runner manually against
 it.
 
+`--root` is repeatable; the first root listed wins on a resource-path
+collision (matches `pagecore_wpt_case`'s own multi-root resolution). The
+`pagecore_wpt_extended` CTest target always lists
+`tests/wpt/vendor-overlay` before `PAGECORE_WPT_ROOT`, so every extended run
+automatically gets PageCore's real `test_driver_internal` implementation at
+`/resources/testdriver-vendor.js` (upstream's own copy at that path is an
+empty vendor extension point, so `test_driver.click()`/`send_keys()`/
+`Actions()` would otherwise fail with "Cannot read property of null"). That
+overlay directory intentionally contains only that one file — not
+`testharness.js` — so it never shadows the checkout's real test harness and
+corpus runs stay comparable against prior baselines. A manual invocation of
+`tools/run_wpt_subset.js` against a real checkout needs the same
+`--root tests/wpt/vendor-overlay --root /path/to/wpt` order to get
+`test_driver` support.
+
 Generate a broad exploratory manifest from selected upstream directories with
 the manifest generator:
 
@@ -139,6 +154,7 @@ Then run it directly:
 node tools/run_wpt_subset.js \
   --case-runner build/pagecore_wpt_case \
   --manifest /tmp/pagecore-wpt-generated.json \
+  --root tests/wpt/vendor-overlay \
   --root /path/to/wpt
 ```
 

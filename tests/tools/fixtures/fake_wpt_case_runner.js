@@ -18,6 +18,17 @@ function argVal(flag) {
   return index === -1 ? undefined : args[index + 1];
 }
 
+// Unlike argVal(), collects every occurrence of a repeatable flag (in argv
+// order) -- needed for --root, which run_wpt_subset.js now forwards once per
+// listed root.
+function argVals(flag) {
+  const values = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) values.push(args[i + 1]);
+  }
+  return values;
+}
+
 const testPath = argVal('--path') || '';
 const waitMs = argVal('--wait-ms');
 
@@ -83,6 +94,33 @@ if (testPath.includes('cluster')) {
     harness: 'OK',
     message: null,
     subtests: [{ name: 'width reflects', status: 'FAIL', message: `assert_equals: expected ${width} but got 0` }]
+  }));
+  process.exit(0);
+}
+
+if (testPath.includes('overlay')) {
+  // Mirrors WptResourceLoader's own first-match-wins resolution (see
+  // tools/pagecore_wpt_case.cpp) at the granularity run_wpt_subset.js's CLI
+  // plumbing actually controls: which --root directories got forwarded, and
+  // in what order. Real per-request resolution across roots is exercised
+  // against the actual C++ resource loader elsewhere, not by this fixture.
+  const roots = argVals('--root');
+  let content = null;
+  for (const root of roots) {
+    const candidate = path.join(root, 'overlay-resource.txt');
+    if (fs.existsSync(candidate)) {
+      content = fs.readFileSync(candidate, 'utf8').trim();
+      break;
+    }
+  }
+  console.log(JSON.stringify({
+    harness: 'OK',
+    message: null,
+    subtests: [{
+      name: 'first --root wins',
+      status: content === 'from-a' ? 'PASS' : 'FAIL',
+      message: `resolved content: ${JSON.stringify(content)} from roots ${JSON.stringify(roots)}`
+    }]
   }));
   process.exit(0);
 }
