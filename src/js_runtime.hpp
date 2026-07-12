@@ -24,6 +24,8 @@ extern "C" {
 #include <quickjs.h>
 }
 
+#include <lexbor/encoding/encoding.h>
+
 namespace pagecore {
 
 class CookieJar;
@@ -129,6 +131,24 @@ public:
     void record_dom_bridge_perf(std::string_view name, long long elapsed_us);
     void flush_dom_bridge_perf();
 
+    struct TextDecoderHandle {
+        int id = 0;
+        std::string encoding; // canonical WHATWG name, e.g. "utf-8", "gbk"
+    };
+    // Returns nullopt for an unrecognized label or one that maps to the
+    // "replacement" encoding, which TextDecoder's constructor must reject
+    // (see api-replacement-encodings.any.js) even though it decodes to a
+    // real lxb_encoding_data_t. `label` is matched case-sensitively against
+    // Lexbor's (already-lowercase) label table; the caller trims/lowercases.
+    std::optional<TextDecoderHandle> create_text_decoder(std::string_view label, bool fatal);
+    // Feeds `bytes` through the decoder's persistent state, so a multi-byte
+    // sequence split across two calls (WHATWG streaming decode) is handled
+    // correctly. `is_final` flushes a dangling partial sequence at the end of
+    // the stream instead of holding it for a chunk that will never come.
+    // Returns nullopt only when the decoder was created with fatal=true and
+    // an invalid byte sequence was encountered.
+    std::optional<std::string> decode_text_chunk(int handle, std::string_view bytes, bool is_final);
+
 private:
     struct DomBridgePerfAggregate {
         long long elapsed_us = 0;
@@ -160,6 +180,20 @@ private:
     std::shared_ptr<CachingResourceLoader> js_resource_cache_;
     // js-side load id -> async transfer id, for cancellation.
     std::unordered_map<std::uint64_t, std::uint64_t> pending_resource_loads_;
+
+    // Persistent per-TextDecoder-instance decode state, so a multi-byte
+    // sequence split across chunks resumes correctly. Cleared implicitly when
+    // this JsRuntime (and its page) is destroyed; there is no explicit
+    // destroy call from JS since a TextDecoder has no deterministic finalizer.
+    struct TextDecoderState {
+        const lxb_encoding_data_t* encoding_data = nullptr;
+        lxb_encoding_decode_t ctx{};
+        lxb_codepoint_t replacement = 0;
+        bool fatal = false;
+    };
+    std::unordered_map<int, TextDecoderState> text_decoders_;
+    int next_text_decoder_id_ = 1;
+
     DomDocument* document_ = nullptr;
     LoadOptions options_;
     std::shared_ptr<ResourceLoader> loader_;

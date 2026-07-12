@@ -826,26 +826,160 @@
           }
         }
 
+        // A handful of legacy WHATWG labels Lexbor's own table does not list
+        // (it is complete for every label WPT's textdecoder-labels.any.js
+        // otherwise exercises). Mapped to a label Lexbor does recognize
+        // rather than patching Lexbor upstream for nine aliases.
+        const LEGACY_ENCODING_LABEL_ALIASES = {
+          'unicode11utf8': 'utf-8',
+          'unicode20utf8': 'utf-8',
+          'x-unicode20utf8': 'utf-8',
+          'unicodefffe': 'utf-16be',
+          'csunicode': 'utf-16le',
+          'iso-10646-ucs-2': 'utf-16le',
+          'ucs-2': 'utf-16le',
+          'unicode': 'utf-16le',
+          'unicodefeff': 'utf-16le'
+        };
+
+        // WHATWG "ASCII lowercase": only A-Z, unlike String.prototype.toLowerCase(),
+        // which Unicode-case-folds characters like U+212A KELVIN SIGN to 'k' --
+        // that would make the label "Koi8-r" wrongly match "koi8-r".
+        function asciiLowercaseLabel(text) {
+          return text.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+        }
+
+        // WHATWG "get an encoding": trim ASCII whitespace, ASCII-lowercase,
+        // then match against the label table. Lexbor owns the actual table;
+        // this just normalizes the same way the spec's lookup does.
+        function normalizeEncodingLabel(label) {
+          const trimmed = asciiLowercaseLabel(String(label == null ? 'utf-8' : label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ''));
+          return LEGACY_ENCODING_LABEL_ALIASES[trimmed] || trimmed;
+        }
+
+        function bomBytesFor(encoding) {
+          if (encoding === 'utf-8') return [0xef, 0xbb, 0xbf];
+          if (encoding === 'utf-16le') return [0xff, 0xfe];
+          if (encoding === 'utf-16be') return [0xfe, 0xff];
+          return null;
+        }
+
+        // Whether `bytes` (so far) could still be a prefix of `bom`: 'full' once
+        // all of `bom` is present and matches, 'partial' while more bytes could still
+        // complete a match, 'no' as soon as any byte mismatches (so e.g. two
+        // leading NUL bytes are never held back waiting for a UTF-8 BOM that
+        // starts with 0xEF).
+        function bomPrefixMatch(bytes, bom) {
+          const checkLength = Math.min(bytes.length, bom.length);
+          for (let i = 0; i < checkLength; i++) {
+            if (bytes[i] !== bom[i]) return 'no';
+          }
+          return bytes.length >= bom.length ? 'full' : 'partial';
+        }
+
+        function concatBytes(a, b) {
+          const out = new Uint8Array(a.length + b.length);
+          out.set(a, 0);
+          out.set(b, a.length);
+          return out;
+        }
+
+        // A buffer can be detached (ArrayBuffer.prototype.transfer()) as a side
+        // effect of converting a later argument -- e.g. TextDecoder.decode(buf,
+        // { get stream() { buf.buffer.transfer(0); return false; } }). Per spec
+        // this is not an error: the detached input is simply treated as empty.
+        function toBytes(input) {
+          if (input instanceof Uint8Array) return input.buffer.detached ? new Uint8Array() : input;
+          if (ArrayBuffer.isView(input)) {
+            return input.buffer.detached ? new Uint8Array() : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+          }
+          if (input instanceof ArrayBuffer) return input.detached ? new Uint8Array() : new Uint8Array(input);
+          return new Uint8Array();
+        }
+
         class TextDecoder {
           constructor(label = 'utf-8', options = {}) {
-            const normalized = String(label || 'utf-8').toLowerCase();
-            if (normalized !== 'utf-8' && normalized !== 'utf8') {
-              throw new RangeError('Only utf-8 TextDecoder is implemented');
+            const normalized = normalizeEncodingLabel(label);
+            const fatal = Boolean(options && options.fatal);
+            if (typeof host.textDecoderCreate === 'function') {
+              const created = host.textDecoderCreate(normalized, fatal);
+              if (!created) {
+                throw new RangeError(`Failed to construct 'TextDecoder': The encoding label provided ('${label}') is invalid.`);
+              }
+              this._handle = created.handle;
+              // Lexbor's encoding_data->name is a display-style label (e.g.
+              // "GBK", "Big5"); the spec requires the ASCII-lowercased form.
+              this.encoding = created.encoding.toLowerCase();
+            } else {
+              // No native encoding binding (e.g. isolated JS-shim unit tests
+              // with no C++ host bridge): fall back to pure-JS UTF-8 only,
+              // matching this class's pre-native-binding behavior.
+              if (normalized !== 'utf-8' && normalized !== 'utf8') {
+                throw new RangeError(`Failed to construct 'TextDecoder': The encoding label provided ('${label}') is invalid.`);
+              }
+              this._handle = null;
+              this.encoding = 'utf-8';
             }
-            this.encoding = 'utf-8';
-            this.fatal = Boolean(options.fatal);
-            this.ignoreBOM = Boolean(options.ignoreBOM);
+            this.fatal = fatal;
+            this.ignoreBOM = Boolean(options && options.ignoreBOM);
+            // True while a `{stream: true}` sequence is in progress; false
+            // (including right before this decoder has done anything) means
+            // the *next* decode() call starts a fresh sequence, eligible for
+            // BOM stripping again from a clean slate.
+            this._streaming = false;
+            this._resetBomState();
           }
 
-          decode(input = new Uint8Array()) {
-            const bytes = input instanceof Uint8Array
-              ? input
-              : ArrayBuffer.isView(input)
-                ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
-                : input instanceof ArrayBuffer
-                  ? new Uint8Array(input)
-                  : new Uint8Array();
-            return utf8DecodeReplacement(bytes, { fatal: this.fatal });
+          // `_bomPending` is null once resolved for the rest of this
+          // sequence, or when there is no BOM concept for this encoding /
+          // ignoreBOM is set; otherwise it holds bytes not yet fed to the
+          // decoder because they could still turn out to be a BOM.
+          _resetBomState() {
+            this._bomPending = (!this.ignoreBOM && bomBytesFor(this.encoding)) ? new Uint8Array(0) : null;
+          }
+
+          decode(input = new Uint8Array(), options = {}) {
+            // Read `options.stream` before converting `input` to bytes: a
+            // getter on `options` can detach `input`'s buffer as a side
+            // effect (see toBytes()), and per spec that ordering is what
+            // makes the detached-input case observable as empty, not an
+            // exception from reading stale byte data.
+            const streaming = Boolean(options && options.stream);
+            let bytes = toBytes(input);
+
+            if (!this._streaming) {
+              // Starting a fresh sequence: this covers both the first-ever
+              // call and a call following one that finalized or threw (a
+              // fatal error always ends the sequence, per spec, regardless
+              // of what `stream` that failed call itself requested).
+              this._resetBomState();
+            }
+
+            if (this._bomPending) {
+              const bom = bomBytesFor(this.encoding);
+              const combined = concatBytes(this._bomPending, bytes);
+              const match = bomPrefixMatch(combined, bom);
+              if (match === 'partial' && streaming) {
+                // Could still be a BOM or could still be ordinary data (e.g. a
+                // lone leading 0xFF byte of a UTF-16LE code unit); neither is
+                // decided until more bytes arrive or the stream ends.
+                this._bomPending = combined;
+                this._streaming = true;
+                return '';
+              }
+              bytes = match === 'full' ? combined.subarray(bom.length) : combined;
+              this._bomPending = null;
+            }
+
+            const result = this._handle === null
+              ? utf8DecodeReplacement(bytes, { fatal: this.fatal })
+              : host.textDecoderDecode(this._handle, bytes, !streaming);
+            if (result === null || result === undefined) {
+              this._streaming = false;
+              throw new TypeError('The encoded data was not valid.');
+            }
+            this._streaming = streaming;
+            return result;
           }
         }
 

@@ -221,7 +221,9 @@
         TransformStream,
         TransformStreamDefaultController,
         ByteLengthQueuingStrategy,
-        CountQueuingStrategy
+        CountQueuingStrategy,
+        TextDecoderStream,
+        TextEncoderStream
       } = api.streams;
       const {
         CSS,
@@ -393,6 +395,8 @@
         global.TransformStreamDefaultController = TransformStreamDefaultController;
         global.ByteLengthQueuingStrategy = ByteLengthQueuingStrategy;
         global.CountQueuingStrategy = CountQueuingStrategy;
+        global.TextDecoderStream = TextDecoderStream;
+        global.TextEncoderStream = TextEncoderStream;
         global.XMLHttpRequest = XMLHttpRequest;
         global.Storage = Storage;
         global.CSSRule = CSSRule;

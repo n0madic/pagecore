@@ -16,7 +16,7 @@
     deps: ['events', 'web'],
     install(ctx, api) {
       const { DOMException } = api.events;
-      const { TextEncoder } = api.web;
+      const { TextEncoder, TextDecoder } = api.web;
 
       function notSupported(feature) {
         return new DOMException(`${feature} is not supported by this PageCore stream implementation.`, 'NotSupportedError');
@@ -284,18 +284,10 @@
           this._storedError = undefined;
           // Provide a controller so sinks that call controller.error(...) work.
           this._controller = {
-            error: (reason) => {
-              if (this._state === 'writable') {
-                this._state = 'errored';
-                this._storedError = reason;
-              }
-            }
+            error: (reason) => this._error(reason)
           };
           if (typeof this._sink.start === 'function') {
-            resolvePromise(this._sink.start(this._controller)).catch((reason) => {
-              this._state = 'errored';
-              this._storedError = reason;
-            });
+            resolvePromise(this._sink.start(this._controller)).catch((reason) => this._error(reason));
           }
         }
 
@@ -307,23 +299,44 @@
           return new WritableStreamDefaultWriter(this);
         }
 
+        // Mirrors errorReadableStream(): transitions state and rejects the
+        // attached writer's `closed`/`ready` promises, so a write() rejection
+        // (e.g. a TransformStream sink whose transform() threw) is observable
+        // there too, not just as the write() call's own rejection.
+        _error(reason) {
+          if (this._state !== 'writable') return;
+          this._state = 'errored';
+          this._storedError = reason;
+          if (this._writer) this._writer._errored(reason);
+        }
+
         _write(chunk) {
-          if (this._state !== 'writable') return Promise.reject(new TypeError('WritableStream is not writable'));
-          return typeof this._sink.write === 'function'
+          if (this._state !== 'writable') {
+            return Promise.reject(this._state === 'errored' ? this._storedError : new TypeError('WritableStream is not writable'));
+          }
+          const result = typeof this._sink.write === 'function'
             ? resolvePromise(this._sink.write(chunk))
             : Promise.resolve();
+          return result.catch((reason) => {
+            this._error(reason);
+            throw reason;
+          });
         }
 
         _close() {
           if (this._state === 'closed') return Promise.resolve();
           this._state = 'closed';
-          return typeof this._sink.close === 'function'
+          const result = typeof this._sink.close === 'function'
             ? resolvePromise(this._sink.close())
             : Promise.resolve();
+          if (this._writer) result.then(() => this._writer._closedSuccessfully(), (reason) => this._writer._errored(reason));
+          return result;
         }
 
         _abort(reason) {
           this._state = 'errored';
+          this._storedError = reason;
+          if (this._writer) this._writer._errored(reason);
           return typeof this._sink.abort === 'function'
             ? resolvePromise(this._sink.abort(reason))
             : Promise.resolve();
@@ -340,8 +353,27 @@
           this._stream = stream;
           stream._writer = this;
           this.ready = Promise.resolve();
-          this.closed = Promise.resolve();
           this.desiredSize = 1;
+          if (stream._state === 'errored') {
+            this.closed = Promise.reject(stream._storedError);
+          } else if (stream._state === 'closed') {
+            this.closed = Promise.resolve();
+          } else {
+            this.closed = new Promise((resolve, reject) => {
+              this._closedResolve = resolve;
+              this._closedReject = reject;
+            });
+          }
+        }
+
+        // Mirrors ReadableStreamDefaultReader's _closedResolve/_closedReject:
+        // called by the stream when it transitions after this writer already
+        // has a pending `closed` promise.
+        _closedSuccessfully() {
+          if (this._closedResolve) this._closedResolve(undefined);
+        }
+        _errored(reason) {
+          if (this._closedReject) this._closedReject(reason);
         }
 
         write(chunk) {
@@ -366,6 +398,22 @@
       class TransformStream {
         constructor(transformer = {}, _writableStrategy = {}, _readableStrategy = {}) {
           let readableController = null;
+          // A transform()/flush() that throws (e.g. TextDecoderStream hitting
+          // a fatal decode error) must error *both* sides: the readable side
+          // via this controller, and the write()/close() promise itself. A
+          // synchronous throw happens before resolvePromise() ever runs, so
+          // it needs its own catch, not just a .catch() on the settled value.
+          const runStep = (fn) => {
+            try {
+              return resolvePromise(fn()).catch((error) => {
+                readableController.error(error);
+                throw error;
+              });
+            } catch (error) {
+              readableController.error(error);
+              return Promise.reject(error);
+            }
+          };
           this.readable = new ReadableStream({
             start(controller) {
               readableController = controller;
@@ -374,7 +422,7 @@
           this.writable = new WritableStream({
             write(chunk) {
               if (transformer && typeof transformer.transform === 'function') {
-                return resolvePromise(transformer.transform(chunk, {
+                return runStep(() => transformer.transform(chunk, {
                   enqueue(value) { readableController.enqueue(value); },
                   error(error) { readableController.error(error); },
                   terminate() { readableController.close(); }
@@ -385,7 +433,7 @@
             },
             close() {
               if (transformer && typeof transformer.flush === 'function') {
-                return resolvePromise(transformer.flush({
+                return runStep(() => transformer.flush({
                   enqueue(value) { readableController.enqueue(value); },
                   error(error) { readableController.error(error); },
                   terminate() { readableController.close(); }
@@ -426,6 +474,80 @@
       class WritableStreamDefaultController {}
       class TransformStreamDefaultController {}
 
+      // Generic transform streams over TextDecoder/TextEncoder: each chunk is
+      // decoded/encoded with `{stream: true}` so a multi-byte sequence split
+      // across chunks still resolves correctly, and flush() finalizes the
+      // sequence when the writable side closes.
+      function isBufferSource(value) {
+        return value instanceof ArrayBuffer || ArrayBuffer.isView(value);
+      }
+
+      class TextDecoderStream {
+        constructor(label = 'utf-8', options = {}) {
+          const decoder = new TextDecoder(label, options);
+          this._decoder = decoder;
+          this._transform = new TransformStream({
+            transform(chunk, controller) {
+              // Per spec each written chunk must itself be a BufferSource;
+              // anything else errors both the readable and writable sides
+              // (see TransformStream's runStep, which catches this throw).
+              if (!isBufferSource(chunk)) {
+                throw new TypeError('TextDecoderStream chunk must be a BufferSource');
+              }
+              const text = decoder.decode(chunk, { stream: true });
+              if (text) controller.enqueue(text);
+            },
+            flush(controller) {
+              const text = decoder.decode();
+              if (text) controller.enqueue(text);
+            }
+          });
+        }
+        get encoding() { return this._decoder.encoding; }
+        get fatal() { return this._decoder.fatal; }
+        get ignoreBOM() { return this._decoder.ignoreBOM; }
+        get readable() { return this._transform.readable; }
+        get writable() { return this._transform.writable; }
+      }
+
+      class TextEncoderStream {
+        constructor() {
+          const encoder = new TextEncoder();
+          this._encoder = encoder;
+          // A lone leading (high) surrogate at the very end of a chunk might
+          // be completed by a trailing surrogate at the start of the next
+          // chunk, so it is held back rather than replaced immediately; a
+          // lone trailing surrogate, or a leading surrogate followed by
+          // anything else, is not ambiguous and is replaced right away by
+          // encoder.encode()'s own USVString conversion.
+          let pendingHighSurrogate = null;
+          this._transform = new TransformStream({
+            transform(chunk, controller) {
+              let text = String(chunk);
+              if (pendingHighSurrogate !== null) {
+                text = pendingHighSurrogate + text;
+                pendingHighSurrogate = null;
+              }
+              const lastCode = text.length ? text.charCodeAt(text.length - 1) : 0;
+              if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+                pendingHighSurrogate = text[text.length - 1];
+                text = text.slice(0, -1);
+              }
+              if (text.length) controller.enqueue(encoder.encode(text));
+            },
+            flush(controller) {
+              if (pendingHighSurrogate !== null) {
+                controller.enqueue(encoder.encode(pendingHighSurrogate));
+                pendingHighSurrogate = null;
+              }
+            }
+          });
+        }
+        get encoding() { return this._encoder.encoding; }
+        get readable() { return this._transform.readable; }
+        get writable() { return this._transform.writable; }
+      }
+
       return {
         ReadableStream,
         ReadableStreamDefaultController,
@@ -439,7 +561,9 @@
         TransformStream,
         TransformStreamDefaultController,
         ByteLengthQueuingStrategy,
-        CountQueuingStrategy
+        CountQueuingStrategy,
+        TextDecoderStream,
+        TextEncoderStream
       };
     }
   };

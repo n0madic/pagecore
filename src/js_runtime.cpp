@@ -1356,6 +1356,49 @@ JSValue host_domain_to_ascii(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue host_text_decoder_create(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 2) throw std::runtime_error("textDecoderCreate requires label and fatal");
+        const std::string label = to_string(ctx, argv[0]);
+        const bool fatal = JS_ToBool(ctx, argv[1]) != 0;
+
+        const auto handle = js.create_text_decoder(label, fatal);
+        if (!handle) {
+            return JS_NULL;
+        }
+
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "handle", JS_NewInt32(ctx, handle->id));
+        JS_SetPropertyStr(ctx, result, "encoding", js_string(ctx, handle->encoding));
+        return result;
+    });
+}
+
+JSValue host_text_decoder_decode(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 3) throw std::runtime_error("textDecoderDecode requires handle, bytes, and isFinal");
+        int32_t handle = 0;
+        if (JS_ToInt32(ctx, &handle, argv[0]) < 0) {
+            throw std::runtime_error("textDecoderDecode: invalid handle");
+        }
+        size_t byte_length = 0;
+        uint8_t* bytes = JS_GetUint8Array(ctx, &byte_length, argv[1]);
+        if (bytes == nullptr && byte_length != 0) {
+            throw std::runtime_error("textDecoderDecode requires a Uint8Array");
+        }
+        const bool is_final = JS_ToBool(ctx, argv[2]) != 0;
+
+        const std::string_view view(reinterpret_cast<const char*>(bytes), byte_length);
+        const auto decoded = js.decode_text_chunk(handle, view, is_final);
+        if (!decoded) {
+            return JS_NULL;
+        }
+        return js_string(ctx, *decoded);
+    });
+}
+
 JSValue host_set_cookie_string(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -1654,6 +1697,8 @@ void JsRuntime::install()
     set_function(context_, host, "getCookieString", host_get_cookie_string, 1);
     set_function(context_, host, "setCookieString", host_set_cookie_string, 2);
     set_function(context_, host, "domainToAscii", host_domain_to_ascii, 1);
+    set_function(context_, host, "textDecoderCreate", host_text_decoder_create, 2);
+    set_function(context_, host, "textDecoderDecode", host_text_decoder_decode, 3);
     set_function(context_, host, "activityBegin", host_activity_begin, 1);
     set_function(context_, host, "activityEnd", host_activity_end, 1);
     set_function(context_, host, "activityMarkMutation", host_activity_mark_mutation, 1);
@@ -2513,6 +2558,149 @@ void JsRuntime::set_document_cookie(std::string_view url, std::string_view cooki
     if (cookie_jar_ != nullptr) {
         cookie_jar_->set_document_cookie(url, cookie);
     }
+}
+
+namespace {
+
+void append_utf8_codepoint(std::string& out, lxb_codepoint_t code)
+{
+    if (code <= 0x7f) {
+        out += static_cast<char>(code);
+    } else if (code <= 0x7ff) {
+        out += static_cast<char>(0xc0 | (code >> 6));
+        out += static_cast<char>(0x80 | (code & 0x3f));
+    } else if (code <= 0xffff) {
+        out += static_cast<char>(0xe0 | (code >> 12));
+        out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+        out += static_cast<char>(0x80 | (code & 0x3f));
+    } else {
+        out += static_cast<char>(0xf0 | (code >> 18));
+        out += static_cast<char>(0x80 | ((code >> 12) & 0x3f));
+        out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+        out += static_cast<char>(0x80 | (code & 0x3f));
+    }
+}
+
+} // namespace
+
+std::optional<JsRuntime::TextDecoderHandle> JsRuntime::create_text_decoder(std::string_view label, bool fatal)
+{
+    const auto* encoding_data = lxb_encoding_data_by_name(
+        reinterpret_cast<const lxb_char_t*>(label.data()), label.size());
+
+    // "replacement" (and its historical aliases) is a real lxb_encoding_data_t
+    // to Lexbor, but the WHATWG Encoding Standard carves it out specifically:
+    // TextDecoder's constructor must reject it with a RangeError rather than
+    // ever decode with it (see api-replacement-encodings.any.js).
+    if (encoding_data == nullptr || encoding_data->encoding == LXB_ENCODING_REPLACEMENT) {
+        return std::nullopt;
+    }
+
+    const int id = next_text_decoder_id_++;
+    TextDecoderState state;
+    state.encoding_data = encoding_data;
+    state.fatal = fatal;
+    state.replacement = LXB_ENCODING_REPLACEMENT_CODEPOINT;
+
+    const lxb_status_t init_status = lxb_encoding_decode_init(&state.ctx, encoding_data, nullptr, 0);
+    if (init_status != LXB_STATUS_OK) {
+        return std::nullopt;
+    }
+    if (!fatal) {
+        // A non-fatal decoder replaces bad sequences with U+FFFD inline
+        // instead of erroring; buffer_length must already reflect a real
+        // output buffer for this to succeed, so it is (re)armed per chunk in
+        // decode_text_chunk rather than here.
+        state.ctx.replace_to = &state.replacement;
+        state.ctx.replace_len = 1;
+    }
+
+    text_decoders_.emplace(id, state);
+
+    TextDecoderHandle handle;
+    handle.id = id;
+    handle.encoding = reinterpret_cast<const char*>(encoding_data->name);
+    return handle;
+}
+
+std::optional<std::string> JsRuntime::decode_text_chunk(int handle, std::string_view bytes, bool is_final)
+{
+    auto iterator = text_decoders_.find(handle);
+    if (iterator == text_decoders_.end()) {
+        throw std::runtime_error("decode_text_chunk: unknown TextDecoder handle");
+    }
+    TextDecoderState& state = iterator->second;
+
+    std::string result;
+    lxb_codepoint_t codepoint_buffer[256];
+    state.ctx.buffer_out = codepoint_buffer;
+    state.ctx.buffer_length = std::size(codepoint_buffer);
+    state.ctx.buffer_used = 0;
+    // replace_to points at state.replacement, which does not move, but the
+    // pointer must be re-armed since buffer_set (via buffer_length above)
+    // does not touch it -- re-set for clarity and because init() above only
+    // set it once against a zero-length buffer.
+    if (!state.fatal) {
+        state.ctx.replace_to = &state.replacement;
+        state.ctx.replace_len = 1;
+    }
+
+    const auto* data = reinterpret_cast<const lxb_char_t*>(bytes.data());
+    const lxb_char_t* end = data + bytes.size();
+
+    auto drain = [&]() {
+        const lxb_codepoint_t* cps = lxb_encoding_decode_buf(&state.ctx);
+        const size_t used = lxb_encoding_decode_buf_used(&state.ctx);
+        for (size_t i = 0; i < used; ++i) {
+            append_utf8_codepoint(result, cps[i]);
+        }
+        lxb_encoding_decode_buf_used_set(&state.ctx, 0);
+    };
+
+    while (data < end) {
+        const lxb_status_t status = state.encoding_data->decode(&state.ctx, &data, end);
+        if (status == LXB_STATUS_OK) {
+            drain();
+            break;
+        }
+        if (status == LXB_STATUS_SMALL_BUFFER) {
+            drain();
+            continue;
+        }
+        if (status == LXB_STATUS_CONTINUE) {
+            // Input exhausted mid-sequence; state.ctx retains the pending
+            // lead byte(s) for the next chunk (WHATWG streaming decode).
+            drain();
+            break;
+        }
+        // Only reachable in fatal mode (replace_to unset): an invalid byte
+        // sequence with no replacement configured. Per spec, throwing here
+        // still resets the decoder ("set this's do not flush to false"): a
+        // later decode() call on the same instance must not inherit the
+        // failed attempt's partial byte state.
+        lxb_encoding_decode_init(&state.ctx, state.encoding_data, nullptr, 0);
+        return std::nullopt;
+    }
+
+    if (is_final) {
+        const lxb_status_t finish_status = lxb_encoding_decode_finish(&state.ctx);
+        // finish() appends a replacement codepoint into buffer_out on
+        // success; drain it before the reset below discards buffer_out.
+        if (finish_status == LXB_STATUS_OK) {
+            drain();
+        }
+        // A fresh decoder must not carry EOF-flush state into the next
+        // sequence if this same TextDecoder instance is reused after `stream:
+        // false` -- the WHATWG algorithm re-initializes decoder state at the
+        // start of every non-streaming decode() call. This applies whether
+        // finish() succeeded or (fatal mode) hit a dangling partial sequence.
+        lxb_encoding_decode_init(&state.ctx, state.encoding_data, nullptr, 0);
+        if (finish_status != LXB_STATUS_OK) {
+            return std::nullopt;
+        }
+    }
+
+    return result;
 }
 
 void JsRuntime::log_console(std::string_view severity, std::string_view message)

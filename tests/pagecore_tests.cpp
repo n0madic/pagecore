@@ -2521,6 +2521,74 @@ void test_url_hostname_idna()
         "special-scheme hostnames should go through IDNA/Punycode and forbidden-code-point checks, opaque hosts should not");
 }
 
+void test_text_decoder_encoding_support()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const checks = [];
+
+    // A legacy multi-byte encoding decodes via the native Lexbor binding.
+    const gbk = new TextDecoder('gbk');
+    checks.push(gbk.encoding === 'gbk');
+    checks.push(gbk.decode(new Uint8Array([0xc4, 0xe3, 0xba, 0xc3])) === '你好');
+
+    // A label mapping to the WHATWG "replacement" encoding is rejected by the
+    // constructor even though Lexbor resolves it to a real decoder (used
+    // only for a different code path than TextDecoder, per spec).
+    let threw = false;
+    try { new TextDecoder('hz-gb-2312'); } catch (error) { threw = error.name === 'RangeError'; }
+    checks.push(threw);
+    threw = false;
+    try { new TextDecoder('not-a-real-encoding'); } catch (error) { threw = error.name === 'RangeError'; }
+    checks.push(threw);
+
+    // Fatal mode: a decode error throws, and does not leave the decoder's
+    // internal state corrupted for the next (unrelated) call.
+    const fatalGbk = new TextDecoder('gbk', { fatal: true });
+    threw = false;
+    try { fatalGbk.decode(Uint8Array.from([0xfe, 0x39, 0xfe, 0x40])); } catch (error) { threw = error.name === 'TypeError'; }
+    checks.push(threw);
+    checks.push(fatalGbk.decode(Uint8Array.of(0x40)) === '@');
+
+    // A BOM split across two streamed chunks is still recognized and
+    // stripped once complete.
+    const utf8 = new TextDecoder('utf-8');
+    checks.push(utf8.decode(Uint8Array.of(0xef, 0xbb), { stream: true }) === '');
+    checks.push(utf8.decode(Uint8Array.of(0xbf, 0x40)) === '@');
+
+    // TextDecoderStream/TextEncoderStream: an astral character split across
+    // two written chunks reassembles into a single decoded string.
+    (async () => {
+      const encodeStream = new TextEncoderStream();
+      const writer = encodeStream.writable.getWriter();
+      const reader = encodeStream.readable.getReader();
+      const blueHeart = '\u{1F499}';
+      writer.write(blueHeart[0]);
+      writer.write(blueHeart[1]);
+      writer.close();
+      const bytes = [];
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes.push(...value);
+      }
+      const decoded = new TextDecoder('utf-8').decode(new Uint8Array(bytes));
+      checks.push(decoded === blueHeart);
+
+      document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+    })();
+  </script>
+</body></html>
+)HTML", "https://example.test/text-decoder-encoding.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "TextDecoder should support legacy multi-byte encodings via the native binding, reject replacement-mapped labels, "
+        "recover cleanly from fatal errors, and stream BOM detection across chunk boundaries");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -12901,6 +12969,7 @@ int main()
         test_dom_interface_globals();
         test_url_search_params_robustness();
         test_url_hostname_idna();
+        test_text_decoder_encoding_support();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();
