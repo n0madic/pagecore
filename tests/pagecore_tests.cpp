@@ -2090,6 +2090,51 @@ void test_character_data_interface()
         "CharacterData should own the data mutation API and treat a numeric constructor argument as data");
 }
 
+void test_dom_interface_globals()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="host" data-x="1"></div>
+  <script>
+    const checks = [];
+    const host = document.getElementById('host');
+
+    checks.push(host.dataset instanceof DOMStringMap);
+    checks.push(host.dataset.x === '1');
+
+    checks.push(document instanceof HTMLDocument);
+    checks.push(Object.prototype.toString.call(document) === '[object HTMLDocument]');
+    // XMLDocument must exist and be distinct: WPT asserts a parsed document is
+    // *not* an XMLDocument, which only means anything if the interface is there.
+    checks.push(typeof XMLDocument === 'function');
+    checks.push(!(document instanceof XMLDocument));
+
+    const range = new StaticRange({ startContainer: host, startOffset: 0, endContainer: host, endOffset: 0 });
+    checks.push(range.collapsed === true);
+    checks.push(range.startContainer === host);
+
+    checks.push(document.createEvent('FocusEvent') instanceof FocusEvent);
+    checks.push(document.createEvent('hashchangeevent') instanceof HashChangeEvent);
+    checks.push(document.createEvent('HTMLEvents') instanceof Event);
+    let notSupported = false;
+    try { document.createEvent('foo'); } catch (error) { notSupported = error.name === 'NotSupportedError'; }
+    checks.push(notSupported);
+    // Device-sensor and touch interfaces stay absent on purpose, so feature
+    // detection is not told this engine has sensors it does not have.
+    checks.push(typeof DeviceMotionEvent === 'undefined');
+    checks.push(typeof TouchEvent === 'undefined');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/interfaces.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "DOM interface globals should be installed and createEvent should reject unmodelled interfaces");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -12461,6 +12506,7 @@ int main()
         test_document_write_escaped_script_text_remains_text();
         test_comment_nodes_wrap_for_sibling_traversal();
         test_character_data_interface();
+        test_dom_interface_globals();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();

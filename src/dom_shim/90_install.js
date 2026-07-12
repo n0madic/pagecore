@@ -38,9 +38,12 @@
         MouseEvent,
         KeyboardEvent,
         PointerEvent,
+        FocusEvent,
+        HashChangeEvent,
         AbortSignal,
         AbortController,
         MutationObserver,
+        MutationRecord,
         deliverMutationObservers,
         installWindowIdentity
       } = api.events;
@@ -50,6 +53,8 @@
         CharacterData,
         Text,
         Comment,
+        DOMStringMap,
+        XMLDocument,
         Attr,
         Element,
         HTMLElement,
@@ -157,6 +162,7 @@
         DOMRect,
         DOMRectList,
         Range,
+        StaticRange,
         Selection,
         URL,
         URLSearchParams,
@@ -235,9 +241,12 @@
         global.MouseEvent = MouseEvent;
         global.KeyboardEvent = KeyboardEvent;
         global.PointerEvent = PointerEvent;
+        global.FocusEvent = FocusEvent;
+        global.HashChangeEvent = HashChangeEvent;
         global.AbortSignal = AbortSignal;
         global.AbortController = AbortController;
         global.MutationObserver = MutationObserver;
+        global.MutationRecord = MutationRecord;
         global.Node = Node;
         global.CharacterData = CharacterData;
         global.Text = Text;
@@ -326,9 +335,15 @@
         global.SVGTitleElement = SVGTitleElement;
         global.SVGDescElement = SVGDescElement;
         global.Document = Document;
+        // Legacy alias: PageCore parses a single HTML document, so Document and
+        // HTMLDocument are one class (Symbol.toStringTag still reports
+        // "[object HTMLDocument]" for the real document).
+        global.HTMLDocument = Document;
+        global.XMLDocument = XMLDocument;
         global.DocumentFragment = DocumentFragment;
         global.ShadowRoot = ShadowRoot;
         global.DOMImplementation = DOMImplementation;
+        global.DOMStringMap = DOMStringMap;
         global.ElementInternals = ElementInternals;
         global.ValidityState = ValidityState;
         global.DOMTokenList = DOMTokenList;
@@ -336,6 +351,7 @@
         global.TreeWalker = TreeWalker;
         global.NodeIterator = NodeIterator;
         global.Range = Range;
+        global.StaticRange = StaticRange;
         global.Selection = Selection;
         global.DOMRectReadOnly = DOMRectReadOnly;
         global.DOMRect = DOMRect;

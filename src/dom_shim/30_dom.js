@@ -38,13 +38,48 @@
         DOMException,
         EventTarget,
         Event,
+        CustomEvent,
+        MessageEvent,
+        UIEvent,
         MouseEvent,
         KeyboardEvent,
+        PointerEvent,
+        FocusEvent,
+        HashChangeEvent,
         installWindowIdentity,
         connectCustomElementTree,
         notifyCustomElementAttributeChanged,
         invokeCustomElementConnected
       } = api.events;
+
+      // document.createEvent() takes a legacy interface name, matched
+      // ASCII-case-insensitively, and must throw NotSupportedError for anything
+      // else. Only interfaces PageCore actually models are listed: exposing
+      // DeviceMotionEvent/TouchEvent here would tell a page that sensors and
+      // touch input exist, and docs/browser-api-support.md deliberately prefers a
+      // clean absence over a stub that lies to feature detection.
+      const legacyEventConstructors = {
+        event: Event,
+        events: Event,
+        htmlevents: Event,
+        svgevents: Event,
+        customevent: CustomEvent,
+        messageevent: MessageEvent,
+        uievent: UIEvent,
+        uievents: UIEvent,
+        mouseevent: MouseEvent,
+        mouseevents: MouseEvent,
+        keyboardevent: KeyboardEvent,
+        pointerevent: PointerEvent,
+        focusevent: FocusEvent,
+        hashchangeevent: HashChangeEvent
+      };
+
+      // ASCII lowercase, not String.prototype.toLowerCase(): the spec folds only
+      // A-Z, and WPT checks that "UİEvent" (U+0130) does not fold into "uievent".
+      function asciiLowercase(value) {
+        return String(value).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+      }
       const wrapperCache = ctx.wrapperCache;
       // Per-node cache of the materialized childNodes/children wrapper lists,
       // keyed (per entry) by the bridge mutation version. Repeated traversal
@@ -1796,8 +1831,13 @@
           return attribute.slice(5).replace(/-([a-z])/g, (_match, char) => char.toUpperCase());
         }
 
+        // The dataset facade is a Proxy, so its prototype comes from the proxy
+        // target: creating the target from DOMStringMap.prototype is what makes
+        // `element.dataset instanceof DOMStringMap` true.
+        class DOMStringMap {}
+
         function datasetFor(element) {
-          return new Proxy({}, {
+          return new Proxy(Object.create(DOMStringMap.prototype), {
             get(_target, property) {
               const attr = dataAttrName(property);
               if (!attr) return undefined;
@@ -3953,9 +3993,13 @@
           }
           getElementsByName(name) { return this.querySelectorAll(`[name="${String(name).replace(/"/g, '\\"')}"]`); }
           createEvent(type) {
-            if (/mouse/i.test(type)) return new MouseEvent('');
-            if (/keyboard/i.test(type)) return new KeyboardEvent('');
-            return new Event('');
+            const Constructor = Object.prototype.hasOwnProperty.call(legacyEventConstructors, asciiLowercase(type))
+              ? legacyEventConstructors[asciiLowercase(type)]
+              : null;
+            if (!Constructor) {
+              throw new DOMException(`The provided event type ("${type}") is invalid.`, 'NotSupportedError');
+            }
+            return new Constructor('');
           }
           createTreeWalker(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
             return new TreeWalker(root, whatToShow, filter);
@@ -4086,6 +4130,14 @@
           }
           getElementsByName(name) { return this.querySelectorAll(`[name="${String(name).replace(/"/g, '\\"')}"]`); }
         }
+
+        // PageCore has a single, HTML-parsed document, so Document and
+        // HTMLDocument are the same class (see the Symbol.toStringTag override
+        // below, which keeps the real document reporting "[object HTMLDocument]").
+        // XMLDocument still needs to exist and be distinct: WPT checks that a
+        // DOMParser-produced document is *not* an XMLDocument, which is only a
+        // meaningful assertion if the interface is installed.
+        class XMLDocument extends Document {}
 
         class DOMImplementation {
           createHTMLDocument(title = '') { return new DetachedHTMLDocument(title); }
@@ -4289,6 +4341,8 @@
         CharacterData,
         Text,
         Comment,
+        DOMStringMap,
+        XMLDocument,
         Attr,
         Element,
         HTMLElement,

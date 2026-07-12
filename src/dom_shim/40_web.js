@@ -207,6 +207,44 @@
         defineValue(Range, 'END_TO_END', 2, true);
         defineValue(Range, 'END_TO_START', 3, true);
 
+        // A StaticRange just records boundary points; unlike Range it does not
+        // track tree mutations, so it needs no live bookkeeping.
+        class StaticRange {
+          constructor(init) {
+            if (init === null || typeof init !== 'object') {
+              throw new TypeError("Failed to construct 'StaticRange': parameter 1 is not of type 'StaticRangeInit'.");
+            }
+            for (const key of ['startContainer', 'startOffset', 'endContainer', 'endOffset']) {
+              if (!(key in init)) {
+                throw new TypeError(`Failed to construct 'StaticRange': required member ${key} is undefined.`);
+              }
+            }
+            // DocumentType (10) and Attr (2) cannot be boundary containers.
+            for (const container of [init.startContainer, init.endContainer]) {
+              if (!container || typeof container.nodeType !== 'number') {
+                throw new TypeError("Failed to construct 'StaticRange': member is not of type 'Node'.");
+              }
+              if (container.nodeType === 10 || container.nodeType === 2) {
+                throw new DOMException('The supplied node is incorrect.', 'InvalidNodeTypeError');
+              }
+            }
+            this._startContainer = init.startContainer;
+            this._startOffset = Number(init.startOffset) >>> 0;
+            this._endContainer = init.endContainer;
+            this._endOffset = Number(init.endOffset) >>> 0;
+          }
+
+          get startContainer() { return this._startContainer; }
+          get startOffset() { return this._startOffset; }
+          get endContainer() { return this._endContainer; }
+          get endOffset() { return this._endOffset; }
+          get collapsed() {
+            return this._startContainer === this._endContainer && this._startOffset === this._endOffset;
+          }
+
+          get [Symbol.toStringTag]() { return 'StaticRange'; }
+        }
+
         function assertRangeBoundary(node, offset) {
           if (!node || typeof node.nodeType !== 'number') throw new TypeError('Boundary container must be a Node');
           const numericOffset = Number(offset);
@@ -1594,6 +1632,7 @@
         DOMRect,
         DOMRectList,
         Range,
+        StaticRange,
         Selection,
         selection,
         URLSearchParams,

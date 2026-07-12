@@ -18,6 +18,7 @@
   const ObjectDefineProperty = Object.defineProperty;
   const ObjectPrototypeHasOwnProperty = Object.prototype.hasOwnProperty;
   const ObjectAssign = Object.assign;
+  const ObjectCreate = Object.create;
   const ArrayPrototypePush = Array.prototype.push;
 
   return {
@@ -161,6 +162,26 @@
             this.isComposing = Boolean(init.isComposing);
           }
         }
+
+        class FocusEvent extends UIEvent {
+          constructor(type, init = {}) {
+            super(type, init);
+            this.relatedTarget = init.relatedTarget === undefined ? null : init.relatedTarget;
+          }
+        }
+
+        class HashChangeEvent extends Event {
+          constructor(type, init = {}) {
+            super(type, init);
+            this.oldURL = init.oldURL === undefined ? '' : String(init.oldURL);
+            this.newURL = init.newURL === undefined ? '' : String(init.newURL);
+          }
+        }
+
+        // Records are only ever produced by the observer machinery, so the
+        // interface has no constructor; it exists so that a delivered record is
+        // `instanceof MutationRecord`.
+        class MutationRecord {}
 
         class PointerEvent extends MouseEvent {
           constructor(type, init = {}) {
@@ -567,7 +588,7 @@
             if (wantsOldValue === null) continue;
             // Each observer gets its own record; oldValue is exposed only when
             // that observer asked for it (attributeOldValue/characterDataOldValue).
-            const delivered = ObjectAssign({}, record);
+            const delivered = ObjectAssign(ObjectCreate(MutationRecord.prototype), record);
             delivered.oldValue = wantsOldValue && record.oldValue !== undefined ? record.oldValue : null;
             ArrayPrototypePush.call(observer._records, delivered);
             pendingMutationObservers.add(observer);
@@ -699,6 +720,9 @@
         MouseEvent,
         KeyboardEvent,
         PointerEvent,
+        FocusEvent,
+        HashChangeEvent,
+        MutationRecord,
         EventTarget,
         Window,
         installWindowIdentity,
