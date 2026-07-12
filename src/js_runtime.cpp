@@ -11,6 +11,8 @@ extern "C" {
 #include <quickjs.h>
 }
 
+#include <lexbor/unicode/idna.h>
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -1309,6 +1311,51 @@ JSValue host_get_cookie_string(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+lxb_status_t idna_to_ascii_collect(const lxb_char_t* data, size_t length, void* ctx)
+{
+    static_cast<std::string*>(ctx)->assign(reinterpret_cast<const char*>(data), length);
+    return LXB_STATUS_OK;
+}
+
+// WHATWG URL "domain to ASCII": mapping, NFC normalization, Punycode encoding,
+// and UTS46 validity checks, always with beStrict=false (the URL Standard
+// never invokes the strict/STD3 variant from host parsing). Mirrors the exact
+// flags lexbor's own URL parser uses, so this stays consistent with any
+// future native URL parsing built on the same library.
+JSValue host_domain_to_ascii(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime&) {
+        if (argc < 1) throw std::runtime_error("domainToAscii requires input");
+        const std::string input = to_string(ctx, argv[0]);
+
+        lxb_unicode_idna_t* idna = lxb_unicode_idna_create();
+        if (idna == nullptr) {
+            throw std::runtime_error("domainToAscii: failed to allocate IDNA processor");
+        }
+        if (lxb_unicode_idna_init(idna) != LXB_STATUS_OK) {
+            lxb_unicode_idna_destroy(idna, true);
+            throw std::runtime_error("domainToAscii: failed to initialize IDNA processor");
+        }
+
+        std::string result;
+        const lxb_status_t status = lxb_unicode_idna_to_ascii(
+            idna, reinterpret_cast<const lxb_char_t*>(input.data()), input.size(),
+            idna_to_ascii_collect, &result,
+            static_cast<lxb_unicode_idna_flag_t>(
+                LXB_UNICODE_IDNA_FLAG_CHECK_BIDI | LXB_UNICODE_IDNA_FLAG_CHECK_JOINERS));
+
+        lxb_unicode_idna_destroy(idna, true);
+
+        // A processing failure (disallowed code point, bad hyphens, empty
+        // label, ...) is not a host error: the JS caller reports it as a
+        // TypeError from the URL constructor, per spec.
+        if (status != LXB_STATUS_OK) {
+            return JS_NULL;
+        }
+        return js_string(ctx, result);
+    });
+}
+
 JSValue host_set_cookie_string(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -1606,6 +1653,7 @@ void JsRuntime::install()
     set_function(context_, host, "cancelAnimationFrame", host_cancel_animation_frame, 1);
     set_function(context_, host, "getCookieString", host_get_cookie_string, 1);
     set_function(context_, host, "setCookieString", host_set_cookie_string, 2);
+    set_function(context_, host, "domainToAscii", host_domain_to_ascii, 1);
     set_function(context_, host, "activityBegin", host_activity_begin, 1);
     set_function(context_, host, "activityEnd", host_activity_end, 1);
     set_function(context_, host, "activityMarkMutation", host_activity_mark_mutation, 1);

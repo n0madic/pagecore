@@ -607,6 +607,43 @@
           [Symbol.iterator]() { return this.entries(); }
         }
 
+        // The six schemes the URL Standard calls "special": their host is a
+        // domain (subject to IDNA/Punycode) rather than an opaque, verbatim
+        // string, and an empty or IDNA-rejected host is a parse failure.
+        const SPECIAL_SCHEMES = new Set(['http:', 'https:', 'ws:', 'wss:', 'ftp:', 'file:']);
+
+        function percentDecodeString(text) {
+          return utf8DecodeReplacement(percentDecodeBytes(utf8EncodeScalar(text)));
+        }
+
+        // Spec "forbidden domain code point": a WHATWG URL Standard overlay on
+        // top of UTS46/IDNA — these characters are rejected by host parsing
+        // even though IDNA mapping itself would happily pass most of them
+        // through (e.g. U+0020 SPACE is not disallowed by UTS46 mapping).
+        const FORBIDDEN_HOST_CODE_POINTS = new Set([' ', '#', '/', ':', '<', '>', '?', '@', '[', '\\', ']', '^', '|']);
+        function hasForbiddenDomainCodePoint(text) {
+          for (const ch of text) {
+            const code = ch.codePointAt(0);
+            if (code <= 0x1f || code === 0x25 || code === 0x7f) return true; // C0 control, '%', DELETE
+            if (FORBIDDEN_HOST_CODE_POINTS.has(ch)) return true;
+          }
+          return false;
+        }
+
+        // WHATWG "domain to ASCII", always with beStrict=false (the URL
+        // Standard never invokes the strict/STD3 variant from host parsing).
+        // Returns null on failure (disallowed code point, empty label, bad
+        // hyphens, ...) rather than throwing, so callers decide whether that
+        // means a hard parse failure (constructor/href) or a silent no-op
+        // (the hostname/host setters).
+        function domainToAscii(hostname) {
+          const decoded = percentDecodeString(hostname);
+          if (decoded === '' || hasForbiddenDomainCodePoint(decoded)) return null;
+          const ascii = typeof host.domainToAscii === 'function' ? host.domainToAscii(decoded) : decoded.toLowerCase();
+          if (typeof ascii !== 'string' || ascii === '' || hasForbiddenDomainCodePoint(ascii)) return null;
+          return ascii;
+        }
+
         function parseURL(input, base = undefined) {
           let raw = String(input).trim();
           if (base !== undefined && !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(raw)) {
@@ -614,23 +651,29 @@
           }
           const match = /^([A-Za-z][A-Za-z0-9+.-]*:)(?:\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(raw);
           if (!match) throw new TypeError(`Invalid URL: ${input}`);
+          const protocol = match[1].toLowerCase();
           const authority = match[2] || '';
           let username = '';
           let password = '';
-          let host = authority;
+          let authorityHost = authority;
           const at = authority.lastIndexOf('@');
           if (at >= 0) {
             const auth = authority.slice(0, at);
-            host = authority.slice(at + 1);
+            authorityHost = authority.slice(at + 1);
             const colon = auth.indexOf(':');
             username = decodeURIComponent(colon < 0 ? auth : auth.slice(0, colon));
             password = colon < 0 ? '' : decodeURIComponent(auth.slice(colon + 1));
           }
-          const hostColon = host.lastIndexOf(':');
-          const hostname = hostColon > 0 ? host.slice(0, hostColon) : host;
-          const port = hostColon > 0 ? host.slice(hostColon + 1) : '';
+          const hostColon = authorityHost.lastIndexOf(':');
+          let hostname = hostColon > 0 ? authorityHost.slice(0, hostColon) : authorityHost;
+          const port = hostColon > 0 ? authorityHost.slice(hostColon + 1) : '';
+          if (SPECIAL_SCHEMES.has(protocol)) {
+            const ascii = domainToAscii(hostname);
+            if (ascii === null) throw new TypeError(`Invalid URL: invalid host "${hostname}"`);
+            hostname = ascii;
+          }
           return {
-            protocol: match[1].toLowerCase(),
+            protocol,
             username,
             password,
             hostname,
@@ -692,11 +735,32 @@
           set host(value) {
             const text = String(value);
             const index = text.lastIndexOf(':');
-            this._parts.hostname = index > 0 ? text.slice(0, index) : text;
-            this._parts.port = index > 0 ? text.slice(index + 1) : '';
+            const candidateHostname = index > 0 ? text.slice(0, index) : text;
+            const candidatePort = index > 0 ? text.slice(index + 1) : '';
+            if (SPECIAL_SCHEMES.has(this._parts.protocol)) {
+              // Per spec, a rejected host leaves both host and port untouched
+              // rather than throwing: setters fail silently, unlike the
+              // constructor.
+              const ascii = domainToAscii(candidateHostname);
+              if (ascii === null) return;
+              this._parts.hostname = ascii;
+              this._parts.port = candidatePort;
+              return;
+            }
+            this._parts.hostname = candidateHostname;
+            this._parts.port = candidatePort;
           }
           get hostname() { return this._parts.hostname; }
-          set hostname(value) { this._parts.hostname = String(value); }
+          set hostname(value) {
+            const text = String(value);
+            if (SPECIAL_SCHEMES.has(this._parts.protocol)) {
+              const ascii = domainToAscii(text);
+              if (ascii === null) return;
+              this._parts.hostname = ascii;
+              return;
+            }
+            this._parts.hostname = text;
+          }
           get port() { return this._parts.port; }
           set port(value) { this._parts.port = String(value); }
           get pathname() { return this._parts.pathname; }

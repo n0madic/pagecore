@@ -2475,6 +2475,52 @@ void test_url_search_params_robustness()
         "URLSearchParams should parse/serialize losslessly and iterate live over its backing list");
 }
 
+void test_url_hostname_idna()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const checks = [];
+
+    // A non-ASCII hostname on a special scheme is Punycode-encoded.
+    checks.push(new URL('https://Ä.example/x').hostname === 'xn--4ca.example');
+    // IDNA mapping lowercases special-scheme hostnames.
+    checks.push(new URL('https://EXAMPLE.COM/x').hostname === 'example.com');
+
+    // A non-special scheme's host is opaque: no IDNA, no lowercasing.
+    checks.push(new URL('foo://EXAMPLE.COM/x').hostname === 'EXAMPLE.COM');
+
+    // An empty host on a special scheme is a hard parse failure.
+    let threw = false;
+    try { new URL('https:///path'); } catch (error) { threw = error.name === 'TypeError'; }
+    checks.push(threw);
+
+    // Forbidden host code points (space, control characters, ...) are
+    // rejected even though IDNA mapping alone would not flag them; this is a
+    // WHATWG URL Standard overlay on top of UTS46/IDNA, not part of it.
+    threw = false;
+    try { new URL('https://bad host.example/x'); } catch (error) { threw = error.name === 'TypeError'; }
+    checks.push(threw);
+
+    // The hostname/host setters fail silently (unlike the constructor): an
+    // invalid assignment leaves the URL unchanged rather than throwing.
+    const url = new URL('https://good.example/x');
+    url.hostname = 'bad host with spaces';
+    checks.push(url.hostname === 'good.example');
+    url.host = 'also bad:1';
+    checks.push(url.hostname === 'good.example' && url.port === '');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/hostname-idna.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "special-scheme hostnames should go through IDNA/Punycode and forbidden-code-point checks, opaque hosts should not");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -12854,6 +12900,7 @@ int main()
         test_live_collections();
         test_dom_interface_globals();
         test_url_search_params_robustness();
+        test_url_hostname_idna();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();
