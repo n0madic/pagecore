@@ -195,6 +195,8 @@
         MediaQueryList,
         MediaQueryListEvent,
         makeMediaQueryList,
+        ResizeObserver,
+        IntersectionObserver,
         getRandomValues,
         randomUUID,
         installWptHook,
@@ -416,6 +418,8 @@
         global.DOMParser = DOMParser;
         global.MediaQueryList = MediaQueryList;
         global.MediaQueryListEvent = MediaQueryListEvent;
+        global.ResizeObserver = ResizeObserver;
+        global.IntersectionObserver = IntersectionObserver;
         global.CSS = Object.assign(global.CSS || {}, CSS);
         global.btoa = btoa;
         global.atob = atob;

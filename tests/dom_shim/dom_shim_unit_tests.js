@@ -1279,6 +1279,102 @@ test('dom directionality inherits from the nearest ancestor and ignores an inval
     'an invalid dir value is the undefined state, not an explicit direction -- it still inherits');
 });
 
+test('dom Element get/set/removeAttributeNode interop with the attributes NamedNodeMap', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+
+  const el = document.createElement('div');
+  el.setAttribute('id', 'foo');
+  el.setAttribute('data-x', '1');
+
+  const idAttr = el.getAttributeNode('id');
+  assert.ok(idAttr instanceof dom.Attr, 'getAttributeNode returns an Attr instance');
+  assert.strictEqual(idAttr.name, 'id');
+  assert.strictEqual(idAttr.value, 'foo');
+  assert.strictEqual(el.getAttributeNode('missing'), null);
+
+  // React's commit phase clears every attribute with exactly this idiom
+  // (`for (var t = e.attributes; t.length;) e.removeAttributeNode(t[0])`)
+  // when handing a server-rendered element over to hydration.
+  const attrs = el.attributes;
+  while (attrs.length) {
+    el.removeAttributeNode(attrs[0]);
+  }
+  assert.strictEqual(el.attributes.length, 0, 'removeAttributeNode drains attributes like removeAttribute');
+  assert.strictEqual(el.getAttribute('id'), null);
+  assert.strictEqual(el.getAttribute('data-x'), null);
+
+  assert.throws(() => el.removeAttributeNode(idAttr), /NotFoundError/);
+
+  // This shim's Attr is always a live view bound to its ownerElement (like
+  // NamedNodeMap's own Attr instances), not a standalone/detachable node, so
+  // setAttributeNode's "old" result is exercised through hasAttribute/name
+  // rather than a frozen-at-construction value snapshot.
+  assert.strictEqual(el.setAttributeNode(new dom.Attr(el, 'class')), null, 'no prior class attribute to replace');
+  assert.strictEqual(el.getAttribute('class'), '', 'Attr.value defaults to empty string when never assigned');
+
+  el.setAttribute('class', 'box');
+  const replaced = el.setAttributeNode(new dom.Attr(el, 'class'));
+  assert.ok(replaced instanceof dom.Attr);
+  assert.strictEqual(replaced.name, 'class');
+});
+
+test('web ResizeObserver is a spec-shaped no-op that never invokes its callback', () => {
+  const { dom, web } = installDomEnvironment();
+  const { document } = dom;
+
+  assert.throws(() => new web.ResizeObserver(), /TypeError/, 'a callback is required');
+  assert.throws(() => new web.ResizeObserver('not a function'), /TypeError/);
+
+  let called = false;
+  const observer = new web.ResizeObserver(() => { called = true; });
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+
+  assert.throws(() => observer.observe({}), /TypeError/, 'observe() requires an Element');
+  observer.observe(el);
+  observer.unobserve(el);
+  observer.disconnect();
+
+  assert.strictEqual(called, false, 'no browser observation loop backs this stub, so the callback never fires');
+});
+
+test('web IntersectionObserver is a spec-shaped no-op that never invokes its callback', () => {
+  const { dom, web } = installDomEnvironment();
+  const { document } = dom;
+
+  assert.throws(() => new web.IntersectionObserver(), /TypeError/, 'a callback is required');
+  assert.throws(() => new web.IntersectionObserver('not a function'), /TypeError/);
+
+  let called = false;
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  const root = document.createElement('div');
+
+  const observer = new web.IntersectionObserver(() => { called = true; }, {
+    root,
+    rootMargin: '10px',
+    threshold: [0, 0.5, 1]
+  });
+
+  assert.strictEqual(observer.root, root);
+  assert.strictEqual(observer.rootMargin, '10px');
+  assert.deepStrictEqual(observer.thresholds, [0, 0.5, 1]);
+  assert.deepStrictEqual(observer.takeRecords(), []);
+
+  const defaultObserver = new web.IntersectionObserver(() => {});
+  assert.strictEqual(defaultObserver.root, null);
+  assert.strictEqual(defaultObserver.rootMargin, '0px 0px 0px 0px');
+  assert.deepStrictEqual(defaultObserver.thresholds, [0]);
+
+  assert.throws(() => observer.observe({}), /TypeError/, 'observe() requires an Element');
+  observer.observe(el);
+  observer.unobserve(el);
+  observer.disconnect();
+
+  assert.strictEqual(called, false, 'no browser observation loop backs this stub, so the callback never fires');
+});
+
 Promise.all(testPromises).catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exitCode = 1;

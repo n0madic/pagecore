@@ -57,6 +57,7 @@ void usage(const char* argv0)
         << "  --screenshot PATH        shorthand for --format png --output PATH\n"
         << "  --viewport WIDTHxHEIGHT  render viewport, default 1280x720\n"
         << "  --full-page              expand the viewport height to the full page content height before rendering\n"
+        << "  --max-viewport-dimension NUMBER per-axis viewport/full-page-height cap in px, default 16384\n"
         << "  --scale NUMBER           render scale factor, default 1\n"
         << "  --wait-until MODE        load, network-idle, dom-stable, or ready; default ready\n"
         << "  --wait-ms NUMBER         page readiness hard budget, default 15000\n"
@@ -73,21 +74,23 @@ void usage(const char* argv0)
         << "  --perf-trace PATH|-      write perf trace JSONL; '-' writes to stderr\n";
 }
 
-// Largest render dimension we accept per axis. Note this bounds each axis only;
-// the surface is created at viewport x device_scale, so the width*height*scale^2
-// product is bounded separately by validate_render_dimensions().
-constexpr int kMaxViewportDimension = 16384;
+// Default largest render dimension we accept per axis, overridable with
+// --max-viewport-dimension. Note this bounds each axis only; the surface is
+// created at viewport x device_scale, so the width*height*scale^2 product is
+// bounded separately (and unconditionally) by validate_render_dimensions().
+constexpr int kDefaultMaxViewportDimension = 16384;
 constexpr float kMaxScale = 8.0f;
 // Upper bound on the rasterized pixel count (~256 MB as ARGB32), matching the
-// raster backend's own guard.
+// raster backend's own guard. Independent of --max-viewport-dimension: raising
+// the per-axis cap cannot be used to bypass this memory ceiling.
 constexpr double kMaxRenderPixels = 64.0 * 1024.0 * 1024.0;
 
-void validate_full_page_height(int content_height)
+void validate_full_page_height(int content_height, int max_viewport_dimension)
 {
-    if (content_height > kMaxViewportDimension) {
+    if (content_height > max_viewport_dimension) {
         throw std::runtime_error(
             "--full-page content height (" + std::to_string(content_height)
-            + ") exceeds max viewport dimension (" + std::to_string(kMaxViewportDimension) + ")");
+            + ") exceeds max viewport dimension (" + std::to_string(max_viewport_dimension) + ")");
     }
 }
 
@@ -185,7 +188,7 @@ int parse_nonnegative_int(const std::string& value, const std::string& name)
     return parse_int_in_range(value, name, 0, std::numeric_limits<int>::max());
 }
 
-pagecore::Viewport parse_viewport(const std::string& value)
+pagecore::Viewport parse_viewport(const std::string& value, int max_viewport_dimension)
 {
     const auto separator = value.find('x');
     if (separator == std::string::npos || separator == 0 || separator + 1 == value.size()) {
@@ -193,8 +196,8 @@ pagecore::Viewport parse_viewport(const std::string& value)
     }
 
     pagecore::Viewport viewport;
-    viewport.width = parse_int_in_range(value.substr(0, separator), "viewport width", 1, kMaxViewportDimension);
-    viewport.height = parse_int_in_range(value.substr(separator + 1), "viewport height", 1, kMaxViewportDimension);
+    viewport.width = parse_int_in_range(value.substr(0, separator), "viewport width", 1, max_viewport_dimension);
+    viewport.height = parse_int_in_range(value.substr(separator + 1), "viewport height", 1, max_viewport_dimension);
     return viewport;
 }
 
@@ -382,6 +385,19 @@ int main(int argc, char** argv)
         bool stdin_input = false;
         bool full_page = false;
 
+        // --max-viewport-dimension must be known before --viewport/--full-page
+        // are parsed below, regardless of where it appears on the command line,
+        // so resolve it in its own pass first.
+        int max_viewport_dimension = kDefaultMaxViewportDimension;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--max-viewport-dimension") {
+                if (i + 1 >= argc) {
+                    throw std::runtime_error("missing value for --max-viewport-dimension");
+                }
+                max_viewport_dimension = parse_positive_int(argv[++i], "max-viewport-dimension");
+            }
+        }
+
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             auto next = [&]() -> std::string {
@@ -404,9 +420,10 @@ int main(int argc, char** argv)
             else if (arg == "--dump-display-list") display_list_dump = next();
             else if (arg == "--viewport") {
                 const float scale = render_options.viewport.device_scale_factor;
-                render_options.viewport = parse_viewport(next());
+                render_options.viewport = parse_viewport(next(), max_viewport_dimension);
                 render_options.viewport.device_scale_factor = scale;
             }
+            else if (arg == "--max-viewport-dimension") next(); // resolved in the pre-scan above
             else if (arg == "--scale") render_options.viewport.device_scale_factor = parse_positive_float(next(), "scale");
             else if (arg == "--wait-until") load_options.wait_until = parse_wait_until(next());
             else if (arg == "--wait-ms") load_options.wait_time = std::chrono::milliseconds(parse_nonnegative_int(next(), "wait-ms"));
@@ -514,7 +531,7 @@ int main(int argc, char** argv)
                 // page-tall viewport changes vh/%, fixed-position, and
                 // geometry-dependent JS results.
                 pagecore::DisplayList display = page.display_list(render_options);
-                validate_full_page_height(display.content_height);
+                validate_full_page_height(display.content_height, max_viewport_dimension);
                 display.viewport.height = std::max(display.viewport.height, std::max(1, display.content_height));
                 // The pre-expansion pre-flight ran on the original viewport; re-check
                 // the expanded surface so width x expanded-height x scale^2 can't blow

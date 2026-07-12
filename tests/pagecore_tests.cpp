@@ -1265,8 +1265,8 @@ void test_browser_like_web_api_shims()
       checks.push(!('Worker' in window));
       checks.push(!('SharedWorker' in window));
       checks.push(!('serviceWorker' in navigator));
-      checks.push(!('IntersectionObserver' in window));
-      checks.push(!('ResizeObserver' in window));
+      checks.push(typeof IntersectionObserver === 'function');
+      checks.push(typeof ResizeObserver === 'function');
       checks.push(!('PerformanceObserver' in window));
 
       document.title = 'Shim Title';
@@ -4052,6 +4052,50 @@ void test_target_pseudo_class_selector_fallback()
     require(
         page.outer_html("body[data-target-selector='ok']").has_value(),
         ":target selector fallback should match the location hash element");
+}
+
+// Regression test for a litehtml selector-list parsing gap (see
+// cmake/patches/0001-litehtml-external-tree-build.patch, css_selector.cpp):
+// litehtml's top-level style-rule selector list is strict, so a single
+// unrecognized simple pseudo-class in a comma-separated list invalidated the
+// *entire* rule. `:host` wasn't recognized, and Tailwind CSS v4's compiled
+// output always emits its @theme custom-property block as a single
+// `:root,:host{...}` rule (so it also reaches shadow-DOM-scoped usage) --
+// silently dropping every custom property the rest of the stylesheet
+// referenced via var(), which broke nearly all typography/color/spacing on
+// real Tailwind v4 sites (e.g. tailwindcss.com).
+// Scoped to litehtml's CSS cascade (getComputedStyle), which is what
+// css_selector.cpp's is_supported_simple_pseudo_class actually gates.
+// document.querySelectorAll/matches(':host') go through a *different*
+// selector engine (Lexbor, via the bridge) that still doesn't recognize
+// :host at all -- an unrelated, pre-existing gap this patch does not touch.
+void test_host_pseudo_class_does_not_invalidate_root_selector_list()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><head><style>
+  :root,:host{--test-size:42px}
+  #sized{font-size:var(--test-size)}
+  :host{color:red}
+</style></head><body>
+  <div id="sized">sized</div>
+  <script>
+    const style = getComputedStyle(document.getElementById('sized'));
+    const sizedOk = style.fontSize === '42px';
+    // :host has no meaning outside a shadow tree, and PageCore does not
+    // implement real host-matching semantics, so a bare `:host{...}` rule
+    // must stay recognized-but-inert rather than accidentally matching real
+    // content once it stops being rejected as an unknown selector.
+    const hostMatchesNothing = style.color !== 'rgb(255, 0, 0)';
+    document.body.setAttribute('data-host-selector',
+      sizedOk && hostMatchesNothing ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-host-selector='ok']").has_value(),
+        ":root,:host{} custom properties should apply via :root, and a bare :host rule should match nothing");
 }
 
 void test_request_response_fetch_object_shims()
@@ -14009,6 +14053,7 @@ int main()
         test_text_encoder_decoder_utf8_shims();
         test_escaped_colon_class_selector_fallback();
         test_target_pseudo_class_selector_fallback();
+        test_host_pseudo_class_does_not_invalidate_root_selector_list();
         test_request_response_fetch_object_shims();
         test_xhr_and_fetch_load_through_resource_loader();
         test_shared_cookie_jar_document_scripts_fetch_and_xhr();

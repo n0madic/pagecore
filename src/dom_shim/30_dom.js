@@ -3905,6 +3905,42 @@
               if (name.endsWith(suffix)) return this.removeAttribute(name);
             }
           }
+          // Attr-node views onto the same getAttribute/setAttribute/removeAttribute
+          // storage. React's commit phase (e.g. clearing all attributes before
+          // hydration takeover) walks `element.attributes` and calls
+          // removeAttributeNode() on each live Attr, so these need to interop
+          // with NamedNodeMap's Attr instances rather than being separate stubs.
+          getAttributeNode(name) {
+            const attributeName = String(name);
+            if (!this.hasAttribute(attributeName)) return null;
+            return new Attr(this, attributeName);
+          }
+          getAttributeNodeNS(namespace, localName) {
+            const value = this.getAttributeNS(namespace, localName);
+            if (value === null) return null;
+            const local = String(localName);
+            if (this.hasAttribute(local)) return new Attr(this, local);
+            const suffix = ':' + local;
+            for (const name of this.getAttributeNames()) {
+              if (name.endsWith(suffix)) return new Attr(this, name);
+            }
+            return null;
+          }
+          setAttributeNode(attr) {
+            if (!(attr instanceof Attr)) throw new TypeError('setAttributeNode expects Attr');
+            const old = this.getAttributeNode(attr.name);
+            this.setAttribute(attr.name, attr.value);
+            return old;
+          }
+          setAttributeNodeNS(attr) {
+            return this.setAttributeNode(attr);
+          }
+          removeAttributeNode(attr) {
+            if (!(attr instanceof Attr)) throw new TypeError('removeAttributeNode expects Attr');
+            if (!this.hasAttribute(attr.name)) throw new DOMException('Attribute not found', 'NotFoundError');
+            this.removeAttribute(attr.name);
+            return attr;
+          }
           toggleAttribute(name, force = undefined) {
             const has = this.hasAttribute(name);
             if (force === true || (!has && force !== false)) {

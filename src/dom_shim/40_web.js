@@ -2154,6 +2154,84 @@
           return new MediaQueryList(query);
         }
 
+        // Deliberately a no-op: PageCore has no browser observation loop
+        // (see docs/browser-api-support.md), so there is no layout-change
+        // signal to drive callbacks from. This exists purely so a page script
+        // that references `ResizeObserver` unconditionally (rather than
+        // feature-detecting it) doesn't throw a ReferenceError and abort.
+        // observe()/unobserve()/disconnect() track targets for API-shape
+        // fidelity only; the callback is never invoked.
+        class ResizeObserver {
+          constructor(callback) {
+            if (typeof callback !== 'function') {
+              throw new TypeError('ResizeObserver requires a callback function');
+            }
+            this._callback = callback;
+            this._targets = new Set();
+          }
+
+          observe(target, _options) {
+            if (!(target instanceof Element)) {
+              throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'");
+            }
+            this._targets.add(target);
+          }
+
+          unobserve(target) {
+            this._targets.delete(target);
+          }
+
+          disconnect() {
+            this._targets.clear();
+          }
+
+          get [Symbol.toStringTag]() { return 'ResizeObserver'; }
+        }
+
+        // Same rationale and shape as ResizeObserver above: a spec-shaped
+        // no-op so page scripts that reference `IntersectionObserver`
+        // unconditionally don't throw a ReferenceError. `root`/`rootMargin`/
+        // `thresholds` are normalized and exposed read-only per spec, but
+        // nothing ever calls the callback or produces entries.
+        class IntersectionObserver {
+          constructor(callback, options = {}) {
+            if (typeof callback !== 'function') {
+              throw new TypeError('IntersectionObserver requires a callback function');
+            }
+            const opts = options && typeof options === 'object' ? options : {};
+            this._callback = callback;
+            this._targets = new Set();
+            this._root = opts.root === undefined ? null : opts.root;
+            this._rootMargin = opts.rootMargin === undefined ? '0px 0px 0px 0px' : String(opts.rootMargin);
+            const rawThresholds = opts.threshold === undefined ? [0] : opts.threshold;
+            const thresholds = (Array.isArray(rawThresholds) ? rawThresholds : [rawThresholds]).map(Number);
+            this._thresholds = (thresholds.length ? thresholds : [0]).slice().sort((a, b) => a - b);
+          }
+
+          get root() { return this._root; }
+          get rootMargin() { return this._rootMargin; }
+          get thresholds() { return this._thresholds.slice(); }
+
+          observe(target) {
+            if (!(target instanceof Element)) {
+              throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'");
+            }
+            this._targets.add(target);
+          }
+
+          unobserve(target) {
+            this._targets.delete(target);
+          }
+
+          disconnect() {
+            this._targets.clear();
+          }
+
+          takeRecords() { return []; }
+
+          get [Symbol.toStringTag]() { return 'IntersectionObserver'; }
+        }
+
         function getRandomValues(array) {
           if (!ArrayBuffer.isView(array) || array instanceof DataView) {
             throw new TypeError('Expected an integer typed array');
@@ -2566,6 +2644,8 @@
         MediaQueryList,
         MediaQueryListEvent,
         makeMediaQueryList,
+        ResizeObserver,
+        IntersectionObserver,
         getRandomValues,
         randomUUID,
         installWptHook,

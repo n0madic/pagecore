@@ -17,6 +17,33 @@ index 9699c394..37bb136b 100644
        private:
          uint_ptr add_font(const font_description& descr, font_metrics* fm);
  
+diff --git a/src/css_selector.cpp b/src/css_selector.cpp
+index fd332924..c33e182b 100644
+--- a/src/css_selector.cpp
++++ b/src/css_selector.cpp
+@@ -474,6 +474,22 @@ namespace litehtml
+             "first-of-type",
+             "last-of-type",
+             "only-of-type",
++            // Shadow-tree pseudo-class  https://www.w3.org/TR/css-scoping-1/#host-selector
++            // No element ever carries a "host" flag in m_pseudo_classes (real
++            // :host-matching semantics aren't implemented), so this is
++            // recognized-but-never-matching -- the same outcome a real browser
++            // gives a compound selector using :host outside any shadow tree.
++            // The point is only to keep it from being an *unrecognized* simple
++            // pseudo-class: css::parse_style_rule's selector-list parsing is
++            // strict (one bad selector invalidates the whole comma-separated
++            // list, see css_selector.cpp's parse_selector_list), and Tailwind
++            // v4's compiled output always emits its @theme custom-property
++            // block as a single `:root,:host{...}` rule so it also reaches
++            // shadow-DOM-scoped Tailwind usage. Without recognizing :host here,
++            // that whole rule -- and therefore every theme custom property
++            // referenced via var() throughout the rest of the stylesheet --
++            // was silently dropped.
++            "host",
+         };
+         return supported_simple_pseudo_classes.count(lowcase(name)) == 1;
+     }
 diff --git a/src/document.cpp b/src/document.cpp
 index 86ae5968..56ec97d6 100644
 --- a/src/document.cpp
