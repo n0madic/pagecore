@@ -71,6 +71,11 @@ struct LoadOptions {
     std::optional<std::chrono::milliseconds> max_js_resource_time;
     std::string user_agent = "PageCore/0.1";
     std::string base_url;
+    // Canonical WHATWG label (e.g. "UTF-8", "Shift_JIS") for the document's
+    // character encoding, as resolved by decode_html_bytes() before parsing.
+    // A boot-time literal seeding document.characterSet/charset, like base_url
+    // seeds location.href -- fixed for the document's lifetime.
+    std::string document_character_set = "UTF-8";
     std::function<void(std::string_view severity, std::string_view message)> console_log;
     PerfTraceCallback perf_trace;
 };
@@ -94,7 +99,7 @@ public:
     void set_resource_loader(std::shared_ptr<ResourceLoader> loader);
     void set_layout_engine_factory(std::shared_ptr<LayoutEngineFactory> factory);
 
-    void load_html(std::string_view html, std::string base_url = {});
+    void load_html(std::string_view html, std::string base_url = {}, std::string character_set = "UTF-8");
     void load_url(std::string_view url);
     std::string eval(std::string_view script);
     void run_until_idle();

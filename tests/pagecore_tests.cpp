@@ -1800,6 +1800,199 @@ void test_get_computed_style_matches_real_cascade_for_cases_js_engine_got_wrong(
         "getComputedStyle() should match litehtml's real cascade for cases the old JS engine got wrong");
 }
 
+void test_computed_style_direction_reflects_dir_attribute_and_auto_detection()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="explicit-rtl" dir="rtl"></div>
+  <div id="explicit-ltr" dir="ltr"></div>
+  <div id="auto-hebrew" dir="auto">שלום</div>
+  <div id="auto-latin" dir="auto">hello</div>
+  <div id="inherited-parent" dir="rtl"><span id="inherited-child"></span></div>
+  <div id="invalid-dir" dir="banana"></div>
+  <script>
+    const checks = [];
+    const direction = (id) => getComputedStyle(document.getElementById(id)).direction;
+
+    checks.push(direction('explicit-rtl') === 'rtl');
+    checks.push(direction('explicit-ltr') === 'ltr');
+    checks.push(direction('auto-hebrew') === 'rtl');
+    checks.push(direction('auto-latin') === 'ltr');
+    checks.push(direction('inherited-child') === 'rtl');
+    // litehtml has no `direction` CSS property; there is nothing to cascade an
+    // invalid dir="banana" into, so this is the "undefined state" (same as no
+    // dir attribute at all) and inherits rather than resolving to some default.
+    checks.push(direction('invalid-dir') === 'ltr');
+
+    const style = getComputedStyle(document.body);
+    checks.push('direction' in style);
+    checks.push(Object.keys(style).includes('direction'));
+    checks.push(style.getPropertyValue('direction') === 'ltr');
+
+    document.body.setAttribute('data-direction-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-direction-check='ok']").has_value(),
+        "getComputedStyle().direction should reflect explicit dir, dir=auto detection, and inheritance, and be enumerable");
+}
+
+void test_dir_selector_matches_and_filters_correctly()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="a" dir="rtl" class="foo">1</div>
+  <div id="b" dir="ltr" class="foo">2</div>
+  <div id="c" dir="rtl">3</div>
+  <script>
+    const checks = [];
+    const a = document.getElementById('a');
+    const b = document.getElementById('b');
+    const c = document.getElementById('c');
+
+    const rtlMatches = [...document.querySelectorAll(':dir(rtl)')];
+    checks.push(rtlMatches.length === 2);
+    checks.push(rtlMatches.includes(a) && rtlMatches.includes(c) && !rtlMatches.includes(b));
+
+    checks.push(document.querySelectorAll('div:dir(rtl).foo').length === 1);
+    checks.push(document.querySelector('div:dir(rtl).foo') === a);
+
+    checks.push(a.matches(':dir(rtl)') === true);
+    checks.push(a.matches(':dir(ltr)') === false);
+    checks.push(b.matches(':dir(ltr)') === true);
+    checks.push(a.matches('div:dir(rtl).foo') === true);
+    checks.push(b.matches('div:dir(rtl).foo') === false);
+
+    // dir="ltr" so the span itself does not match :dir(rtl) -- closest() must
+    // walk up to find the nearest rtl ancestor (a), not just resolve the
+    // span's own (inherited-if-unset) directionality.
+    const span = document.createElement('span');
+    span.setAttribute('dir', 'ltr');
+    a.appendChild(span);
+    checks.push(span.closest(':dir(rtl)') === a);
+    checks.push(span.closest(':dir(ltr)') === span);
+
+    document.body.setAttribute('data-dir-selector-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-dir-selector-check='ok']").has_value(),
+        ":dir() should filter querySelectorAll/querySelector results and compose with matches()/closest()");
+}
+
+void test_bdi_defaults_to_auto_direction()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <bdi id="implicit">שלום</bdi>
+  <bdi id="explicit-ltr" dir="ltr">שלום</bdi>
+  <script>
+    const checks = [];
+    checks.push(getComputedStyle(document.getElementById('implicit')).direction === 'rtl');
+    // An explicit dir on a bdi wins over auto-detection, like on any element.
+    checks.push(getComputedStyle(document.getElementById('explicit-ltr')).direction === 'ltr');
+    document.body.setAttribute('data-bdi-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-bdi-check='ok']").has_value(),
+        "a <bdi> with no dir attribute should auto-detect directionality from its content");
+}
+
+void test_dir_auto_form_control_uses_value_not_descendants()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <input id="text-input" dir="auto">
+  <textarea id="textarea-el" dir="auto"></textarea>
+  <input id="checkbox-input" dir="auto" type="checkbox">
+  <script>
+    const checks = [];
+    const textInput = document.getElementById('text-input');
+    const textarea = document.getElementById('textarea-el');
+    const checkbox = document.getElementById('checkbox-input');
+
+    textInput.value = 'שלום';
+    checks.push(getComputedStyle(textInput).direction === 'rtl');
+    textInput.value = 'hello';
+    checks.push(getComputedStyle(textInput).direction === 'ltr');
+
+    textarea.value = 'שלום';
+    checks.push(getComputedStyle(textarea).direction === 'rtl');
+
+    // A non-text-like input type never uses its value for auto-detection (it
+    // has no descendants to scan either, so the generic fallback keeps it ltr).
+    checkbox.value = 'שלום';
+    checks.push(getComputedStyle(checkbox).direction === 'ltr');
+
+    document.body.setAttribute('data-form-dir-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-form-dir-check='ok']").has_value(),
+        "dir=auto on a text-like <input>/<textarea> should detect directionality from its value, not descendant text nodes");
+}
+
+void test_dir_auto_ignores_svg_namespaced_script_style_and_bdi()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="outer" dir="auto"></div>
+  <script>
+    const outer = document.getElementById('outer');
+    const svgNs = 'http://www.w3.org/2000/svg';
+    const checks = [];
+
+    // A same-tag-named SVG element is not the HTML script/style interface, so
+    // (unlike a real <script>/<style>) its text must still contribute to the
+    // ancestor's auto-detection.
+    for (const tag of ['style', 'bdi']) {
+      outer.textContent = '';
+      const foreign = document.createElementNS(svgNs, tag);
+      foreign.appendChild(document.createTextNode('שלום'));
+      outer.appendChild(foreign);
+      checks.push(getComputedStyle(outer).direction === 'rtl');
+    }
+
+    document.body.setAttribute('data-svg-dir-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-svg-dir-check='ok']").has_value(),
+        "auto-detection must not skip an SVG-namespaced element merely because its tag name collides with an "
+        "HTML-only interface (script/style/bdi)");
+}
+
+void test_query_selector_all_from_document_does_not_duplicate_root()
+{
+    pagecore::Page page;
+    page.load_html("<html><body><div>a</div></body></html>", "https://example.test/index.html");
+
+    require(
+        page.eval(
+            "(() => {"
+            "  const all = [...document.querySelectorAll('*')];"
+            "  const unique = new Set(all);"
+            "  return all.length === unique.size && document.querySelectorAll('html').length === 1;"
+            "})()") == "true",
+        "document.querySelectorAll must not report any element (including documentElement) more than once");
+}
+
 void test_dom_fragment_range_serializer_and_mutation_observer()
 {
     pagecore::Page page;
@@ -2591,6 +2784,93 @@ void test_text_decoder_encoding_support()
         page.outer_html("body[data-ok='ok']").has_value(),
         "TextDecoder should support legacy multi-byte encodings via the native binding, reject replacement-mapped labels, "
         "recover cleanly from fatal errors, and stream BOM detection across chunk boundaries");
+}
+
+void test_document_character_set_defaults_to_utf8_for_load_html()
+{
+    pagecore::Page page;
+    page.load_html("<html><body>hi</body></html>", "https://example.test/index.html");
+
+    require(page.eval("document.characterSet") == "UTF-8",
+            "a direct load_html() call with no character_set argument should still report UTF-8 "
+            "(proving zero behavior change for every existing call site)");
+    require(page.eval("document.charset") == "UTF-8", "document.charset should mirror document.characterSet");
+}
+
+void test_page_load_url_decodes_meta_charset_to_utf8()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    // Shift_JIS is ASCII-compatible, so only the CJK payload needs real
+    // Shift_JIS bytes: "\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd" is
+    // "こんにちは" (konnichiwa).
+    loader->add(
+        "https://example.test/index.html",
+        "<html><head><meta charset=\"Shift_JIS\"></head><body id=\"target\">"
+        "\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd"
+        "</body></html>");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_url("https://example.test/index.html");
+
+    require(page.eval("document.characterSet") == "Shift_JIS",
+            "load_url should resolve document.characterSet from the <meta charset> prescan "
+            "when no BOM or transport charset is present");
+    require(page.eval("document.getElementById('target').textContent") == "\xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf",
+            "Shift_JIS bytes declared via <meta charset> should decode to the correct UTF-8 text in the DOM");
+}
+
+void test_page_load_url_prefers_transport_content_type_over_meta()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    // GBK is ASCII-compatible; the payload "\xc4\xe3\xba\xc3\xca\xc0\xbd\xe7" is
+    // "你好世界" (ni hao shi jie) in GBK -- it decodes to something else
+    // entirely if wrongly read as Shift_JIS, a strong signal for which path won.
+    loader->add(
+        "https://example.test/index.html",
+        "<html><head><meta charset=\"Shift_JIS\"></head><body id=\"target\">"
+        "\xc4\xe3\xba\xc3\xca\xc0\xbd\xe7"
+        "</body></html>",
+        "text/html; charset=GBK");
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_url("https://example.test/index.html");
+
+    require(page.eval("document.characterSet") == "GBK",
+            "a transport Content-Type charset should win over a conflicting <meta charset> and skip the prescan entirely");
+    require(page.eval("document.getElementById('target').textContent") == "\xe4\xbd\xa0\xe5\xa5\xbd\xe4\xb8\x96\xe7\x95\x8c",
+            "the body should decode as GBK (the header's declared encoding), not Shift_JIS (the meta's conflicting claim)");
+}
+
+void test_page_load_url_detects_bom()
+{
+    auto loader = std::make_shared<pagecore::MemoryResourceLoader>();
+    // UTF-16LE with a leading BOM, no Content-Type charset and no <meta charset>
+    // hint: `<html><body id="target">café</body></html>`. A plain string
+    // literal would truncate at the first embedded \x00 via strlen(), so this
+    // uses the array-plus-explicit-length form to keep every byte.
+    static const char kUtf16Bytes[] =
+        "\xff\xfe\x3c\x00\x68\x00\x74\x00\x6d\x00\x6c\x00\x3e\x00\x3c\x00"
+        "\x62\x00\x6f\x00\x64\x00\x79\x00\x20\x00\x69\x00\x64\x00\x3d\x00"
+        "\x22\x00\x74\x00\x61\x00\x72\x00\x67\x00\x65\x00\x74\x00\x22\x00"
+        "\x3e\x00\x63\x00\x61\x00\x66\x00\xe9\x00\x3c\x00\x2f\x00\x62\x00"
+        "\x6f\x00\x64\x00\x79\x00\x3e\x00\x3c\x00\x2f\x00\x68\x00\x74\x00"
+        "\x6d\x00\x6c\x00\x3e\x00";
+    const std::string body(kUtf16Bytes, sizeof(kUtf16Bytes) - 1);
+    loader->add("https://example.test/index.html", body);
+
+    pagecore::Page page;
+    page.set_resource_loader(loader);
+    page.load_url("https://example.test/index.html");
+
+    // Per the HTML spec, the UTF-16-forced-to-UTF-8 override applies only to the
+    // <meta charset> prescan step, not to a real BOM: a genuinely UTF-16 document
+    // is decoded, and reported, as UTF-16.
+    require(page.eval("document.characterSet") == "UTF-16LE",
+            "a leading UTF-16LE BOM should be honored as-is (the UTF-16-to-UTF-8 override is prescan-only)");
+    require(page.eval("document.getElementById('target').textContent") == "caf\xc3\xa9",
+            "BOM-detected UTF-16LE bytes should decode to the correct UTF-8 text in the DOM");
 }
 
 void test_node_move_before()
@@ -8585,6 +8865,33 @@ void test_query_selector_cache_returns_all_and_first()
             "querySelectorAll returns empty when nothing matches");
 }
 
+void test_query_selector_all_excludes_context_node_from_results()
+{
+    // Regression: run_selector() previously set LXB_SELECTORS_OPT_MATCH_ROOT,
+    // so querySelector(All) from an element whose own tag/attributes also
+    // satisfy the selector (most obviously '*', which every element matches)
+    // would incorrectly include that element itself in the results -- found
+    // while computing scrollWidth/scrollHeight as "self plus every descendant".
+    pagecore::DomDocument doc;
+    doc.parse(
+        "<html><body>"
+        "<div id='box' class='x'><p class='x'>1</p></div>"
+        "</body></html>");
+    const pagecore::NodeId root = doc.document_node();
+    const pagecore::NodeId box = doc.query_selector(root, "#box");
+    require(box != pagecore::kInvalidNodeId, "test setup: #box should exist");
+
+    require(doc.query_selector_all(box, "*").size() == 1,
+            "querySelectorAll('*') from an element must exclude that element itself, matching only its descendant");
+
+    const auto by_class = doc.query_selector_all(box, ".x");
+    require(by_class.size() == 1 && by_class.front() != box,
+            "querySelectorAll must not match the context node even when it satisfies the selector");
+
+    require(doc.query_selector(box, ".x") != box,
+            "querySelector must not match the context node even when it satisfies the selector");
+}
+
 void test_described_traversal_wraps_children_correctly()
 {
     pagecore::Page page;
@@ -10617,6 +10924,129 @@ void test_root_client_geometry_uses_viewport()
     require(
         page.eval("document.documentElement.clientHeight === window.innerHeight") == "true",
         "root clientHeight should match the viewport height");
+}
+
+void test_element_scroll_width_height_reflect_descendant_extent()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="box" style="width:50px;height:40px;overflow:auto;">
+    <div id="inner" style="width:200px;height:150px;"></div>
+  </div>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.eval("document.getElementById('box').clientWidth") == "50",
+            "clientWidth should stay the container's own padding-box size regardless of overflowing content");
+    require(page.eval("document.getElementById('box').clientHeight") == "40",
+            "clientHeight should stay the container's own padding-box size regardless of overflowing content");
+    require(page.eval("document.getElementById('box').scrollWidth") == "200",
+            "scrollWidth should reflect the overflowing descendant's border-box extent");
+    require(page.eval("document.getElementById('box').scrollHeight") == "150",
+            "scrollHeight should reflect the overflowing descendant's border-box extent");
+}
+
+void test_element_scroll_top_left_are_stored_and_clamped()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="box" style="width:50px;height:40px;">
+    <div style="width:200px;height:150px;"></div>
+  </div>
+  <script>
+    const box = document.getElementById('box');
+    const checks = [];
+    checks.push(box.scrollTop === 0 && box.scrollLeft === 0);
+
+    box.scrollTop = 40;
+    box.scrollLeft = 30;
+    checks.push(box.scrollTop === 40 && box.scrollLeft === 30);
+
+    // scrollWidth (200) - clientWidth (50) = 150; scrollHeight (150) - clientHeight (40) = 110.
+    box.scrollTop = 99999;
+    box.scrollLeft = 99999;
+    checks.push(box.scrollTop === 110 && box.scrollLeft === 150);
+
+    box.scrollTop = -50;
+    box.scrollLeft = -50;
+    checks.push(box.scrollTop === 0 && box.scrollLeft === 0);
+
+    document.body.setAttribute('data-scroll-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-scroll-check='ok']").has_value(),
+            "scrollTop/scrollLeft should be stored per element and clamped to [0, scrollWidth/Height - clientWidth/Height]");
+}
+
+void test_element_scroll_to_by_scroll_normalize_argument_shapes()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="box" style="width:50px;height:40px;">
+    <div style="width:200px;height:150px;"></div>
+  </div>
+  <script>
+    const box = document.getElementById('box');
+    const checks = [];
+
+    box.scrollTo(30, 20);
+    checks.push(box.scrollLeft === 30 && box.scrollTop === 20);
+
+    // A missing axis in the options form leaves that axis unchanged.
+    box.scrollTo({ left: 40 });
+    checks.push(box.scrollLeft === 40 && box.scrollTop === 20);
+
+    // `behavior: 'smooth'` is accepted but applied instantly (no animation).
+    box.scroll({ top: 10, behavior: 'smooth' });
+    checks.push(box.scrollLeft === 40 && box.scrollTop === 10);
+
+    box.scrollBy(5, -5);
+    checks.push(box.scrollLeft === 45 && box.scrollTop === 5);
+
+    // A missing axis in scrollBy's options form defaults that delta to 0.
+    box.scrollBy({ left: -45 });
+    checks.push(box.scrollLeft === 0 && box.scrollTop === 5);
+
+    document.body.setAttribute('data-scroll-args-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-scroll-args-check='ok']").has_value(),
+            "scrollTo/scrollBy/scroll should normalize both the (x, y) and ({left, top, behavior}) call shapes");
+}
+
+void test_window_scroll_delegates_to_document_element()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div style="width:2000px;height:3000px;"></div>
+  <script>
+    const checks = [];
+    checks.push(window.scrollX === 0 && window.scrollY === 0);
+    checks.push(window.pageXOffset === 0 && window.pageYOffset === 0);
+
+    window.scrollTo(100, 200);
+    checks.push(window.scrollX === document.documentElement.scrollLeft);
+    checks.push(window.scrollY === document.documentElement.scrollTop);
+    checks.push(window.scrollX === 100 && window.scrollY === 200);
+
+    window.scrollBy(10, -10);
+    checks.push(window.scrollX === 110 && window.scrollY === 190);
+
+    document.body.setAttribute('data-window-scroll-check', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.outer_html("body[data-window-scroll-check='ok']").has_value(),
+            "window.scrollX/scrollY/scrollTo/scrollBy should delegate to document.documentElement's scroll model");
 }
 
 void test_html_image_element_x_y_reflect_layout_position()
@@ -13524,6 +13954,12 @@ int main()
         test_cssom_dynamic_sheets_media_disabled_and_adopted();
         test_page_computed_style_cpp_api();
         test_get_computed_style_matches_real_cascade_for_cases_js_engine_got_wrong();
+        test_computed_style_direction_reflects_dir_attribute_and_auto_detection();
+        test_dir_selector_matches_and_filters_correctly();
+        test_bdi_defaults_to_auto_direction();
+        test_dir_auto_form_control_uses_value_not_descendants();
+        test_dir_auto_ignores_svg_namespaced_script_style_and_bdi();
+        test_query_selector_all_from_document_does_not_duplicate_root();
         test_dom_fragment_range_serializer_and_mutation_observer();
         test_page_enforces_dom_node_budget();
         test_page_enforces_aggregate_load_deadline();
@@ -13541,6 +13977,10 @@ int main()
         test_url_search_params_robustness();
         test_url_hostname_idna();
         test_text_decoder_encoding_support();
+        test_document_character_set_defaults_to_utf8_for_load_html();
+        test_page_load_url_decodes_meta_charset_to_utf8();
+        test_page_load_url_prefers_transport_content_type_over_meta();
+        test_page_load_url_detects_bom();
         test_node_move_before();
         test_range_content_methods();
         test_dom_implementation_create_methods();
@@ -13700,6 +14140,7 @@ int main()
         test_layout_input_digest_superset_invariants();
         test_subtree_dirty_epoch_tracks_descendant_mutations();
         test_query_selector_cache_returns_all_and_first();
+        test_query_selector_all_excludes_context_node_from_results();
         test_described_traversal_wraps_children_correctly();
         test_child_node_list_cache_reflects_mutations();
         test_eval_api();
@@ -13761,6 +14202,10 @@ int main()
         test_geometry_get_client_rects_returns_domrectlist();
         test_window_named_element_access_exposes_document_ids();
         test_root_client_geometry_uses_viewport();
+        test_element_scroll_width_height_reflect_descendant_extent();
+        test_element_scroll_top_left_are_stored_and_clamped();
+        test_element_scroll_to_by_scroll_normalize_argument_shapes();
+        test_window_scroll_delegates_to_document_element();
         test_html_image_element_x_y_reflect_layout_position();
         test_layout_serialization_materializes_cached_absolute_width();
         test_layout_serialization_materializes_absolute_percentage_width_without_js_measure();

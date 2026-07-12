@@ -624,8 +624,11 @@ std::vector<NodeId> DomDocument::Impl::run_selector(lxb_dom_node_t* root, std::s
     }
 
     SelectorResults results{this, {}, first_only};
-    lxb_selectors_opt_set(selectors, static_cast<lxb_selectors_opt_t>(
-        LXB_SELECTORS_OPT_MATCH_ROOT | LXB_SELECTORS_OPT_MATCH_FIRST));
+    // No LXB_SELECTORS_OPT_MATCH_ROOT: this is the shared backend for
+    // querySelector()/querySelectorAll(), both of which must match only
+    // descendants of `root`, never `root` itself (DOM spec's "scope-match a
+    // selectors string" excludes the context object from candidates).
+    lxb_selectors_opt_set(selectors, static_cast<lxb_selectors_opt_t>(LXB_SELECTORS_OPT_MATCH_FIRST));
 
     const lxb_status_t status = lxb_selectors_find(selectors, root, list, selector_callback, &results);
     restore_transient_attributes(shadow_marker_restore);

@@ -1201,6 +1201,84 @@ test('web XHR serializes a FormData body as multipart/form-data', () => {
   assert.ok(captured.body.endsWith(`--${boundary}--\r\n`), 'body ends with the closing boundary');
 });
 
+test('dom auto-directionality classifies the first-strong character across scripts', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+
+  const makeAutoDiv = (text) => {
+    const el = document.createElement('div');
+    el.setAttribute('dir', 'auto');
+    el.appendChild(document.createTextNode(text));
+    return el;
+  };
+
+  assert.strictEqual(dom.computedStyleFor(makeAutoDiv('hello')).direction, 'ltr');
+  assert.strictEqual(dom.computedStyleFor(makeAutoDiv('שלום')).direction, 'rtl', 'Hebrew');
+  assert.strictEqual(dom.computedStyleFor(makeAutoDiv('مرحبا')).direction, 'rtl', 'Arabic');
+  assert.strictEqual(
+    dom.computedStyleFor(makeAutoDiv('123 456')).direction, 'ltr',
+    'digits/spaces are not strong characters; falls back to ltr when nothing strong is found');
+  assert.strictEqual(
+    dom.computedStyleFor(makeAutoDiv('123 שלום')).direction, 'rtl',
+    'leading weak characters are skipped until the first strong one');
+});
+
+test('dom auto-directionality skips script/style content and a nested element with its own dir', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+
+  const outer = document.createElement('div');
+  outer.setAttribute('dir', 'auto');
+
+  const script = document.createElement('script');
+  script.appendChild(document.createTextNode('مرحبا'));
+  outer.appendChild(script);
+
+  const nested = document.createElement('span');
+  nested.setAttribute('dir', 'ltr');
+  nested.appendChild(document.createTextNode('שלום'));
+  outer.appendChild(nested);
+
+  outer.appendChild(document.createTextNode('hello'));
+
+  assert.strictEqual(
+    dom.computedStyleFor(outer).direction, 'ltr',
+    'script content and a nested element with its own dir must not contribute to auto-detection');
+});
+
+test('dom bdi defaults to auto-detected directionality without an explicit dir attribute', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+
+  const container = document.createElement('div');
+  const bdi = document.createElement('bdi');
+  bdi.appendChild(document.createTextNode('שלום'));
+  container.appendChild(bdi);
+
+  assert.strictEqual(dom.computedStyleFor(bdi).direction, 'rtl');
+});
+
+test('dom directionality inherits from the nearest ancestor and ignores an invalid dir value', () => {
+  const { dom } = installDomEnvironment();
+  const { document } = dom;
+
+  const rtlAncestor = document.createElement('div');
+  rtlAncestor.setAttribute('dir', 'rtl');
+  const plainChild = document.createElement('span');
+  rtlAncestor.appendChild(plainChild);
+
+  assert.strictEqual(
+    dom.computedStyleFor(plainChild).direction, 'rtl',
+    'inherits from the nearest ancestor with an explicit dir');
+
+  const invalidDirChild = document.createElement('span');
+  invalidDirChild.setAttribute('dir', 'banana');
+  rtlAncestor.appendChild(invalidDirChild);
+  assert.strictEqual(
+    dom.computedStyleFor(invalidDirChild).direction, 'rtl',
+    'an invalid dir value is the undefined state, not an explicit direction -- it still inherits');
+});
+
 Promise.all(testPromises).catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exitCode = 1;

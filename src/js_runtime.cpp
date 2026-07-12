@@ -5,6 +5,7 @@
 #include "cookie_jar.hpp"
 #include "curl_async_loader.hpp"
 #include "dom_shim.hpp"
+#include "util.hpp"
 #include "pagecore/resource_loader.hpp"
 
 extern "C" {
@@ -1769,6 +1770,7 @@ void JsRuntime::install()
     set_function(context_, host, "base64Decode", host_base64_decode, 1);
     JS_SetPropertyStr(context_, host, "baseURL", js_string(context_, options_.base_url));
     JS_SetPropertyStr(context_, host, "userAgent", js_string(context_, options_.user_agent));
+    JS_SetPropertyStr(context_, host, "characterSet", js_string(context_, options_.document_character_set));
 
     JS_SetPropertyStr(context_, global, "__dom", dom);
     JS_SetPropertyStr(context_, global, "__host", host);
@@ -2634,29 +2636,6 @@ void JsRuntime::set_document_cookie(std::string_view url, std::string_view cooki
         cookie_jar_->set_document_cookie(url, cookie);
     }
 }
-
-namespace {
-
-void append_utf8_codepoint(std::string& out, lxb_codepoint_t code)
-{
-    if (code <= 0x7f) {
-        out += static_cast<char>(code);
-    } else if (code <= 0x7ff) {
-        out += static_cast<char>(0xc0 | (code >> 6));
-        out += static_cast<char>(0x80 | (code & 0x3f));
-    } else if (code <= 0xffff) {
-        out += static_cast<char>(0xe0 | (code >> 12));
-        out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
-        out += static_cast<char>(0x80 | (code & 0x3f));
-    } else {
-        out += static_cast<char>(0xf0 | (code >> 18));
-        out += static_cast<char>(0x80 | ((code >> 12) & 0x3f));
-        out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
-        out += static_cast<char>(0x80 | (code & 0x3f));
-    }
-}
-
-} // namespace
 
 std::optional<JsRuntime::TextDecoderHandle> JsRuntime::create_text_decoder(std::string_view label, bool fatal)
 {

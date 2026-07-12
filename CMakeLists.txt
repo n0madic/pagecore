@@ -551,6 +551,7 @@ add_library(pagecore
     src/display_list_dump.cpp
     src/dom_document.cpp
     src/event_loop.cpp
+    src/html_encoding.cpp
     src/image_io.cpp
     src/js_runtime.cpp
     src/page.cpp

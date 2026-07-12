@@ -567,13 +567,16 @@
         };
         global.screenX = 0;
         global.screenY = 0;
-        global.scrollX = 0;
-        global.scrollY = 0;
-        global.pageXOffset = 0;
-        global.pageYOffset = 0;
-        global.scrollTo = () => {};
-        global.scrollBy = () => {};
-        global.scroll = () => {};
+        // Delegates to document.documentElement's virtual scroll model (see
+        // Element.scrollTop in 30_dom.js): matches real browsers, where
+        // window.scrollY === document.documentElement.scrollTop in standards mode.
+        Object.defineProperty(global, 'scrollX', { configurable: true, get: () => document.documentElement.scrollLeft });
+        Object.defineProperty(global, 'scrollY', { configurable: true, get: () => document.documentElement.scrollTop });
+        Object.defineProperty(global, 'pageXOffset', { configurable: true, get: () => document.documentElement.scrollLeft });
+        Object.defineProperty(global, 'pageYOffset', { configurable: true, get: () => document.documentElement.scrollTop });
+        global.scrollTo = (...args) => document.documentElement.scrollTo(...args);
+        global.scrollBy = (...args) => document.documentElement.scrollBy(...args);
+        global.scroll = (...args) => document.documentElement.scroll(...args);
         global.open = () => null;
         global.close = () => {};
         global.postMessage = (message) => {

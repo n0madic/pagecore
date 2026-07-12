@@ -3045,6 +3045,112 @@
           return true;
         }
 
+        // First-strong-character directionality detection (HTML's "auto"
+        // algorithm, https://html.spec.whatwg.org/multipage/dom.html#auto-directionality),
+        // pragmatically approximated with QuickJS's Unicode property escapes
+        // instead of a full UAX#9 Bidi_Class table (QuickJS has no
+        // \p{Bidi_Class=...} support): Hebrew/Arabic/Syriac/Thaana/Nko script
+        // membership stands in for the strong-RTL (R/AL) classes, and the
+        // general Letter category (\p{L}) stands in for strong-LTR (L). Good
+        // enough to resolve real-world RTL-script text; does not implement full
+        // bidi-class coverage (e.g. Adlam, N'Ko additions, RTL punctuation-only
+        // edge cases).
+        const STRONG_RTL_RE = /[\p{Script=Hebrew}\p{Script=Arabic}\p{Script=Syriac}\p{Script=Thaana}\p{Script=Nko}]/u;
+        const STRONG_LTR_RE = /\p{L}/u;
+
+        function firstStrongDirection(text) {
+          for (const ch of String(text)) {
+            if (STRONG_RTL_RE.test(ch)) return 'rtl';
+            if (STRONG_LTR_RE.test(ch)) return 'ltr';
+          }
+          return null;
+        }
+
+        // Whether element's `dir` *content attribute* (not the HTMLElement-only
+        // `.dir` IDL reflection, which is simply undefined on a non-HTMLElement
+        // like an SVG-namespaced node -- see applyElementNamespace) is present
+        // and in one of the three defined states. Works for any Element
+        // regardless of namespace/interface, matching the DOM-attribute-level
+        // spec text.
+        function hasDefinedDirAttribute(element) {
+          const raw = element.getAttribute('dir');
+          if (raw == null) return false;
+          const normalized = raw.toLowerCase();
+          return normalized === 'ltr' || normalized === 'rtl' || normalized === 'auto';
+        }
+
+        // Scans element's descendants in tree order for the first strong
+        // character, skipping script/style content and any descendant that
+        // establishes its own directionality (a bdi, or a dir attribute in a
+        // defined ltr/rtl/auto state) -- its text does not contribute to this
+        // element's auto-detection, per spec. The script/style/bdi checks use
+        // `instanceof` rather than `localName`: applyElementNamespace()
+        // reassigns an SVG-namespaced element's prototype to a generic
+        // SVGElement (or its specific SVG interface) even when its tag name
+        // happens to collide with an HTML-only interface, so e.g. an SVG
+        // "script" element must NOT be skipped here -- only a real
+        // HTMLScriptElement is.
+        function autoDirectionalityScan(element) {
+          for (const child of element.childNodes) {
+            if (child.nodeType === TEXT_NODE) {
+              const direction = firstStrongDirection(child.data);
+              if (direction) return direction;
+            } else if (child.nodeType === ELEMENT_NODE) {
+              if (child instanceof HTMLScriptElement || child instanceof HTMLStyleElement) continue;
+              if ((child instanceof HTMLElement && child.localName === 'bdi') || hasDefinedDirAttribute(child)) continue;
+              const direction = autoDirectionalityScan(child);
+              if (direction) return direction;
+            }
+          }
+          return null;
+        }
+
+        // "auto-directionality form-associated elements" per spec: a textarea,
+        // or an input whose type keeps a free-text value. dir=auto on one of
+        // these detects from the control's *value*, not descendant text nodes
+        // (input has none at all; textarea's is its value duplicated as a
+        // child text node, but the spec still names the value explicitly).
+        // Every other input type (checkbox, date, color, ...) has no
+        // descendants either, so autoDirectionalityScan's existing "nothing
+        // found -> ltr" fallback already gives the right answer for those
+        // without needing a special case. `instanceof` (not localName) for the
+        // same SVG-namespace-collision reason as autoDirectionalityScan above.
+        const AUTO_DIRECTIONALITY_INPUT_TYPES = new Set([
+          'hidden', 'text', 'search', 'tel', 'url', 'email', 'password', 'submit', 'reset', 'button'
+        ]);
+
+        function isAutoDirectionalityFormAssociated(element) {
+          if (element instanceof HTMLTextAreaElement) return true;
+          return element instanceof HTMLInputElement && AUTO_DIRECTIONALITY_INPUT_TYPES.has(element.type);
+        }
+
+        // Resolves an element's directionality per HTML's "directionality"
+        // algorithm: explicit ltr/rtl, auto-detection (dir=auto, or an
+        // undefined-state bdi), or inheritance from the nearest ancestor
+        // (defaulting to ltr at the document root). Reads the `dir` content
+        // attribute directly (via hasDefinedDirAttribute/getAttribute), not
+        // the `.dir` IDL reflection: that reflection lives on
+        // HTMLElement.prototype only, so it is simply undefined on a
+        // non-HTMLElement target (e.g. an SVG-namespaced element) rather than
+        // the empty-string "undefined state" a missing/invalid attribute
+        // reads as everywhere else in this algorithm.
+        function resolveElementDirectionality(element) {
+          if (!(element instanceof Element)) return 'ltr';
+          if (hasDefinedDirAttribute(element)) {
+            const normalized = element.getAttribute('dir').toLowerCase();
+            if (normalized === 'ltr') return 'ltr';
+            if (normalized === 'rtl') return 'rtl';
+            // normalized === 'auto': fall through to auto-detection below.
+          } else if (!(element instanceof HTMLElement && element.localName === 'bdi')) {
+            const parent = element.parentElement;
+            return parent ? resolveElementDirectionality(parent) : 'ltr';
+          }
+          if (isAutoDirectionalityFormAssociated(element)) {
+            return firstStrongDirection(element.value) || 'ltr';
+          }
+          return autoDirectionalityScan(element) || 'ltr';
+        }
+
         function matchesCompoundSelector(element, selector) {
           if (!(element instanceof Element)) return false;
           let text = String(selector || '').trim();
@@ -3061,6 +3167,15 @@
             const hash = (global.location && global.location.hash) || '';
             const targetId = hash.startsWith('#') ? decodeURIComponent(hash.slice(1)) : '';
             return targetId && element.id === targetId ? '' : '\u0000';
+          });
+          if (text.includes('\u0000')) return false;
+          // Evaluated inline (against whichever candidate element this compound
+          // is being tested against, per matchFrom()'s combinator walk in
+          // selectorMatchesElementFast), so :dir() composes correctly with
+          // combinators here -- unlike the querySelectorAll post-filter below,
+          // which only checks the final matched element.
+          text = text.replace(/:dir\(\s*(ltr|rtl)\s*\)/gi, (_match, value) => {
+            return resolveElementDirectionality(element) === value.toLowerCase() ? '' : '\u0000';
           });
           if (text.includes('\u0000')) return false;
           if (/:(hover|active|focus|visited|link|checked|disabled|enabled|first-child|last-child|nth-child|nth-of-type|first-of-type|last-of-type)\b/.test(text)) {
@@ -3175,6 +3290,11 @@
           const property = cssPropertyName(name);
           if (!property) return '';
           if (!(element instanceof Element)) return '';
+          // litehtml has no `direction` CSS property at all: this is a
+          // JS-computed override rather than a bridge/litehtml-cascade value,
+          // per HTML's directionality algorithm (see resolveElementDirectionality
+          // above) rather than actual CSS inheritance/cascade.
+          if (property === 'direction') return resolveElementDirectionality(element);
           const entry = computedStyleEntryForVersion(element, version);
           if (entry.values !== null) return entry.values[property] || '';
           if (!Object.prototype.hasOwnProperty.call(entry.properties, property)) {
@@ -3187,7 +3307,14 @@
 
         function computedStyleFor(element) {
           const styleValues = () => computedStyleValuesFor(element);
-          const propertyNames = () => Object.keys(styleValues());
+          // 'direction' is JS-computed (see computedStylePropertyForVersion
+          // above), not one of litehtml's bridge-provided cascade properties,
+          // so it must be added to enumeration explicitly.
+          const propertyNames = () => {
+            const names = Object.keys(styleValues());
+            if (names.indexOf('direction') === -1) names.push('direction');
+            return names;
+          };
           const propertyValue = (name) => {
             const property = cssPropertyName(name);
             if (!property) return '';
@@ -3243,6 +3370,15 @@
             ownKeys() {
               return propertyNames();
             },
+            has(target, property) {
+              // 'direction' is not an own property of the underlying
+              // `declaration` object (it is JS-computed, see propertyNames()
+              // above), so without this trap `'direction' in style` would
+              // fall through to the default Reflect.has(target, ...) check
+              // and miss it.
+              if (property === 'direction') return true;
+              return Reflect.has(target, property);
+            },
             getOwnPropertyDescriptor(_target, property) {
               if (typeof property !== 'string') return undefined;
               const value = propertyValue(property);
@@ -3273,6 +3409,73 @@
 
         function elementGeometry(element) {
           return elementGeometryForVersion(element, layoutMutationVersion());
+        }
+
+        // CSSOM View "scrolling area" extent, pragmatically approximated as the
+        // union of the element's own padding-box with every descendant's
+        // border-box (all read from the same litehtml-laid-out, unscrolled
+        // coordinate space -- see the Element.scroll* comment below for why
+        // that's an acceptable simplification). Cached per layout mutation
+        // version like elementGeometryCache: the scan is O(descendant count),
+        // so this bounds it to one scan per layout change per element read.
+        const scrollExtentCache = new WeakMap();
+        function scrollExtentFor(element) {
+          const version = layoutMutationVersion();
+          const cached = scrollExtentCache.get(element);
+          if (cached !== undefined && cached.version === version) return cached;
+
+          const geometry = elementGeometry(element);
+          let width = element.clientWidth;
+          let height = element.clientHeight;
+          if (geometry) {
+            let maxRight = geometry.paddingX + geometry.paddingWidth;
+            let maxBottom = geometry.paddingY + geometry.paddingHeight;
+            for (const descendant of element.querySelectorAll('*')) {
+              const descendantGeometry = elementGeometry(descendant);
+              if (!descendantGeometry) continue;
+              const right = descendantGeometry.borderX + descendantGeometry.borderWidth;
+              const bottom = descendantGeometry.borderY + descendantGeometry.borderHeight;
+              if (right > maxRight) maxRight = right;
+              if (bottom > maxBottom) maxBottom = bottom;
+            }
+            width = Math.max(width, Math.round(maxRight - geometry.paddingX));
+            height = Math.max(height, Math.round(maxBottom - geometry.paddingY));
+          }
+
+          const entry = { version, width, height };
+          scrollExtentCache.set(element, entry);
+          return entry;
+        }
+
+        function clampScrollOffset(value, max) {
+          if (!Number.isFinite(value) || value < 0) return 0;
+          return value > max ? max : value;
+        }
+
+        // Sets the per-element virtual scroll offset (see the Element.scrollTop
+        // comment below); an undefined axis is left untouched, so single-axis
+        // callers (the scrollTop/scrollLeft setters) don't disturb the other.
+        function setElementScroll(element, left, top) {
+          const extent = scrollExtentFor(element);
+          if (left !== undefined) {
+            const maxLeft = Math.max(0, extent.width - element.clientWidth);
+            element._scrollLeft = clampScrollOffset(Number(left), maxLeft);
+          }
+          if (top !== undefined) {
+            const maxTop = Math.max(0, extent.height - element.clientHeight);
+            element._scrollTop = clampScrollOffset(Number(top), maxTop);
+          }
+        }
+
+        // Normalizes scrollTo/scrollBy/scroll's `(x, y)` and
+        // `({left, top, behavior})` call shapes into a single {left, top} pair.
+        // `behavior: 'smooth'` is accepted (so feature detection succeeds) but
+        // has no effect -- there is no animation, the offset lands instantly.
+        function normalizeScrollArgs(args) {
+          if (args.length === 1 && args[0] && typeof args[0] === 'object') {
+            return { left: args[0].left, top: args[0].top };
+          }
+          return { left: args[0], top: args[1] };
         }
 
         function cssPixelValue(value) {
@@ -3483,9 +3686,35 @@
           return out;
         }
 
+        // lexbor accepts `:dir()` syntax without erroring but its own matcher
+        // always returns false (never selects anything), so unlike the
+        // `.\:`-escaped-class/`:target` fallback above it never reaches the
+        // catch branch below -- it must be intercepted here instead: run the
+        // selector with `:dir(...)` stripped through the normal
+        // querySelectorAllCompat path (still getting its escaped-class
+        // fallback "for free"), then post-filter by directionality. Correct
+        // for `:dir()` in the selector's own (rightmost) compound -- unlike
+        // matchesCompoundSelector's inline handling used by matches()/
+        // closest() above, this does not re-verify `:dir()` on a non-rightmost
+        // compound in a combinator chain (e.g. `div:dir(rtl) > span`), nor
+        // does it track `:dir()` per-part in a comma-separated selector list
+        // (`a:dir(ltr), b` applies the same filter to every part's matches) --
+        // known, narrow gaps for the highest-risk piece of directionality
+        // support.
+        function querySelectorAllWithDirFilter(root, selector) {
+          let direction = null;
+          const stripped = String(selector).replace(/:dir\(\s*(ltr|rtl)\s*\)/gi, (_match, value) => {
+            direction = value.toLowerCase();
+            return '';
+          }).trim();
+          const candidates = querySelectorAllCompat(root, stripped || '*');
+          return direction ? candidates.filter((el) => resolveElementDirectionality(el) === direction) : candidates;
+        }
+
         function querySelectorAllCompat(root, selector) {
           const text = String(selector);
           if (/:scope\b/i.test(text)) return querySelectorAllScoped(root, text);
+          if (/:dir\(/i.test(text)) return querySelectorAllWithDirFilter(root, text);
           try {
             return toArray(bridge.querySelectorAll(root._liveId(), text));
           } catch (error) {
@@ -3499,6 +3728,7 @@
         function querySelectorCompat(root, selector) {
           const text = String(selector);
           if (/:scope\b/i.test(text)) return querySelectorAllScoped(root, text)[0] || null;
+          if (/:dir\(/i.test(text)) return querySelectorAllWithDirFilter(root, text)[0] || null;
           try {
             return wrapNode(bridge.querySelector(root._liveId(), text));
           } catch (error) {
@@ -3869,16 +4099,38 @@
             }
             return Math.round(borderLeft);
           }
-          // Approximation (no patch to litehtml's protected scroll-size
-          // state): equates scroll size with the padding-box client size.
-          // Known limitation for overflow:scroll|auto content.
-          get scrollWidth() { return this.clientWidth; }
-          get scrollHeight() { return this.clientHeight; }
-          // No real scroll write-channel from JS back into litehtml layout.
-          get scrollTop() { return 0; }
-          set scrollTop(_value) {}
-          get scrollLeft() { return 0; }
-          set scrollLeft(_value) {}
+          get scrollWidth() { return scrollExtentFor(this).width; }
+          get scrollHeight() { return scrollExtentFor(this).height; }
+          // A virtual scroll model: litehtml never actually scrolls its laid-out
+          // render tree (no patch to its protected scroll-size state), so the
+          // offset is a per-element expando (`_scrollLeft`/`_scrollTop`, the
+          // same pattern <input>/<textarea> use for dirty-value tracking) that
+          // is clamped against scrollWidth/Height but does not move anything
+          // litehtml paints. Known consequence: elementFromPoint and rendered
+          // output do not react to a nonzero scroll offset (see
+          // docs/browser-api-support.md's scroll-geometry row).
+          get scrollTop() {
+            const extent = scrollExtentFor(this);
+            return clampScrollOffset(this._scrollTop || 0, Math.max(0, extent.height - this.clientHeight));
+          }
+          set scrollTop(value) { setElementScroll(this, undefined, Number(value)); }
+          get scrollLeft() {
+            const extent = scrollExtentFor(this);
+            return clampScrollOffset(this._scrollLeft || 0, Math.max(0, extent.width - this.clientWidth));
+          }
+          set scrollLeft(value) { setElementScroll(this, Number(value), undefined); }
+          scrollTo(...args) {
+            const { left, top } = normalizeScrollArgs(args);
+            setElementScroll(
+              this,
+              left === undefined ? this.scrollLeft : left,
+              top === undefined ? this.scrollTop : top);
+          }
+          scroll(...args) { this.scrollTo(...args); }
+          scrollBy(...args) {
+            const { left, top } = normalizeScrollArgs(args);
+            setElementScroll(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0));
+          }
         }
 
         // A thin wrapper over the real shadow-container element attach_shadow_root()
@@ -4922,8 +5174,8 @@
           moveBefore(node, child) { nodeMoveBefore(this, node, child); }
           get readyState() { return ctx.documentReadyState; }
           set readyState(value) { setDocumentReadyState(value); }
-          get characterSet() { return 'UTF-8'; }
-          get charset() { return 'UTF-8'; }
+          get characterSet() { return host.characterSet || 'UTF-8'; }
+          get charset() { return host.characterSet || 'UTF-8'; }
           get contentType() { return 'text/html'; }
           get compatMode() { return bridge.compatMode(); }
           get hidden() { return false; }

@@ -2,11 +2,13 @@
 
 #include "cookie_jar.hpp"
 #include "css_scan.hpp"
+#include "html_encoding.hpp"
 #include "js_runtime.hpp"
 #include "perf_scope.hpp"
 #include "render_resource_loaders.hpp"
 #include "script_type.hpp"
 #include "subresource_scanner.hpp"
+#include "util.hpp"
 #include "pagecore/render.hpp"
 #include "pagecore/resource_loader.hpp"
 
@@ -1613,12 +1615,13 @@ void Page::set_layout_engine_factory(std::shared_ptr<LayoutEngineFactory> factor
     impl_->invalidate_display_list_cache();
 }
 
-void Page::load_html(std::string_view html, std::string base_url)
+void Page::load_html(std::string_view html, std::string base_url, std::string character_set)
 {
     impl_->js.reset();
     impl_->invalidate_display_list_cache();
     impl_->current_url = std::move(base_url);
     impl_->options.base_url = impl_->current_url;
+    impl_->options.document_character_set = std::move(character_set);
     impl_->document.parse(html);
 
     if (impl_->options.enable_js) {
@@ -1640,7 +1643,16 @@ void Page::load_url(std::string_view url)
     event.property = "document";
     event.url = response.url.empty() ? std::string(url) : response.url;
     emit_perf_trace(impl_->options.perf_trace, std::move(event));
-    load_html(response.body, response.url.empty() ? std::string(url) : response.url);
+
+    std::string content_type;
+    for (const auto& header : response.headers) {
+        if (header_name_equals(header.first, "Content-Type")) {
+            content_type = header.second;
+            break;
+        }
+    }
+    DecodedHtml decoded = decode_html_bytes(response.body, content_type);
+    load_html(decoded.utf8_html, response.url.empty() ? std::string(url) : response.url, decoded.character_set);
 }
 
 std::string Page::eval(std::string_view script)
