@@ -486,6 +486,139 @@
           return liveCollection(NodeList, () => snapshot);
         }
 
+        // ---- Pre-insertion validity (DOM "ensure pre-insertion validity") -------
+        // Without this, inserting into an impossible place threw whatever the bridge
+        // happened to throw (an InternalError, or a TypeError from liveId()) instead
+        // of the HierarchyRequestError / NotFoundError the DOM specifies. Every
+        // insertion path funnels through here.
+
+        const ELEMENT_NODE = 1;
+        const TEXT_NODE = 3;
+        const CDATA_SECTION_NODE = 4;
+        const PROCESSING_INSTRUCTION_NODE = 7;
+        const COMMENT_NODE = 8;
+        const DOCUMENT_NODE = 9;
+        const DOCUMENT_TYPE_NODE = 10;
+        const DOCUMENT_FRAGMENT_NODE = 11;
+
+        // Only these can hold children.
+        const PARENT_NODE_TYPES = new Set([DOCUMENT_NODE, DOCUMENT_FRAGMENT_NODE, ELEMENT_NODE]);
+        // DocumentFragment, DocumentType, Element, or CharacterData.
+        const INSERTABLE_NODE_TYPES = new Set([
+          DOCUMENT_FRAGMENT_NODE, DOCUMENT_TYPE_NODE, ELEMENT_NODE,
+          TEXT_NODE, CDATA_SECTION_NODE, PROCESSING_INSTRUCTION_NODE, COMMENT_NODE
+        ]);
+
+        function hierarchyRequestError(message) {
+          return new DOMException(message, 'HierarchyRequestError');
+        }
+
+        function nodeTypeOf(node) {
+          if (isDocumentFragment(node)) return DOCUMENT_FRAGMENT_NODE;
+          return node && typeof node.nodeType === 'number' ? node.nodeType : undefined;
+        }
+
+        // "Host-including inclusive ancestor": a node cannot be inserted into itself
+        // or into one of its own descendants.
+        function isInclusiveAncestor(node, parent) {
+          for (let current = parent; current; current = current.parentNode) {
+            if (current === node) return true;
+            if (current.__id !== undefined && node.__id !== undefined && current.__id === node.__id) return true;
+          }
+          return false;
+        }
+
+        // `replacing` is the node replaceChild() is about to remove; it is null for a
+        // plain insertion. It matters because the document's "at most one element
+        // child" rules must not count the node that is on its way out.
+        function ensureInsertionValidity(node, parent, child, replacing = null) {
+          if (!isNodeWrapper(node) && !isDocumentFragment(node)) {
+            throw new TypeError("Failed to execute on 'Node': parameter 1 is not of type 'Node'.");
+          }
+          const parentType = nodeTypeOf(parent);
+          if (!PARENT_NODE_TYPES.has(parentType)) {
+            throw hierarchyRequestError('This node type does not support this method.');
+          }
+          if (isInclusiveAncestor(node, parent)) {
+            throw hierarchyRequestError('The new child element contains the parent.');
+          }
+          if (child !== null && child !== undefined && child.parentNode !== parent) {
+            throw new DOMException('The node before which the new node is to be inserted is not a child of this node.', 'NotFoundError');
+          }
+
+          const nodeType = nodeTypeOf(node);
+          if (!INSERTABLE_NODE_TYPES.has(nodeType)) {
+            throw hierarchyRequestError('Nodes of this type may not be inserted.');
+          }
+          if (nodeType === TEXT_NODE && parentType === DOCUMENT_NODE) {
+            throw hierarchyRequestError('Nodes of type Text may not be inserted inside a Document.');
+          }
+          if (nodeType === DOCUMENT_TYPE_NODE && parentType !== DOCUMENT_NODE) {
+            throw hierarchyRequestError('A DocumentType may only be inserted inside a Document.');
+          }
+          if (parentType !== DOCUMENT_NODE) return;
+
+          // A Document may hold at most one element child and one doctype, with the
+          // doctype first, so the remaining rules only apply under the document.
+          const children = [...parent.childNodes];
+          const others = replacing ? children.filter((entry) => entry !== replacing) : children;
+          const elementChildren = others.filter((entry) => entry.nodeType === ELEMENT_NODE);
+          const hasDoctype = others.some((entry) => entry.nodeType === DOCUMENT_TYPE_NODE);
+          const doctypeFollows = (reference) => {
+            if (!reference) return false;
+            const index = children.indexOf(reference);
+            return index !== -1 && children.slice(index + 1).some((entry) => entry.nodeType === DOCUMENT_TYPE_NODE);
+          };
+          const elementPrecedes = (reference) => {
+            if (!reference) return false;
+            const index = children.indexOf(reference);
+            return index !== -1 && children.slice(0, index).some((entry) => entry.nodeType === ELEMENT_NODE);
+          };
+          // On insertion the reference child being a doctype also blocks an element,
+          // because the element would land before it. On replacement the reference
+          // child is the node going away, so it cannot block anything.
+          const blockedByReference = !replacing && child && child.nodeType === DOCUMENT_TYPE_NODE;
+
+          if (nodeType === DOCUMENT_FRAGMENT_NODE) {
+            const fragmentChildren = [...node.childNodes];
+            const fragmentElements = fragmentChildren.filter((entry) => entry.nodeType === ELEMENT_NODE);
+            if (fragmentElements.length > 1 || fragmentChildren.some((entry) => entry.nodeType === TEXT_NODE)) {
+              throw hierarchyRequestError('Only one element on document allowed.');
+            }
+            if (fragmentElements.length === 1
+              && (elementChildren.length > 0 || blockedByReference || doctypeFollows(child))) {
+              throw hierarchyRequestError('Only one element on document allowed.');
+            }
+            return;
+          }
+
+          if (nodeType === ELEMENT_NODE) {
+            if (elementChildren.length > 0 || blockedByReference || doctypeFollows(child)) {
+              throw hierarchyRequestError('Only one element on document allowed.');
+            }
+            return;
+          }
+
+          if (nodeType === DOCUMENT_TYPE_NODE) {
+            if (hasDoctype || elementPrecedes(child) || (!child && elementChildren.length > 0)) {
+              throw hierarchyRequestError('Only one doctype on document allowed.');
+            }
+          }
+        }
+
+        function ensurePreInsertionValidity(node, parent, child) {
+          ensureInsertionValidity(node, parent, child, null);
+        }
+
+        function ensurePreReplaceValidity(node, parent, replacedChild) {
+          if (!isNodeWrapper(replacedChild)) {
+            throw new TypeError("Failed to execute 'replaceChild' on 'Node': parameter 2 is not of type 'Node'.");
+          }
+          // The NotFoundError for a non-child is raised inside ensureInsertionValidity,
+          // so that the parent-type and ancestor checks still run first, as specified.
+          ensureInsertionValidity(node, parent, replacedChild, replacedChild);
+        }
+
         class Node extends EventTarget {
           constructor(id) {
             super();
@@ -579,6 +712,7 @@
           }
 
           appendChild(child) {
+            ensurePreInsertionValidity(child, this, null);
             if (isDocumentFragment(child)) {
               const addedNodes = [...child.childNodes];
               ctx.suppressMutationRecords++;
@@ -623,6 +757,7 @@
           }
 
           insertBefore(child, referenceChild) {
+            ensurePreInsertionValidity(child, this, referenceChild ?? null);
             if (isDocumentFragment(child)) {
               const addedNodes = [...child.childNodes];
               ctx.suppressMutationRecords++;
@@ -668,6 +803,12 @@
           }
 
           removeChild(child) {
+            if (!isNodeWrapper(child)) {
+              throw new TypeError("Failed to execute 'removeChild' on 'Node': parameter 1 is not of type 'Node'.");
+            }
+            if (child.parentNode !== this) {
+              throw new DOMException('The node to be removed is not a child of this node.', 'NotFoundError');
+            }
             const id = bridge.removeChild(this._liveId(), liveId(child));
             return afterMutation(wrapNode(id) || child, {
               type: 'childList',
@@ -686,9 +827,14 @@
           }
 
           replaceChild(child, replacedChild) {
+            ensurePreReplaceValidity(child, this, replacedChild);
             if (isDocumentFragment(child)) {
-              this.insertBefore(child, replacedChild);
+              // Remove first, then insert at the vacated position, as the spec does.
+              // Inserting first would momentarily give a document two element
+              // children and trip the validity check on the way in.
+              const reference = replacedChild.nextSibling;
               this.removeChild(replacedChild);
+              this.insertBefore(child, reference);
               return replacedChild;
             }
             // Detach an incoming node from a DocumentFragment first, as

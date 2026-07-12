@@ -2091,6 +2091,58 @@ void test_character_data_interface()
         "CharacterData should own the data mutation API and treat a numeric constructor argument as data");
 }
 
+void test_pre_insertion_validity()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="host"><span id="kid"></span></div>
+  <div id="other"></div>
+  <script>
+    const checks = [];
+    const nameOf = (fn) => { try { fn(); return 'no throw'; } catch (error) { return error.name; } };
+    const host = document.getElementById('host');
+    const kid = document.getElementById('kid');
+    const other = document.getElementById('other');
+
+    // A node may not be inserted into itself or into its own descendant.
+    checks.push(nameOf(() => host.appendChild(host)) === 'HierarchyRequestError');
+    checks.push(nameOf(() => kid.appendChild(host)) === 'HierarchyRequestError');
+
+    // Only Document/DocumentFragment/Element can hold children, so a Text node is
+    // never a valid parent. This is checked before the ancestor relationship.
+    const text = document.createTextNode('x');
+    checks.push(nameOf(() => text.appendChild(document.createElement('b'))) === 'HierarchyRequestError');
+    checks.push(nameOf(() => text.appendChild(text)) === 'HierarchyRequestError');
+
+    // A Document node itself is not insertable anywhere.
+    checks.push(nameOf(() => host.appendChild(document)) === 'HierarchyRequestError');
+
+    // The reference/removed child must actually be a child of the parent.
+    checks.push(nameOf(() => host.insertBefore(document.createElement('b'), other)) === 'NotFoundError');
+    checks.push(nameOf(() => host.removeChild(other)) === 'NotFoundError');
+    checks.push(nameOf(() => host.replaceChild(document.createElement('b'), other)) === 'NotFoundError');
+
+    // The document already has one element child (<html>), so it may not take
+    // another, and a Text node may never be a child of a document.
+    checks.push(nameOf(() => document.appendChild(document.createElement('b'))) === 'HierarchyRequestError');
+    checks.push(nameOf(() => document.appendChild(document.createTextNode('x'))) === 'HierarchyRequestError');
+
+    // Valid operations still work, and replaceChild returns the replaced node.
+    const fresh = document.createElement('i');
+    checks.push(host.replaceChild(fresh, kid) === kid);
+    checks.push(host.firstChild === fresh);
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/hierarchy.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "insertion should enforce DOM pre-insertion validity with HierarchyRequestError/NotFoundError");
+}
+
 void test_dom_token_list_is_an_ordered_set()
 {
     pagecore::Page page;
@@ -12712,6 +12764,7 @@ int main()
         test_document_write_escaped_script_text_remains_text();
         test_comment_nodes_wrap_for_sibling_traversal();
         test_character_data_interface();
+        test_pre_insertion_validity();
         test_dom_token_list_is_an_ordered_set();
         test_idl_attribute_reflection();
         test_live_collections();
