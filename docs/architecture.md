@@ -307,6 +307,35 @@ paint at another.
 `Page::layout(RenderOptions)` returns a freshly built engine for callers that
 need the engine itself.
 
+Known gaps in litehtml's own layout engine (upstream, not something the local
+patch addresses — see the litehtml FetchContent patch note under "Direct-DOM
+layout tree" below for what *is* patched):
+
+- **No `gap`/`row-gap`/`column-gap` support**, on flex containers or otherwise:
+  `display:flex; gap:16px` has zero effect on spacing between flex items —
+  litehtml's flex formatting context (`render_flex.cpp`, `flex_line.cpp`,
+  `flex_item.cpp`) has no gap-distribution step at all. Confirmed with a
+  minimal repro (two flex children, `gap:16px`, zero measured space between
+  their boxes) as well as on real content: tailwindcss.com's rendered DOM has
+  197 elements using `flex` classes and 130 using `gap-*` classes, and virtually
+  none of that spacing renders. Modern CSS (Tailwind in particular) uses `gap`
+  as the default spacing mechanism instead of margins, so this affects most
+  utility-framework-built pages, not just edge cases.
+- **No CSS Grid support at all**: there is no `render_grid.cpp` or equivalent —
+  `display:grid`/`display:inline-grid` are not a recognized formatting context,
+  so grid containers and their children fall back to plain block layout instead
+  of being placed on a grid. tailwindcss.com has 76 elements using `grid`
+  classes.
+
+Both were found while comparing tailwindcss.com's (a Tailwind CSS v4 site)
+PageCore render against real Chrome, after already fixing a `:host`-selector
+cascade bug that had been dropping the site's entire custom-property theme
+(see the litehtml patch note under "Direct-DOM layout tree" below). Even with
+every stylesheet rule now parsing and cascading correctly, layout still
+diverges sharply from a real browser wherever the page relies on `gap` or CSS
+Grid. Neither is a small patch — they're real formatting-context features to
+add to litehtml's C++ layout engine, not a parser or selector fix.
+
 ### Direct-DOM layout tree
 
 The litehtml tree is built directly from the Lexbor DOM by default
