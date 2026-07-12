@@ -113,6 +113,12 @@ public:
     std::optional<ComputedStyle> computed_style(NodeId node) const;
     std::optional<std::string> computed_style_property(NodeId node, std::string_view property) const;
     std::optional<ElementGeometry> element_geometry(NodeId node) const;
+    // Hit-tests the last layout at (x, y), viewport-relative pixels. Returns
+    // NodeIds in front-to-back paint order (topmost first); empty if nothing
+    // was hit, if layout is bounded-mode stale (no fresh layout is forced for a
+    // point query), or if the engine doesn't support hit-testing.
+    // topmost_only == true stops after the first hit.
+    std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only) const;
 
 private:
     struct Impl;

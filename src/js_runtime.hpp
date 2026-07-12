@@ -35,6 +35,7 @@ public:
     using ComputedStyleResolver = std::function<std::optional<ComputedStyle>(NodeId)>;
     using ComputedStylePropertyResolver = std::function<std::optional<std::string>(NodeId, std::string_view)>;
     using ElementGeometryResolver = std::function<std::optional<ElementGeometry>(NodeId)>;
+    using ElementsAtPointResolver = std::function<std::vector<NodeId>(float, float, bool)>;
     using ViewportResolver = std::function<Viewport()>;
 
     // `loader` is the blocking loader used for sync XHR / module loads (a
@@ -123,6 +124,12 @@ public:
     void set_element_geometry_resolver(ElementGeometryResolver resolver);
     std::optional<ElementGeometry> element_geometry(NodeId node);
 
+    // Injected by Page::Impl so document.elementFromPoint()/elementsFromPoint()
+    // can hit-test litehtml's render tree without JsRuntime depending on Page
+    // directly.
+    void set_elements_at_point_resolver(ElementsAtPointResolver resolver);
+    std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only);
+
     // Injected by Page::Impl so window.innerWidth/innerHeight/etc. reflect
     // the most recently used render viewport.
     void set_viewport_resolver(ViewportResolver resolver);
@@ -201,6 +208,7 @@ private:
     ComputedStyleResolver computed_style_resolver_;
     ComputedStylePropertyResolver computed_style_property_resolver_;
     ElementGeometryResolver element_geometry_resolver_;
+    ElementsAtPointResolver elements_at_point_resolver_;
     ViewportResolver viewport_resolver_;
     std::unordered_map<std::string, DomBridgePerfAggregate> dom_bridge_perf_;
     std::size_t js_resource_load_count_ = 0;

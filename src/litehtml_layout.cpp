@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <iomanip>
 #include <limits>
@@ -1102,6 +1104,53 @@ public:
         border_box += render_item->get_borders();
 
         return ElementGeometry{rect_from(border_box), rect_from(padding_box)};
+    }
+
+    std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only) override
+    {
+        std::vector<NodeId> ids;
+        if (!document_) {
+            return ids;
+        }
+
+        auto root_render = document_->root_render();
+        if (!root_render) {
+            return ids;
+        }
+
+        // Each iteration's check rejects every element already collected (by
+        // identity), so litehtml's own stacking-order search (get_element_by_point)
+        // surfaces whatever is underneath the last hit. PageCore has no scroll
+        // model, so document and client coordinates coincide (see the interface
+        // doc comment); litehtml itself only distinguishes them for
+        // position:fixed elements.
+        std::unordered_set<const litehtml::element*> excluded;
+        while (true) {
+            auto check = [&excluded](const std::shared_ptr<litehtml::render_item>& item) {
+                return excluded.find(item->src_el().get()) == excluded.end();
+            };
+            auto hit = root_render->get_element_by_point(x, y, x, y, check);
+            if (!hit) {
+                break;
+            }
+            excluded.insert(hit.get());
+
+            const char* sid = hit->get_attr("data-pc-sid");
+            if (sid != nullptr && *sid != '\0') {
+                NodeId node = kInvalidNodeId;
+                const char* begin = sid;
+                const char* end = sid + std::strlen(sid);
+                const auto parsed = std::from_chars(begin, end, node);
+                if (parsed.ec == std::errc{} && parsed.ptr == end && node != kInvalidNodeId) {
+                    ids.push_back(node);
+                    if (topmost_only) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return ids;
     }
 
     std::vector<AbsolutePercentWidthOverride> collect_absolute_percent_width_overrides() override

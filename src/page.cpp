@@ -225,6 +225,8 @@ struct Page::Impl {
             js->set_computed_style_property_resolver(
                 [this](NodeId node, std::string_view property) { return computed_style_property(node, property); });
             js->set_element_geometry_resolver([this](NodeId node) { return element_geometry(node); });
+            js->set_elements_at_point_resolver(
+                [this](float x, float y, bool topmost_only) { return elements_at_point(x, y, topmost_only); });
             js->set_viewport_resolver([this] { return last_render_options.viewport; });
             js->install();
         }
@@ -1547,6 +1549,38 @@ struct Page::Impl {
             (stale ? "bounded_mode_approx:" : "bounded_mode_sound:") + cache_reason;
         return found->second.geometry;
     }
+
+    // Hit-test read. Reuses has_current_layout()/ensure_layout() exactly like
+    // element_geometry(), but deliberately skips its per-node caching and
+    // deadline-backstop machinery (remember_geometry, note_geometry_forced_layout):
+    // there is no natural per-point cache key, and a point query isn't expected to
+    // run every animation frame the way per-element geometry reads are. If bounded
+    // mode is already active, forcing a fresh layout for a point query isn't
+    // warranted -> empty, matching the DOM spec's own tolerance for "no element at
+    // this point" being a legitimate result.
+    std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only)
+    {
+        const bool full_layout_hit = has_current_layout(last_render_options, false, LayoutResourceMode::Full);
+        const bool stylesheets_layout_hit = has_current_layout(
+            last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+
+        PerfScope trace(perf_trace_for(last_render_options), PerfPhase::Geometry, "elements_at_point", 1);
+
+        if (full_layout_hit || stylesheets_layout_hit) {
+            auto ids = styled_document->elements_at_point(x, y, topmost_only);
+            trace.set_count(ids.size());
+            return ids;
+        }
+
+        if (!geometry_bounded_mode) {
+            auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+            auto ids = engine.elements_at_point(x, y, topmost_only);
+            trace.set_count(ids.size());
+            return ids;
+        }
+
+        return {};
+    }
 };
 
 Page::Page(LoadOptions options)
@@ -1700,6 +1734,11 @@ std::optional<std::string> Page::computed_style_property(NodeId node, std::strin
 std::optional<ElementGeometry> Page::element_geometry(NodeId node) const
 {
     return impl_->element_geometry(node);
+}
+
+std::vector<NodeId> Page::elements_at_point(float x, float y, bool topmost_only) const
+{
+    return impl_->elements_at_point(x, y, topmost_only);
 }
 
 } // namespace pagecore

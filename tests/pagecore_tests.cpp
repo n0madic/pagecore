@@ -695,10 +695,14 @@ void test_dom_shim_spec_regressions()
   document.body.setAttribute('data-frag', String(frag.childNodes.length));
 
   // elementFromPoint must exist (baseline API libraries call unguarded) and
-  // return null rather than throw or hand back a wrong element.
-  var efp = (typeof document.elementFromPoint === 'function')
-    ? (document.elementFromPoint(1, 1) === null ? 'null' : 'wrong')
-    : 'missing';
+  // return null or a real Element rather than throw or hand back garbage.
+  // (Real hit-testing means (1,1) now legitimately resolves to whatever
+  // element is actually painted there -- see test_hit_testing for coverage
+  // of the hit-testing behavior itself.)
+  var efpResult = (typeof document.elementFromPoint === 'function') ? document.elementFromPoint(1, 1) : undefined;
+  var efp = typeof document.elementFromPoint !== 'function'
+    ? 'missing'
+    : (efpResult === null || efpResult instanceof Element) ? 'ok' : 'wrong';
   document.body.setAttribute('data-efp', efp);
 </script>
 </body></html>
@@ -712,8 +716,8 @@ void test_dom_shim_spec_regressions()
             "an event on a non-Node EventTarget must not propagate to window");
     require(page.outer_html("body[data-frag='0']").has_value(),
             "replaceChild must detach a fragment-parented incoming node from its fragment");
-    require(page.outer_html("body[data-efp='null']").has_value(),
-            "document.elementFromPoint must be present and return null (baseline API called unguarded)");
+    require(page.outer_html("body[data-efp='ok']").has_value(),
+            "document.elementFromPoint must be present and return null or a real Element (baseline API called unguarded)");
 }
 
 void test_js_console_log_callback()
@@ -13286,6 +13290,87 @@ void test_computed_style_reacts_to_class_driven_width_change()
             "a class change must invalidate the digest and recompute the width");
     require(narrow != wide, "the computed width must change with the class");
 }
+
+// document.elementFromPoint()/elementsFromPoint()/caretPositionFromPoint(): real
+// hit-testing against litehtml's render tree (LiteHtmlLayoutEngine::elements_at_point,
+// backed by litehtml's own get_element_by_point), replacing the old hardcoded
+// null/[] stubs. Every test element is position:absolute with explicit
+// left/top/width/height so hit-test coordinates are exact document-pixel math
+// (PageCore has no scroll model, so document and client coordinates coincide).
+void test_hit_testing()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body style="margin:0">
+  <div id="back" style="position:absolute;left:0;top:0;width:100px;height:100px;z-index:1;background:red;"></div>
+  <div id="front" style="position:absolute;left:0;top:0;width:100px;height:100px;z-index:2;background:blue;"></div>
+
+  <div id="visibleBehind" style="position:absolute;left:0;top:150px;width:100px;height:100px;z-index:1;background:green;"></div>
+  <div id="hiddenAbove" style="position:absolute;left:0;top:150px;width:100px;height:100px;z-index:2;display:none;background:black;"></div>
+
+  <div id="visibleBehind2" style="position:absolute;left:0;top:300px;width:100px;height:100px;z-index:1;background:green;"></div>
+  <div id="invisibleAbove" style="position:absolute;left:0;top:300px;width:100px;height:100px;z-index:2;visibility:hidden;background:black;"></div>
+
+  <div id="clipper" style="position:absolute;left:0;top:450px;width:100px;height:100px;overflow:hidden;">
+    <div id="clipped" style="position:absolute;left:150px;top:0;width:100px;height:100px;background:orange;"></div>
+  </div>
+
+  <div id="textbox" style="position:absolute;left:0;top:600px;width:200px;height:50px;">Hello world</div>
+
+  <script>
+    function ids(list) { return Array.from(list).map((el) => el.id); }
+
+    window.__topId = (document.elementFromPoint(50, 50) || {}).id || '';
+    window.__overlapOrder = ids(document.elementsFromPoint(50, 50)).join(',');
+
+    window.__hiddenTop = (document.elementFromPoint(50, 200) || {}).id || '';
+    window.__hiddenExcluded = !ids(document.elementsFromPoint(50, 200)).includes('hiddenAbove');
+
+    window.__invisibleTop = (document.elementFromPoint(50, 350) || {}).id || '';
+    window.__invisibleExcluded = !ids(document.elementsFromPoint(50, 350)).includes('invisibleAbove');
+
+    window.__nothingFromPoint = document.elementFromPoint(-50, -50);
+    window.__nothingElementsLength = document.elementsFromPoint(-50, -50).length;
+
+    window.__clippedExcluded = !ids(document.elementsFromPoint(200, 500)).includes('clipped');
+
+    const caret = document.caretPositionFromPoint(50, 620);
+    window.__caretOk = !!(caret && caret.offsetNode && caret.offsetNode.nodeType === 3
+      && caret.offsetNode.data === 'Hello world' && caret.offset === 0);
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(page.eval("String(window.__topId)") == "front",
+            "elementFromPoint should return the topmost element by z-index");
+    const std::string overlap_order = page.eval("String(window.__overlapOrder)");
+    require(
+        overlap_order.find("front") != std::string::npos
+            && overlap_order.find("back") != std::string::npos
+            && overlap_order.find("front") < overlap_order.find("back"),
+        "elementsFromPoint should list overlapping elements front-to-back, got: " + overlap_order);
+
+    require(page.eval("String(window.__hiddenTop)") == "visibleBehind",
+            "a display:none element must not be hit-testable; the visible element behind it should be returned");
+    require(page.eval("String(window.__hiddenExcluded)") == "true",
+            "elementsFromPoint must exclude display:none elements");
+
+    require(page.eval("String(window.__invisibleTop)") == "visibleBehind2",
+            "a visibility:hidden element must not be hit-testable; the visible element behind it should be returned");
+    require(page.eval("String(window.__invisibleExcluded)") == "true",
+            "elementsFromPoint must exclude visibility:hidden elements");
+
+    require(page.eval("String(window.__nothingFromPoint)") == "null",
+            "elementFromPoint should return null when nothing is under the point");
+    require(page.eval("String(window.__nothingElementsLength)") == "0",
+            "elementsFromPoint should return an empty list when nothing is under the point");
+
+    require(page.eval("String(window.__clippedExcluded)") == "true",
+            "elementFromPoint/elementsFromPoint must respect overflow:hidden clipping");
+
+    require(page.eval("String(window.__caretOk)") == "true",
+            "caretPositionFromPoint should resolve to the text-containing element's first Text descendant");
+}
 #endif
 
 } // namespace
@@ -13623,6 +13708,7 @@ int main()
         test_render_without_absolute_elements_skips_second_pass();
         test_render_reflects_settled_dom_regardless_of_read_history();
         test_computed_style_reacts_to_class_driven_width_change();
+        test_hit_testing();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "test failed: " << error.what() << "\n";

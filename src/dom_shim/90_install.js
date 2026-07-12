@@ -171,6 +171,7 @@
         DOMRectReadOnly,
         DOMRect,
         DOMRectList,
+        CaretPosition,
         Range,
         StaticRange,
         Selection,
@@ -378,6 +379,7 @@
         global.DOMRectReadOnly = DOMRectReadOnly;
         global.DOMRect = DOMRect;
         global.DOMRectList = DOMRectList;
+        global.CaretPosition = CaretPosition;
         global.URL = URL;
         global.URLSearchParams = URLSearchParams;
         global.TextEncoder = TextEncoder;

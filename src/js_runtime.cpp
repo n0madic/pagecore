@@ -949,6 +949,21 @@ JSValue bridge_element_geometry(JSContext* ctx, JSValue, int argc, JSValue* argv
     });
 }
 
+JSValue bridge_elements_at_point(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 3) throw std::runtime_error("elementsAtPoint requires x, y, and topmostOnly");
+        double x = 0;
+        double y = 0;
+        if (JS_ToFloat64(ctx, &x, argv[0]) < 0 || JS_ToFloat64(ctx, &y, argv[1]) < 0) {
+            throw std::runtime_error("elementsAtPoint requires numeric x, y");
+        }
+        const bool topmost_only = JS_ToBool(ctx, argv[2]);
+        auto ids = js.elements_at_point(static_cast<float>(x), static_cast<float>(y), topmost_only);
+        return js_ids(ctx, ids);
+    });
+}
+
 JSValue bridge_viewport(JSContext* ctx, JSValue, int, JSValue*)
 {
     return bridge_call(ctx, [ctx](JsRuntime& js) {
@@ -1711,6 +1726,7 @@ void JsRuntime::install()
     set_function(context_, dom, "computedStyle", bridge_computed_style, 1);
     set_function(context_, dom, "computedStyleProperty", bridge_computed_style_property, 2);
     set_function(context_, dom, "elementGeometry", bridge_element_geometry, 1);
+    set_function(context_, dom, "elementsAtPoint", bridge_elements_at_point, 3);
     set_function(context_, dom, "viewport", bridge_viewport, 0);
     set_function(context_, dom, "getAttribute", bridge_get_attribute, 2);
     set_function(context_, dom, "hasAttribute", bridge_has_attribute, 2);
@@ -2216,6 +2232,19 @@ std::optional<ElementGeometry> JsRuntime::element_geometry(NodeId node)
         return std::nullopt;
     }
     return element_geometry_resolver_(node);
+}
+
+void JsRuntime::set_elements_at_point_resolver(ElementsAtPointResolver resolver)
+{
+    elements_at_point_resolver_ = std::move(resolver);
+}
+
+std::vector<NodeId> JsRuntime::elements_at_point(float x, float y, bool topmost_only)
+{
+    if (!elements_at_point_resolver_) {
+        return {};
+    }
+    return elements_at_point_resolver_(x, y, topmost_only);
 }
 
 void JsRuntime::set_viewport_resolver(ViewportResolver resolver)

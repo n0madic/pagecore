@@ -94,6 +94,32 @@
           get [Symbol.toStringTag]() { return 'DOMRectList'; }
         }
 
+        // Reduced-scope CaretPosition: offsetNode/offset identify the right
+        // element (or its first Text descendant), not a glyph-precise character
+        // offset -- litehtml exposes no per-glyph text metrics for that. offset
+        // is always 0. See Document.caretPositionFromPoint (dom module) for the
+        // hit-testing side.
+        class CaretPosition {
+          constructor(offsetNode, offset) {
+            this._offsetNode = offsetNode;
+            this._offset = offset;
+          }
+
+          get offsetNode() { return this._offsetNode; }
+          get offset() { return this._offset; }
+
+          getClientRect() {
+            const node = this._offsetNode;
+            if (!node) return null;
+            const element = node.nodeType === 1 ? node : node.parentElement;
+            return element && typeof element.getBoundingClientRect === 'function'
+              ? element.getBoundingClientRect()
+              : null;
+          }
+
+          get [Symbol.toStringTag]() { return 'CaretPosition'; }
+        }
+
         function isCharacterDataNode(node) {
           return node != null && typeof node.data === 'string';
         }
@@ -2355,6 +2381,7 @@
         DOMRectReadOnly,
         DOMRect,
         DOMRectList,
+        CaretPosition,
         Range,
         StaticRange,
         Selection,

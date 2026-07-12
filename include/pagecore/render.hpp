@@ -295,6 +295,22 @@ public:
         return std::nullopt;
     }
 
+    // Hit-tests the last layout() pass at (x, y). PageCore has no scroll model yet
+    // (scrollX/scrollY are hardcoded 0), so "document" and "client" coordinates
+    // coincide: callers pass the same x, y for both. Returns NodeIds in
+    // front-to-back paint order (topmost first); empty when nothing is hit or
+    // layout() hasn't run yet. topmost_only stops after the first hit
+    // (elementFromPoint's case) instead of collecting everything underneath it
+    // (elementsFromPoint's case). Default implementation is for engines without
+    // hit-testing support.
+    virtual std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only)
+    {
+        (void) x;
+        (void) y;
+        (void) topmost_only;
+        return {};
+    }
+
     // A render-local correction the engine wants applied on a second layout pass:
     // pin `position:absolute; box-sizing:border-box; width:%` element `node_key`
     // to `border_box_width_px` so its percentage-width children don't collapse.

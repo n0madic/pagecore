@@ -4879,6 +4879,20 @@
           return wrapNode(bridge.createCDATASection(data));
         }
 
+        // First Text node in `root`'s subtree, tree order, depth-first. Used by
+        // caretPositionFromPoint: the hit-tested element is a real answer, but
+        // litehtml exposes no glyph metrics to place the caret inside a specific
+        // run of text, so the deepest Text descendant is the closest correct
+        // primitive (see CaretPosition in the web module for the scope note).
+        function firstTextDescendant(root) {
+          for (const child of root.childNodes) {
+            if (child.nodeType === TEXT_NODE) return child;
+            const found = firstTextDescendant(child);
+            if (found) return found;
+          }
+          return null;
+        }
+
         class Document extends Node {
           constructor(id) {
             // The Document() constructor ("new Document()" from page script):
@@ -5021,12 +5035,29 @@
           createRange() { return new Range(this); }
           getSelection() { return selection; }
           hasFocus() { return true; }
-          // No coordinate-based hit-testing (PageCore has no visual hit region
-          // model), but the API must exist: it is a baseline method many libraries
-          // call without feature-detecting it. Returning null is a spec-legitimate
-          // result ("no element at the point") and never a wrong element.
-          elementFromPoint() { return null; }
-          elementsFromPoint() { return []; }
+          // Real hit-testing: litehtml's own get_element_by_point() (used
+          // internally for :hover/click support) walks the render tree in
+          // topmost-painted-first order, so the bridge result is already in the
+          // right order for elementsFromPoint. PageCore has no scroll model
+          // (scrollX/scrollY are hardcoded 0), so x, y need no adjustment before
+          // crossing the bridge -- see LayoutEngine::elements_at_point.
+          elementFromPoint(x, y) {
+            const ids = bridge.elementsAtPoint(Number(x), Number(y), true);
+            return ids.length ? wrapNode(ids[0]) : null;
+          }
+          elementsFromPoint(x, y) {
+            return bridge.elementsAtPoint(Number(x), Number(y), false).map((id) => wrapNode(id)).filter(Boolean);
+          }
+          // Reduced scope (see CaretPosition, web module): identifies the right
+          // element via the same hit-test, but offset is always 0 -- no
+          // glyph-precise character offset.
+          caretPositionFromPoint(x, y) {
+            const ids = bridge.elementsAtPoint(Number(x), Number(y), true);
+            if (!ids.length) return null;
+            const element = wrapNode(ids[0]);
+            if (!element) return null;
+            return new CaretPosition(firstTextDescendant(element) || element, 0);
+          }
           adoptNode(node) { return node; }
           importNode(node, deep = false) { return node.cloneNode ? node.cloneNode(Boolean(deep)) : node; }
           open() { return documentOpen(this); }
@@ -5189,6 +5220,10 @@
           createRange() { return document.createRange(); }
           getSelection() { return selection; }
           hasFocus() { return false; }
+          // Unlike the real Document, this genuinely cannot hit-test: a detached
+          // document (createHTMLDocument()/importNode() targets, etc.) is never
+          // laid out or painted, so there is no render tree for a point to hit
+          // against. Returning null/[] is the correct answer here, not a stub.
           elementFromPoint() { return null; }
           elementsFromPoint() { return []; }
           adoptNode(node) { return node; }
