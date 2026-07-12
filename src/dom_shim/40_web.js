@@ -293,12 +293,207 @@
 
         const selection = new Selection();
 
-        function encodeFormComponent(value) {
-          return encodeURIComponent(String(value)).replace(/%20/g, '+');
+        // WebIDL USVString conversion: a lone surrogate cannot round-trip through
+        // UTF-8, so it is replaced with U+FFFD wherever a spec algorithm treats a
+        // value as USVString (URLSearchParams names/values, record keys/values).
+        function toUSVString(value) {
+          const str = String(value);
+          let result = '';
+          for (let i = 0; i < str.length; i++) {
+            const code = str.charCodeAt(i);
+            if (code >= 0xd800 && code <= 0xdbff) {
+              const next = str.charCodeAt(i + 1);
+              if (next >= 0xdc00 && next <= 0xdfff) {
+                result += str[i] + str[i + 1];
+                i++;
+              } else {
+                result += '\uFFFD';
+              }
+            } else if (code >= 0xdc00 && code <= 0xdfff) {
+              result += '\uFFFD';
+            } else {
+              result += str[i];
+            }
+          }
+          return result;
         }
 
-        function decodeFormComponent(value) {
-          return decodeURIComponent(String(value).replace(/\+/g, ' '));
+        function usv(value) { return toUSVString(value); }
+
+        function utf8EncodeScalar(text) {
+          const bytes = [];
+          for (const char of toUSVString(text)) {
+            const code = char.codePointAt(0);
+            if (code <= 0x7f) {
+              bytes.push(code);
+            } else if (code <= 0x7ff) {
+              bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+            } else if (code <= 0xffff) {
+              bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+            } else {
+              bytes.push(
+                0xf0 | (code >> 18),
+                0x80 | ((code >> 12) & 0x3f),
+                0x80 | ((code >> 6) & 0x3f),
+                0x80 | (code & 0x3f)
+              );
+            }
+          }
+          return new Uint8Array(bytes);
+        }
+
+        // WHATWG Encoding Standard "UTF-8 decoder": a malformed or incomplete
+        // sequence yields one U+FFFD, and a continuation byte that turns out to
+        // be invalid is re-examined as a fresh lead byte rather than consumed.
+        function utf8DecodeReplacement(bytes, { fatal = false } = {}) {
+          let out = '';
+          let codePoint = 0;
+          let bytesSeen = 0;
+          let bytesNeeded = 0;
+          let lowerBoundary = 0x80;
+          let upperBoundary = 0xbf;
+          for (let i = 0; i < bytes.length; i++) {
+            const byte = bytes[i];
+            if (bytesNeeded === 0) {
+              if (byte <= 0x7f) {
+                out += String.fromCharCode(byte);
+              } else if (byte >= 0xc2 && byte <= 0xdf) {
+                bytesNeeded = 1;
+                codePoint = byte & 0x1f;
+              } else if (byte >= 0xe0 && byte <= 0xef) {
+                if (byte === 0xe0) lowerBoundary = 0xa0;
+                else if (byte === 0xed) upperBoundary = 0x9f;
+                bytesNeeded = 2;
+                codePoint = byte & 0x0f;
+              } else if (byte >= 0xf0 && byte <= 0xf4) {
+                if (byte === 0xf0) lowerBoundary = 0x90;
+                else if (byte === 0xf4) upperBoundary = 0x8f;
+                bytesNeeded = 3;
+                codePoint = byte & 0x07;
+              } else {
+                if (fatal) throw new TypeError('Invalid UTF-8 data');
+                out += '\uFFFD';
+              }
+              continue;
+            }
+            if (byte < lowerBoundary || byte > upperBoundary) {
+              codePoint = 0;
+              bytesNeeded = 0;
+              bytesSeen = 0;
+              lowerBoundary = 0x80;
+              upperBoundary = 0xbf;
+              if (fatal) throw new TypeError('Invalid UTF-8 data');
+              out += '\uFFFD';
+              i--;
+              continue;
+            }
+            lowerBoundary = 0x80;
+            upperBoundary = 0xbf;
+            codePoint = (codePoint << 6) | (byte & 0x3f);
+            bytesSeen++;
+            if (bytesSeen !== bytesNeeded) continue;
+            out += String.fromCodePoint(codePoint);
+            codePoint = 0;
+            bytesNeeded = 0;
+            bytesSeen = 0;
+          }
+          if (bytesNeeded !== 0) {
+            if (fatal) throw new TypeError('Invalid UTF-8 data');
+            out += '\uFFFD';
+          }
+          return out;
+        }
+
+        function isHexDigitByte(byte) {
+          return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66);
+        }
+        function hexByteValue(byte) {
+          if (byte <= 0x39) return byte - 0x30;
+          if (byte <= 0x46) return byte - 0x41 + 10;
+          return byte - 0x61 + 10;
+        }
+        // Spec "percent-decode": only a well-formed "%XX" is consumed; a lone
+        // '%' not followed by two hex digits passes through unchanged instead of
+        // throwing, unlike decodeURIComponent.
+        function percentDecodeBytes(bytes) {
+          const out = [];
+          for (let i = 0; i < bytes.length; i++) {
+            const byte = bytes[i];
+            if (byte === 0x25 && i + 2 < bytes.length && isHexDigitByte(bytes[i + 1]) && isHexDigitByte(bytes[i + 2])) {
+              out.push((hexByteValue(bytes[i + 1]) << 4) | hexByteValue(bytes[i + 2]));
+              i += 2;
+            } else {
+              out.push(byte);
+            }
+          }
+          return new Uint8Array(out);
+        }
+
+        function replacePlusWithSpace(bytes) {
+          const out = new Uint8Array(bytes.length);
+          for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] === 0x2b ? 0x20 : bytes[i];
+          return out;
+        }
+
+        function isFormUrlencodedSafeByte(byte) {
+          return (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a)
+            || byte === 0x2a || byte === 0x2d || byte === 0x2e || byte === 0x5f;
+        }
+
+        function encodeFormComponent(value) {
+          const bytes = utf8EncodeScalar(value);
+          let out = '';
+          for (const byte of bytes) {
+            if (byte === 0x20) out += '+';
+            else if (isFormUrlencodedSafeByte(byte)) out += String.fromCharCode(byte);
+            else out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+          }
+          return out;
+        }
+
+        // Spec "application/x-www-form-urlencoded parser": works on bytes so a
+        // malformed percent-escape or invalid UTF-8 byte never throws — it
+        // degrades to a literal '%' or a U+FFFD, per spec.
+        function parseUrlencodedPairs(input) {
+          const bytes = utf8EncodeScalar(input);
+          const sequences = [];
+          let start = 0;
+          for (let i = 0; i <= bytes.length; i++) {
+            if (i === bytes.length || bytes[i] === 0x26) {
+              sequences.push(bytes.subarray(start, i));
+              start = i + 1;
+            }
+          }
+          const output = [];
+          for (const seq of sequences) {
+            if (seq.length === 0) continue;
+            let eq = -1;
+            for (let i = 0; i < seq.length; i++) {
+              if (seq[i] === 0x3d) { eq = i; break; }
+            }
+            const nameBytes = eq < 0 ? seq : seq.subarray(0, eq);
+            const valueBytes = eq < 0 ? new Uint8Array(0) : seq.subarray(eq + 1);
+            const name = utf8DecodeReplacement(percentDecodeBytes(replacePlusWithSpace(nameBytes)));
+            const value = utf8DecodeReplacement(percentDecodeBytes(replacePlusWithSpace(valueBytes)));
+            output.push([name, value]);
+          }
+          return output;
+        }
+
+        // Same live-list semantics as forEach(): mutating the list mid-iteration
+        // (e.g. delete()) shifts later entries, and the walk must observe that
+        // rather than iterating a snapshot taken at call time.
+        function urlSearchParamsIterator(target, mapEntry) {
+          let index = 0;
+          return {
+            [Symbol.iterator]() { return this; },
+            next() {
+              if (index >= target._entries.length) return { value: undefined, done: true };
+              const entry = target._entries[index];
+              index += 1;
+              return { value: mapEntry(entry), done: false };
+            }
+          };
         }
 
         class URLSearchParams {
@@ -308,50 +503,70 @@
             // its search/href in sync with a live searchParams object.
             this._onChange = null;
             if (init == null) return;
-            if (init instanceof URLSearchParams) {
-              this._entries = init._entries.map((entry) => [entry[0], entry[1]]);
-            } else if (typeof init === 'string') {
+            // WebIDL's Type(V) is "Object" for both plain objects and callable
+            // objects (functions); `typeof` alone would misroute a function
+            // (e.g. `new URLSearchParams(DOMException)`) into the USVString
+            // fallback below, stringifying its source text instead of reading
+            // its own enumerable properties as a record.
+            const isObjectLike = (typeof init === 'object' && init !== null) || typeof init === 'function';
+            if (typeof init === 'string') {
               const query = init.startsWith('?') ? init.slice(1) : init;
-              if (!query) return;
-              for (const part of query.split('&')) {
-                if (!part) continue;
-                const index = part.indexOf('=');
-                if (index < 0) this.append(decodeFormComponent(part), '');
-                else this.append(decodeFormComponent(part.slice(0, index)), decodeFormComponent(part.slice(index + 1)));
-              }
-            } else if (typeof init[Symbol.iterator] === 'function') {
+              this._entries = parseUrlencodedPairs(query);
+            } else if (isObjectLike && typeof init[Symbol.iterator] === 'function') {
+              // Deliberately not special-cased for `init instanceof
+              // URLSearchParams`: a page can override `init[Symbol.iterator]`,
+              // and per spec that override must be honored, not bypassed by a
+              // fast path that reads _entries directly.
               for (const pair of init) {
-                if (!pair || pair.length < 2) throw new TypeError('URLSearchParams entry must be a pair');
-                this.append(pair[0], pair[1]);
+                if (pair == null || typeof pair[Symbol.iterator] !== 'function') {
+                  throw new TypeError('URLSearchParams entry must be an iterable pair');
+                }
+                const items = [...pair];
+                if (items.length !== 2) throw new TypeError('URLSearchParams entry must be a pair of length 2');
+                this.append(items[0], items[1]);
               }
-            } else if (typeof init === 'object') {
-              for (const key of Object.keys(init)) this.append(key, init[key]);
+            } else if (isObjectLike) {
+              // record<USVString, USVString>: duplicate keys (including two keys
+              // that only collide after USVString conversion) collapse to their
+              // last value but keep their first position, like Map#set.
+              const map = new Map();
+              for (const key of Object.keys(init)) map.set(usv(key), usv(init[key]));
+              this._entries = [...map.entries()];
+            } else {
+              this._entries = parseUrlencodedPairs(String(init));
             }
           }
 
           _notify() { if (typeof this._onChange === 'function') this._onChange(this.toString()); }
-          append(name, value) { this._entries.push([String(name), String(value)]); this._notify(); }
-          delete(name) {
-            name = String(name);
-            this._entries = this._entries.filter((entry) => entry[0] !== name);
+          append(name, value) { this._entries.push([usv(name), usv(value)]); this._notify(); }
+          delete(name, value = undefined) {
+            name = usv(name);
+            if (value === undefined) {
+              this._entries = this._entries.filter((entry) => entry[0] !== name);
+            } else {
+              value = usv(value);
+              this._entries = this._entries.filter((entry) => !(entry[0] === name && entry[1] === value));
+            }
             this._notify();
           }
           get(name) {
-            name = String(name);
+            name = usv(name);
             const found = this._entries.find((entry) => entry[0] === name);
             return found ? found[1] : null;
           }
           getAll(name) {
-            name = String(name);
+            name = usv(name);
             return this._entries.filter((entry) => entry[0] === name).map((entry) => entry[1]);
           }
-          has(name) {
-            name = String(name);
-            return this._entries.some((entry) => entry[0] === name);
+          has(name, value = undefined) {
+            name = usv(name);
+            if (value === undefined) return this._entries.some((entry) => entry[0] === name);
+            value = usv(value);
+            return this._entries.some((entry) => entry[0] === name && entry[1] === value);
           }
           set(name, value) {
-            name = String(name);
-            value = String(value);
+            name = usv(name);
+            value = usv(value);
             let replaced = false;
             const out = [];
             for (const entry of this._entries) {
@@ -375,11 +590,16 @@
             this._notify();
           }
           forEach(callback, thisArg = undefined) {
-            for (const [name, value] of this._entries) callback.call(thisArg, value, name, this);
+            let index = 0;
+            while (index < this._entries.length) {
+              const entry = this._entries[index];
+              index += 1;
+              callback.call(thisArg, entry[1], entry[0], this);
+            }
           }
-          keys() { return this._entries.map((entry) => entry[0])[Symbol.iterator](); }
-          values() { return this._entries.map((entry) => entry[1])[Symbol.iterator](); }
-          entries() { return this._entries.map((entry) => [entry[0], entry[1]])[Symbol.iterator](); }
+          keys() { return urlSearchParamsIterator(this, (entry) => entry[0]); }
+          values() { return urlSearchParamsIterator(this, (entry) => entry[1]); }
+          entries() { return urlSearchParamsIterator(this, (entry) => [entry[0], entry[1]]); }
           get size() { return this._entries.length; }
           toString() {
             return this._entries.map(([name, value]) => `${encodeFormComponent(name)}=${encodeFormComponent(value)}`).join('&');
@@ -460,7 +680,7 @@
               : '';
             return `${parts.protocol}//${credentials}${this.host}${this.pathname}${this.search}${this.hash}`;
           }
-          set href(value) { this._parts = parseURL(value); this._searchParams = null; }
+          set href(value) { this._parts = parseURL(value); this._syncSearchParams(); }
           get origin() { return `${this.protocol}//${this.host}`; }
           get protocol() { return this._parts.protocol; }
           set protocol(value) { this._parts.protocol = String(value).replace(/:?$/, ':').toLowerCase(); }
@@ -485,7 +705,7 @@
           set search(value) {
             const text = String(value);
             this._parts.search = text && !text.startsWith('?') ? `?${text}` : text;
-            this._searchParams = null;
+            this._syncSearchParams();
           }
           get hash() { return this._parts.hash; }
           set hash(value) {
@@ -502,6 +722,14 @@
             }
             return this._searchParams;
           }
+          // Replaces the existing searchParams object's entries in place so its
+          // identity (and any live for-of iterator over it) survives a `search`
+          // or `href` assignment, instead of detaching it via reassignment.
+          _syncSearchParams() {
+            if (!this._searchParams) return;
+            const query = this.search.startsWith('?') ? this.search.slice(1) : this.search;
+            this._searchParams._entries = parseUrlencodedPairs(query);
+          }
           toString() { return this.href; }
           toJSON() { return this.href; }
           static canParse(url, base = undefined) {
@@ -516,25 +744,7 @@
           get encoding() { return 'utf-8'; }
 
           encode(input = '') {
-            const bytes = [];
-            for (const char of String(input)) {
-              const code = char.codePointAt(0);
-              if (code <= 0x7f) {
-                bytes.push(code);
-              } else if (code <= 0x7ff) {
-                bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-              } else if (code <= 0xffff) {
-                bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-              } else {
-                bytes.push(
-                  0xf0 | (code >> 18),
-                  0x80 | ((code >> 12) & 0x3f),
-                  0x80 | ((code >> 6) & 0x3f),
-                  0x80 | (code & 0x3f)
-                );
-              }
-            }
-            return new Uint8Array(bytes);
+            return utf8EncodeScalar(String(input));
           }
 
           encodeInto(source, destination) {
@@ -571,43 +781,7 @@
                 : input instanceof ArrayBuffer
                   ? new Uint8Array(input)
                   : new Uint8Array();
-            let out = '';
-            for (let index = 0; index < bytes.length;) {
-              const first = bytes[index++];
-              let code = first;
-              let needed = 0;
-              if (first >= 0xf0) {
-                code = first & 0x07;
-                needed = 3;
-              } else if (first >= 0xe0) {
-                code = first & 0x0f;
-                needed = 2;
-              } else if (first >= 0xc0) {
-                code = first & 0x1f;
-                needed = 1;
-              } else if (first >= 0x80) {
-                if (this.fatal) throw new TypeError('Invalid UTF-8 data');
-                out += '\uFFFD';
-                continue;
-              }
-
-              let valid = true;
-              for (let offset = 0; offset < needed; offset++) {
-                const next = bytes[index++];
-                if ((next & 0xc0) !== 0x80) {
-                  valid = false;
-                  break;
-                }
-                code = (code << 6) | (next & 0x3f);
-              }
-              if (!valid) {
-                if (this.fatal) throw new TypeError('Invalid UTF-8 data');
-                out += '\uFFFD';
-              } else {
-                out += String.fromCodePoint(code);
-              }
-            }
-            return out;
+            return utf8DecodeReplacement(bytes, { fatal: this.fatal });
           }
         }
 

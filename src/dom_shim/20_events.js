@@ -44,8 +44,12 @@
           }
         }
 
+        // Non-enumerable: this lookup-by-name convenience is PageCore's own, not
+        // a spec member, and an enumerable copy leaks into WebIDL record/sequence
+        // conversions (e.g. `new URLSearchParams(DOMException)`), which must see
+        // only the real legacy `*_ERR` constants below.
         for (const [name, code] of Object.entries(DOM_EXCEPTION_CODES)) {
-          defineValue(DOMException, `${name}_CODE`, code, true);
+          defineValue(DOMException, `${name}_CODE`, code, false);
         }
         for (const [name, code] of Object.entries(DOM_EXCEPTION_LEGACY_CONSTANTS)) {
           defineValue(DOMException, name, code, true);

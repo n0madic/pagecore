@@ -2391,6 +2391,90 @@ void test_dom_interface_globals()
         "DOM interface globals should be installed and createEvent should reject unmodelled interfaces");
 }
 
+void test_url_search_params_robustness()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <script>
+    const checks = [];
+
+    // The application/x-www-form-urlencoded parser works on bytes and must
+    // never throw, unlike decodeURIComponent: a lone '%' or a truncated
+    // percent-escape degrades to a literal '%' or U+FFFD instead of failing.
+    checks.push(new URLSearchParams('b=%2sf%2a').toString() === 'b=%252sf*');
+    checks.push(new URLSearchParams('b=%%2a').toString() === 'b=%25*');
+    checks.push(new URLSearchParams('value=%C2').get('value') === '�');
+
+    // USVString conversion: a lone surrogate cannot round-trip through UTF-8,
+    // so both names and values replace it with U+FFFD.
+    const surrogateParams = new URLSearchParams();
+    surrogateParams.append('a\uD83Db', 'c');
+    checks.push(surrogateParams.toString() === 'a%EF%BF%BDb=c');
+
+    // Two-argument has()/delete(): the value filter is optional, and passing
+    // undefined explicitly must behave as if it were omitted.
+    const twoArg = new URLSearchParams('a=b&a=d');
+    checks.push(twoArg.has('a', 'b') === true);
+    checks.push(twoArg.has('a', 'c') === false);
+    checks.push(twoArg.has('a', undefined) === true);
+    twoArg.delete('a', 'b');
+    checks.push(twoArg.toString() === 'a=d');
+
+    // record<USVString, USVString> conversion: keys that only collide after
+    // USVString conversion collapse to their last value but keep their first
+    // position, matching Map#set semantics.
+    const collidingKeys = new URLSearchParams({ '\uD835x': '1', xx: '2', '\uD83Dx': '3' });
+    checks.push(collidingKeys.toString() === encodeURIComponent('�x') + '=3&xx=2');
+
+    // A JS function is still an Object per WebIDL Type(V), so it must be read
+    // as a record (own enumerable properties), not stringified via its source
+    // text through the USVString fallback.
+    function Tagged() {}
+    Tagged.a = '1';
+    Tagged.b = '2';
+    checks.push(new URLSearchParams(Tagged).toString() === 'a=1&b=2');
+
+    // A page can override an existing URLSearchParams instance's iterator;
+    // the constructor must honor that override rather than special-casing
+    // `instanceof URLSearchParams` and reading _entries directly.
+    const overridden = new URLSearchParams();
+    overridden[Symbol.iterator] = function* () { yield ['a', 'b']; };
+    checks.push(new URLSearchParams(overridden).get('a') === 'b');
+
+    // Live, index-based iteration: deleting the current entry mid-iteration
+    // shifts the next one into the just-visited slot, so it must be skipped
+    // rather than re-visited.
+    const url = new URL('http://localhost/query?param0=0&param1=1&param2=2');
+    const seen = [];
+    for (const param of url.searchParams) {
+      if (param[0] === 'param0') url.searchParams.delete('param0');
+      else seen.push(param[0]);
+    }
+    checks.push(seen.length === 1 && seen[0] === 'param2');
+
+    // Assigning url.search must update the existing searchParams object in
+    // place (same identity), so a live for-of iterator over it observes the
+    // new entries instead of iterating a detached snapshot.
+    const identityUrl = new URL('http://a.b/c?a=1&b=2&c=3&d=4');
+    const liveParams = identityUrl.searchParams;
+    const collected = [];
+    for (const entry of liveParams) {
+      identityUrl.search = 'x=1&y=2&z=3';
+      collected.push(entry[0]);
+    }
+    checks.push(collected.join(',') === 'a,y,z');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/urlsearchparams-robustness.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "URLSearchParams should parse/serialize losslessly and iterate live over its backing list");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -12769,6 +12853,7 @@ int main()
         test_idl_attribute_reflection();
         test_live_collections();
         test_dom_interface_globals();
+        test_url_search_params_robustness();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();
