@@ -54,6 +54,8 @@
         Text,
         Comment,
         DocumentType,
+        ProcessingInstruction,
+        CDATASection,
         NodeList,
         HTMLCollection,
         DOMStringMap,
@@ -262,6 +264,8 @@
         global.Text = Text;
         global.Comment = Comment;
         global.DocumentType = DocumentType;
+        global.ProcessingInstruction = ProcessingInstruction;
+        global.CDATASection = CDATASection;
         global.NodeList = NodeList;
         global.HTMLCollection = HTMLCollection;
         global.Attr = Attr;

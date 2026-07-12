@@ -5,6 +5,7 @@
 #include <lexbor/dom/interfaces/attr.h>
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/comment.h>
+#include <lexbor/dom/interfaces/document_type.h>
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/dom/interfaces/node.h>
 #include <lexbor/dom/interfaces/text.h>
@@ -46,7 +47,8 @@ bool is_character_data(lxb_dom_node_t* node)
     return node != nullptr
         && (node->type == LXB_DOM_NODE_TYPE_TEXT
             || node->type == LXB_DOM_NODE_TYPE_COMMENT
-            || node->type == LXB_DOM_NODE_TYPE_CDATA_SECTION);
+            || node->type == LXB_DOM_NODE_TYPE_CDATA_SECTION
+            || node->type == LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION);
 }
 
 bool is_text_content_descendant(lxb_dom_node_t* node)
@@ -1173,6 +1175,75 @@ NodeId DomDocument::create_comment(std::string_view text)
     }
 
     return impl_->id_for(lxb_dom_interface_node(node));
+}
+
+NodeId DomDocument::create_processing_instruction(std::string_view target, std::string_view data)
+{
+    impl_->note_created_nodes(1);
+    auto* node = lxb_dom_document_create_processing_instruction(
+        &impl_->document->dom_document,
+        reinterpret_cast<const lxb_char_t*>(target.data()), target.size(),
+        reinterpret_cast<const lxb_char_t*>(data.data()), data.size());
+
+    if (node == nullptr) {
+        return 0;
+    }
+
+    return impl_->id_for(lxb_dom_interface_node(node));
+}
+
+NodeId DomDocument::create_cdata_section(std::string_view text)
+{
+    impl_->note_created_nodes(1);
+    auto* node = lxb_dom_document_create_cdata_section(
+        &impl_->document->dom_document,
+        reinterpret_cast<const lxb_char_t*>(text.data()),
+        text.size());
+
+    if (node == nullptr) {
+        return 0;
+    }
+
+    return impl_->id_for(lxb_dom_interface_node(node));
+}
+
+NodeId DomDocument::create_document_type(std::string_view name, std::string_view public_id, std::string_view system_id)
+{
+    impl_->note_created_nodes(1);
+    auto* node = lxb_dom_document_type_create(
+        &impl_->document->dom_document,
+        reinterpret_cast<const lxb_char_t*>(name.data()), name.size(),
+        reinterpret_cast<const lxb_char_t*>(public_id.data()), public_id.size(),
+        reinterpret_cast<const lxb_char_t*>(system_id.data()), system_id.size(),
+        nullptr);
+
+    if (node == nullptr) {
+        return 0;
+    }
+
+    return impl_->id_for(lxb_dom_interface_node(node));
+}
+
+std::string DomDocument::doctype_public_id(NodeId id) const
+{
+    auto* node = impl_->require_node(id);
+    if (node->type != LXB_DOM_NODE_TYPE_DOCUMENT_TYPE) {
+        return {};
+    }
+    size_t len = 0;
+    const auto* value = lxb_dom_document_type_public_id(lxb_dom_interface_document_type(node), &len);
+    return to_string(value, len);
+}
+
+std::string DomDocument::doctype_system_id(NodeId id) const
+{
+    auto* node = impl_->require_node(id);
+    if (node->type != LXB_DOM_NODE_TYPE_DOCUMENT_TYPE) {
+        return {};
+    }
+    size_t len = 0;
+    const auto* value = lxb_dom_document_type_system_id(lxb_dom_interface_document_type(node), &len);
+    return to_string(value, len);
 }
 
 NodeId DomDocument::attach_shadow_root(NodeId host)

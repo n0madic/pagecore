@@ -705,6 +705,60 @@
           performMove(parent, node, child);
         }
 
+        // ---- XML Name / QName validation (DOMImplementation.createDocumentType() /
+        // createDocument()) -------------------------------------------------------
+        // Ported verbatim from the xml-name-validator regexes (the same ones jsdom
+        // uses) rather than hand-derived, since the Unicode NameStartChar/NameChar
+        // range list (XML 1.0 5th ed., https://www.w3.org/TR/xml/#NT-Name) is easy
+        // to get subtly wrong by hand.
+        const NAME_RE = /^[:A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}][:A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}\-.0-9·̀-ͯ‿-⁀]*$/u;
+        const QNAME_RE = /(?:^[A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}][A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}\-.0-9·̀-ͯ‿-⁀]*:[A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}][A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}\-.0-9·̀-ͯ‿-⁀]*$)|(?:^[A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}][A-Z_a-zÀ-ÖØ-öø-˿Ͱ-ͽͿ-῿‌-‍⁰-↏Ⰰ-⿯、-퟿豈-﷏ﷰ-�\u{10000}-\u{EFFFF}\-.0-9·̀-ͯ‿-⁀]*$)/u;
+        const XML_NAMESPACE = 'http://www.w3.org/XML/1998/namespace';
+        const XMLNS_NAMESPACE = 'http://www.w3.org/2000/xmlns/';
+
+        function validateName(name) {
+          if (!NAME_RE.test(name)) {
+            throw new DOMException(`'${name}' did not match the Name production.`, 'InvalidCharacterError');
+          }
+        }
+
+        // https://dom.spec.whatwg.org/#validate -- Name production failure is
+        // InvalidCharacterError, QName production failure is NamespaceError.
+        function validateQualifiedName(qualifiedName) {
+          validateName(qualifiedName);
+          if (!QNAME_RE.test(qualifiedName)) {
+            throw new DOMException(`'${qualifiedName}' did not match the QName production.`, 'NamespaceError');
+          }
+        }
+
+        // https://dom.spec.whatwg.org/#validate-and-extract -- used by
+        // DOMImplementation.createDocument() for its own qualifiedName argument
+        // (the equivalent step createElementNS() would run, were it validated).
+        function validateAndExtractQualifiedName(namespace, qualifiedName) {
+          namespace = namespace === '' ? null : namespace;
+          validateQualifiedName(qualifiedName);
+          let prefix = null;
+          let localName = qualifiedName;
+          const colonIndex = qualifiedName.indexOf(':');
+          if (colonIndex !== -1) {
+            prefix = qualifiedName.slice(0, colonIndex);
+            localName = qualifiedName.slice(colonIndex + 1);
+          }
+          if (prefix !== null && namespace === null) {
+            throw new DOMException('A namespace was given but a prefix was also extracted from the qualifiedName.', 'NamespaceError');
+          }
+          if (prefix === 'xml' && namespace !== XML_NAMESPACE) {
+            throw new DOMException('A prefix of "xml" was given but the namespace was not the XML namespace.', 'NamespaceError');
+          }
+          if ((qualifiedName === 'xmlns' || prefix === 'xmlns') && namespace !== XMLNS_NAMESPACE) {
+            throw new DOMException('A prefix or qualifiedName of "xmlns" was given but the namespace was not the XMLNS namespace.', 'NamespaceError');
+          }
+          if (namespace === XMLNS_NAMESPACE && qualifiedName !== 'xmlns' && prefix !== 'xmlns') {
+            throw new DOMException('The XMLNS namespace was given but neither the prefix nor qualifiedName was "xmlns".', 'NamespaceError');
+          }
+          return { namespace, prefix, localName };
+        }
+
         class Node extends EventTarget {
           constructor(id) {
             super();
@@ -1194,16 +1248,43 @@
           }
         }
 
-        // Only materialized for a doctype already present in the parsed tree
-        // (e.g. `<!DOCTYPE html>`) -- there is no bridge call to construct a
-        // detached one (DOMImplementation.createDocumentType()), so publicId/
-        // systemId are not wired to Lexbor's parsed values yet and read as ''.
-        // name/nodeType/parentNode/isConnected are all correct, being bridge-
-        // driven like every other Node subtype.
+        // interface ProcessingInstruction : CharacterData -- no constructor per
+        // spec (only Document.createProcessingInstruction() makes one), target
+        // is read-only and needs no dedicated bridge accessor: Lexbor's generic
+        // node-name lookup already returns a PI's target for
+        // LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION.
+        class ProcessingInstruction extends CharacterData {
+          constructor(data, internalId) {
+            if (data === INTERNAL_NODE_ID) {
+              super(internalId);
+              return;
+            }
+            throw new TypeError('Illegal constructor');
+          }
+
+          get target() { return this.nodeName; }
+        }
+
+        // interface CDATASection : Text -- no constructor per spec (only an XML
+        // document's createCDATASection() makes one); otherwise identical to Text.
+        class CDATASection extends Text {
+          constructor(data, internalId) {
+            if (data === INTERNAL_NODE_ID) {
+              super(data, internalId);
+              return;
+            }
+            throw new TypeError('Illegal constructor');
+          }
+        }
+
+        // Materialized both for a doctype already present in the parsed tree
+        // (e.g. `<!DOCTYPE html>`) and for one built via
+        // DOMImplementation.createDocumentType() -- name/publicId/systemId are
+        // all bridge-driven now that a native creation path exists.
         class DocumentType extends Node {
           get name() { return this.nodeName; }
-          get publicId() { return ''; }
-          get systemId() { return ''; }
+          get publicId() { return bridge.doctypePublicId(this._liveId()); }
+          get systemId() { return bridge.doctypeSystemId(this._liveId()); }
         }
 
         // The two failure modes are distinct DOMExceptions: an empty token is a
@@ -4773,7 +4854,50 @@
           }
         }
 
+        // Shared by every document-like createProcessingInstruction(): unlike
+        // createCDATASection(), this one is not gated on "is this an HTML
+        // document" -- HTML documents may hold PI nodes via script even though
+        // HTML source syntax never parses one.
+        function createProcessingInstructionNode(target, data) {
+          target = String(target);
+          data = String(data ?? '');
+          validateName(target);
+          if (data.includes('?>')) {
+            throw new DOMException('The data cannot contain the string "?>".', 'InvalidCharacterError');
+          }
+          return wrapNode(bridge.createProcessingInstruction(target, data));
+        }
+
+        // Shared by XMLDocument's createCDATASection(); HTML documents
+        // (Document, DetachedHTMLDocument) never call this -- they throw
+        // NotSupportedError instead, per spec.
+        function createCDATASectionNode(data) {
+          data = String(data ?? '');
+          if (data.includes(']]>')) {
+            throw new DOMException('The data cannot contain the string "]]>".', 'InvalidCharacterError');
+          }
+          return wrapNode(bridge.createCDATASection(data));
+        }
+
         class Document extends Node {
+          constructor(id) {
+            // The Document() constructor ("new Document()" from page script):
+            // "Return a new document that is an XML document." PageCore parses
+            // exactly one physical (HTML) document, so -- like
+            // DOMImplementation.createDocument() below, which this delegates
+            // to -- a second document can only be simulated as a JS-only
+            // XMLDocument container. Known gap: `new Document() instanceof
+            // Document` is therefore false (it is only `instanceof
+            // XMLDocument`), the same category of compromise as
+            // DetachedHTMLDocument not being `instanceof Document` either.
+            // materializeNode() always passes a numeric id, so this branch is
+            // unreachable from internal construction.
+            if (id === undefined) {
+              return domImplementation.createDocument(null, '');
+            }
+            super(id);
+          }
+
           get documentElement() { return wrapNode(bridge.documentElement()); }
           get head() { return wrapNode(bridge.head()); }
           get body() { return wrapNode(bridge.body()); }
@@ -4856,6 +4980,12 @@
           }
           createTextNode(text) { return wrapNode(bridge.createTextNode(String(text ?? ''))); }
           createComment(text) { return wrapNode(bridge.createComment(String(text ?? ''))); }
+          createProcessingInstruction(target, data) { return createProcessingInstructionNode(target, data); }
+          // This document is always an HTML document (PageCore parses no other
+          // kind), so this always throws -- only an XMLDocument may hold CDATA.
+          createCDATASection() {
+            throw new DOMException('This document is an HTML document.', 'NotSupportedError');
+          }
           createDocumentFragment() { return new DocumentFragment(); }
           getElementById(id) { return wrapNode(bridge.getElementById(String(id))); }
           querySelector(selector) { return querySelectorCompat(this, selector); }
@@ -4981,6 +5111,12 @@
           createElementNS(namespaceURI, qualifiedName) { return document.createElementNS(namespaceURI, qualifiedName); }
           createTextNode(text) { return document.createTextNode(text); }
           createComment(text) { return document.createComment(text); }
+          createProcessingInstruction(target, data) { return createProcessingInstructionNode(target, data); }
+          // Also an HTML document, so this always throws -- only an
+          // XMLDocument (DOMImplementation.createDocument()) may hold CDATA.
+          createCDATASection() {
+            throw new DOMException('This document is an HTML document.', 'NotSupportedError');
+          }
           createDocumentFragment() { return new DocumentFragment(); }
           createEvent(type) { return document.createEvent(type); }
           createTreeWalker(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
@@ -5031,17 +5167,153 @@
           }
         }
 
-        // PageCore has a single, HTML-parsed document, so Document and
-        // HTMLDocument are the same class (see the Symbol.toStringTag override
-        // below, which keeps the real document reporting "[object HTMLDocument]").
-        // XMLDocument still needs to exist and be distinct: WPT checks that a
-        // DOMParser-produced document is *not* an XMLDocument, which is only a
-        // meaningful assertion if the interface is installed.
-        class XMLDocument extends Document {}
+        // PageCore has a single, HTML-parsed document, so the real `document`
+        // reports "[object HTMLDocument]" (see the Symbol.toStringTag override
+        // below) rather than being an instance of this class. XMLDocument is
+        // what DOMImplementation.createDocument() (and the bare `new
+        // Document()` constructor above) actually returns.
+        //
+        // Like DetachedHTMLDocument, this is a JS-only container -- PageCore
+        // has exactly one physical Lexbor document, so a second one can only
+        // be simulated at the JS level: createElement/createTextNode/etc. are
+        // real bridge-backed nodes borrowed from the singleton document, just
+        // never linked into its tree, and childNodes here is a plain array
+        // (not bridge-driven) using the same `__fragmentParent` escape hatch
+        // DocumentFragment uses to let a bridge-backed child report a non-
+        // bridge JS parent. A consequence of not being `instanceof Document`:
+        // `xmlDoc.createElement(...).ownerDocument` still returns the real
+        // singleton `document`, not `xmlDoc` (Node.prototype.ownerDocument is
+        // hardwired to it) -- the same pre-existing gap DetachedHTMLDocument
+        // already has.
+        class XMLDocument extends EventTarget {
+          constructor(contentType = 'application/xml') {
+            super();
+            this.nodeType = DOCUMENT_NODE;
+            this.nodeName = '#document';
+            this.childNodes = [];
+            this.readyState = 'complete';
+            this.characterSet = 'UTF-8';
+            this.charset = 'UTF-8';
+            this.contentType = contentType;
+            this.compatMode = 'CSS1Compat';
+            this.implementation = domImplementation;
+            this.location = null;
+            this.defaultView = null;
+          }
+
+          get doctype() { return this.childNodes.find((node) => node.nodeType === DOCUMENT_TYPE_NODE) || null; }
+          get documentElement() { return this.childNodes.find((node) => node.nodeType === ELEMENT_NODE) || null; }
+          get firstChild() { return this.childNodes[0] || null; }
+          get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+          get children() { return this.childNodes.filter((node) => node instanceof Element); }
+          // A document's shadow-including root is itself, so it is trivially
+          // "connected" by definition even while detached from any browsing
+          // context (same reasoning as DetachedHTMLDocument.isConnected).
+          get isConnected() { return true; }
+          getRootNode() { return this; }
+
+          createElement(tagName) { return document.createElement(tagName); }
+          createElementNS(namespaceURI, qualifiedName) { return document.createElementNS(namespaceURI, qualifiedName); }
+          createTextNode(text) { return document.createTextNode(text); }
+          createComment(text) { return document.createComment(text); }
+          createProcessingInstruction(target, data) { return createProcessingInstructionNode(target, data); }
+          createCDATASection(data) { return createCDATASectionNode(data); }
+          createDocumentFragment() { return new DocumentFragment(); }
+          createRange() { return new Range(this); }
+          createEvent(type) { return document.createEvent(type); }
+
+          appendChild(child) {
+            ensurePreInsertionValidity(child, this, null);
+            if (isDocumentFragment(child)) {
+              const addedNodes = [...child.childNodes];
+              for (const node of addedNodes) this.appendChild(node);
+              child.childNodes.length = 0;
+              return child;
+            }
+            if (child.parentNode) child.parentNode.removeChild(child);
+            const existing = this.childNodes.indexOf(child);
+            if (existing >= 0) this.childNodes.splice(existing, 1);
+            this.childNodes.push(child);
+            defineValue(child, '__fragmentParent', this);
+            return child;
+          }
+
+          insertBefore(child, referenceChild) {
+            ensureInsertionValidity(child, this, referenceChild ?? null);
+            if (isDocumentFragment(child)) {
+              const addedNodes = [...child.childNodes];
+              for (const node of addedNodes) this.insertBefore(node, referenceChild);
+              child.childNodes.length = 0;
+              return child;
+            }
+            if (child.parentNode) child.parentNode.removeChild(child);
+            const existing = this.childNodes.indexOf(child);
+            if (existing >= 0) this.childNodes.splice(existing, 1);
+            const index = referenceChild == null ? -1 : this.childNodes.indexOf(referenceChild);
+            if (index < 0) this.childNodes.push(child);
+            else this.childNodes.splice(index, 0, child);
+            defineValue(child, '__fragmentParent', this);
+            return child;
+          }
+
+          removeChild(child) {
+            const index = this.childNodes.indexOf(child);
+            if (index < 0) throw new DOMException('The node to be removed is not a child of this node.', 'NotFoundError');
+            this.childNodes.splice(index, 1);
+            if (child.__fragmentParent === this) defineValue(child, '__fragmentParent', null);
+            return child;
+          }
+
+          contains(candidate) {
+            if (candidate == null) return false;
+            if (candidate === this) return true;
+            for (let node = candidate.parentNode; node; node = node.parentNode) {
+              if (node === this) return true;
+            }
+            return false;
+          }
+        }
 
         class DOMImplementation {
           createHTMLDocument(title = '') { return new DetachedHTMLDocument(title); }
           hasFeature() { return true; }
+
+          createDocumentType(qualifiedName, publicId, systemId) {
+            if (arguments.length < 1) {
+              throw new TypeError("Failed to execute 'createDocumentType' on 'DOMImplementation': 1 argument required, but only 0 present.");
+            }
+            qualifiedName = String(qualifiedName);
+            validateQualifiedName(qualifiedName);
+            const id = bridge.createDocumentType(qualifiedName, String(publicId ?? ''), String(systemId ?? ''));
+            return wrapNode(id);
+          }
+
+          // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
+          createDocument(namespace, qualifiedName, doctype = null) {
+            namespace = namespace === undefined || namespace === null ? null : String(namespace);
+            qualifiedName = qualifiedName === undefined || qualifiedName === null ? '' : String(qualifiedName);
+            let element = null;
+            if (qualifiedName !== '') {
+              const extracted = validateAndExtractQualifiedName(namespace, qualifiedName);
+              // XMLDocument's createElementNS() delegates to the singleton
+              // bridge document's, which force-lowercases the local name
+              // regardless of namespace -- a pre-existing limitation shared
+              // with every other createElementNS() caller, not new here.
+              element = document.createElementNS(extracted.namespace, qualifiedName);
+            }
+            let contentType = 'application/xml';
+            if (namespace === 'http://www.w3.org/1999/xhtml') contentType = 'application/xhtml+xml';
+            else if (namespace === 'http://www.w3.org/2000/svg') contentType = 'image/svg+xml';
+            const result = new XMLDocument(contentType);
+            if (doctype !== null && doctype !== undefined) {
+              if (!(doctype instanceof DocumentType)) {
+                throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': parameter 3 is not of type 'DocumentType'.");
+              }
+              result.appendChild(doctype);
+            }
+            if (element !== null) result.appendChild(element);
+            return result;
+          }
         }
 
         const domImplementation = new DOMImplementation();
@@ -5053,6 +5325,8 @@
           if (type === 9) node = new Document(id);
           else if (type === 3) node = new Text(INTERNAL_NODE_ID, id);
           else if (type === 8) node = new Comment(INTERNAL_NODE_ID, id);
+          else if (type === 4) node = new CDATASection(INTERNAL_NODE_ID, id);
+          else if (type === 7) node = new ProcessingInstruction(INTERNAL_NODE_ID, id);
           else if (type === 10) node = new DocumentType(id);
           else if (type === 1) {
             const tagName = (tag || '').toLowerCase();
@@ -5243,6 +5517,8 @@
         Text,
         Comment,
         DocumentType,
+        ProcessingInstruction,
+        CDATASection,
         NodeList,
         HTMLCollection,
         DOMStringMap,
@@ -5370,7 +5646,7 @@
       const interfaceTagOverrides = { Document: 'HTMLDocument' };
       for (const [name, value] of Object.entries(exports)) {
         if (typeof value !== 'function' || !value.prototype) continue;
-        const isNodeInterface = value === Node || value === DocumentFragment
+        const isNodeInterface = value === Node || value === DocumentFragment || value === XMLDocument
           || value.prototype instanceof Node || value.prototype instanceof DocumentFragment;
         if (!isNodeInterface) continue;
         const tag = interfaceTagOverrides[name] || name;

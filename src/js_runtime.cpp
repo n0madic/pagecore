@@ -724,6 +724,47 @@ JSValue bridge_create_comment(JSContext* ctx, JSValue, int argc, JSValue* argv)
     });
 }
 
+JSValue bridge_create_processing_instruction(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 2) throw std::runtime_error("createProcessingInstruction requires target and data");
+        return js_id(ctx, js.document().create_processing_instruction(to_string(ctx, argv[0]), to_string(ctx, argv[1])));
+    });
+}
+
+JSValue bridge_create_cdata_section(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("createCDATASection requires data");
+        return js_id(ctx, js.document().create_cdata_section(to_string(ctx, argv[0])));
+    });
+}
+
+JSValue bridge_create_document_type(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 3) throw std::runtime_error("createDocumentType requires name, publicId, systemId");
+        return js_id(ctx, js.document().create_document_type(
+            to_string(ctx, argv[0]), to_string(ctx, argv[1]), to_string(ctx, argv[2])));
+    });
+}
+
+JSValue bridge_doctype_public_id(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("doctypePublicId requires a node id");
+        return js_string(ctx, js.document().doctype_public_id(to_node_id(ctx, argv[0])));
+    });
+}
+
+JSValue bridge_doctype_system_id(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("doctypeSystemId requires a node id");
+        return js_string(ctx, js.document().doctype_system_id(to_node_id(ctx, argv[0])));
+    });
+}
+
 JSValue bridge_attach_shadow_root(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -1645,6 +1686,11 @@ void JsRuntime::install()
     set_function(context_, dom, "createElement", bridge_create_element, 1);
     set_function(context_, dom, "createTextNode", bridge_create_text_node, 1);
     set_function(context_, dom, "createComment", bridge_create_comment, 1);
+    set_function(context_, dom, "createProcessingInstruction", bridge_create_processing_instruction, 2);
+    set_function(context_, dom, "createCDATASection", bridge_create_cdata_section, 1);
+    set_function(context_, dom, "createDocumentType", bridge_create_document_type, 3);
+    set_function(context_, dom, "doctypePublicId", bridge_doctype_public_id, 1);
+    set_function(context_, dom, "doctypeSystemId", bridge_doctype_system_id, 1);
     set_function(context_, dom, "attachShadowRoot", bridge_attach_shadow_root, 1);
     set_function(context_, dom, "nodeType", bridge_node_type, 1);
     set_function(context_, dom, "nodeName", bridge_node_name, 1);

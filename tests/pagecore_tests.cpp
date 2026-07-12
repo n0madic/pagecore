@@ -2781,6 +2781,128 @@ void test_range_content_methods()
         "toString(), commonAncestorContainer, and the boundary-point comparisons should follow the DOM spec");
 }
 
+void test_dom_implementation_create_methods()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<!DOCTYPE html>
+<html><body>
+  <script>
+    const checks = [];
+    const nameOf = (fn) => { try { fn(); return 'no throw'; } catch (error) { return error.name; } };
+
+    // The real, parsed document's doctype now reads its name/publicId/systemId
+    // from Lexbor directly instead of the old '' placeholders.
+    checks.push(document.doctype.name === 'html');
+    checks.push(document.doctype.publicId === '' && document.doctype.systemId === '');
+
+    // DOMImplementation.createDocumentType(): a standalone, unattached doctype
+    // with real name/publicId/systemId and no parent yet.
+    const dt = document.implementation.createDocumentType('svg:svg', 'pub-id', 'sys"id');
+    checks.push(dt.nodeType === Node.DOCUMENT_TYPE_NODE);
+    checks.push(dt.name === 'svg:svg' && dt.publicId === 'pub-id' && dt.systemId === 'sys"id');
+    checks.push(dt.parentNode === null);
+
+    // Name/QName production validation: InvalidCharacterError for a name that
+    // fails the Name production, NamespaceError for one that fails QName
+    // (multiple colons) while still matching Name.
+    checks.push(nameOf(() => document.implementation.createDocumentType('1bad', '', '')) === 'InvalidCharacterError');
+    checks.push(nameOf(() => document.implementation.createDocumentType('a:b:c', '', '')) === 'NamespaceError');
+    checks.push(nameOf(() => document.implementation.createDocumentType('', '', '')) === 'InvalidCharacterError');
+
+    // DOMImplementation.createDocument(): an XMLDocument distinct from
+    // Document, holding just the doctype when qualifiedName is empty/null.
+    const xmlDoctype = document.implementation.createDocumentType('qorflesnorf', 'abcde', 'x"\'y');
+    const xmlDoc = document.implementation.createDocument(null, null, xmlDoctype);
+    checks.push(xmlDoc instanceof XMLDocument);
+    checks.push(xmlDoc.nodeType === Node.DOCUMENT_NODE);
+    checks.push(xmlDoc.contentType === 'application/xml');
+    checks.push(xmlDoc.doctype === xmlDoctype && xmlDoctype.parentNode === xmlDoc);
+    checks.push(xmlDoc.documentElement === null);
+
+    // contentType varies by namespace, per spec.
+    checks.push(document.implementation.createDocument('http://www.w3.org/1999/xhtml', 'html', null).contentType === 'application/xhtml+xml');
+    checks.push(document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg', null).contentType === 'image/svg+xml');
+
+    // createDocument's own root-element creation validates qualifiedName too.
+    checks.push(nameOf(() => document.implementation.createDocument(null, 'a:b:c', null)) === 'NamespaceError');
+    // Third argument must be a DocumentType (or null/omitted).
+    checks.push(nameOf(() => document.implementation.createDocument(null, null, {})) === 'TypeError');
+
+    // The XMLDocument returned is a real, working document-like container:
+    // create*/appendChild/documentElement all work.
+    const el = xmlDoc.createElement('everyone-hates-hyphenated-element-names');
+    const textNode = xmlDoc.createTextNode('hello');
+    el.appendChild(textNode);
+    xmlDoc.appendChild(el);
+    checks.push(xmlDoc.documentElement === el && el.parentNode === xmlDoc);
+    checks.push(el.textContent === 'hello');
+    checks.push(xmlDoc.createDocumentFragment() instanceof DocumentFragment);
+
+    // createProcessingInstruction(): works on any document (HTML or XML);
+    // target is exposed via nodeName too, matching Lexbor's generic node-name
+    // lookup for PROCESSING_INSTRUCTION_NODE.
+    const pi = xmlDoc.createProcessingInstruction('somePI', 'chirp chirp');
+    checks.push(pi.nodeType === Node.PROCESSING_INSTRUCTION_NODE);
+    checks.push(pi.target === 'somePI' && pi.nodeName === 'somePI' && pi.data === 'chirp chirp');
+    checks.push(pi instanceof ProcessingInstruction && pi instanceof CharacterData);
+    checks.push(nameOf(() => new ProcessingInstruction()) === 'TypeError');
+
+    const piOnRealDocument = document.createProcessingInstruction('target2', 'data2');
+    checks.push(piOnRealDocument.target === 'target2' && piOnRealDocument.nodeType === Node.PROCESSING_INSTRUCTION_NODE);
+
+    // "?>" inside PI data is InvalidCharacterError, on any document.
+    checks.push(nameOf(() => xmlDoc.createProcessingInstruction('t', 'a?>b')) === 'InvalidCharacterError');
+    checks.push(nameOf(() => document.createProcessingInstruction('1bad', 'x')) === 'InvalidCharacterError');
+
+    // createCDATASection(): NotSupportedError on HTML documents (the real
+    // document and createHTMLDocument()'s result), works on an XMLDocument.
+    checks.push(nameOf(() => document.createCDATASection('x')) === 'NotSupportedError');
+    const foreignDoc = document.implementation.createHTMLDocument('');
+    checks.push(nameOf(() => foreignDoc.createCDATASection('x')) === 'NotSupportedError');
+
+    const cdata = xmlDoc.createCDATASection('1234');
+    checks.push(cdata.nodeType === Node.CDATA_SECTION_NODE);
+    checks.push(cdata.data === '1234' && cdata.nodeName === '#cdata-section');
+    checks.push(cdata instanceof CDATASection && cdata instanceof Text);
+    checks.push(nameOf(() => new CDATASection()) === 'TypeError');
+    checks.push(nameOf(() => xmlDoc.createCDATASection('a]]>b')) === 'InvalidCharacterError');
+
+    // A CDATA section behaves like ordinary CharacterData once inserted --
+    // this is exactly the pattern WPT's dom/ranges/common.js fixture uses
+    // (appending CDATA sections created off a throwaway `new Document()` into
+    // a real HTML paragraph) to build a text-like node with three CDATA/text
+    // children for Range tests. Left detached rather than appended to
+    // document.body: Lexbor's own HTML serializer has no case for
+    // LXB_DOM_NODE_TYPE_CDATA_SECTION (falls through to its generic error
+    // path), so a CDATA descendant would break this test's own
+    // page.outer_html() pass/fail signal below -- a known, narrow Lexbor
+    // limitation, not a bug in this feature (see docs/browser-api-support.md).
+    const p = document.createElement('p');
+    p.appendChild(cdata);
+    p.appendChild(xmlDoc.createCDATASection('5678'));
+    p.append('9012');
+    checks.push(p.textContent === '123456789012');
+    checks.push(p.childNodes.length === 3);
+
+    // The bare `new Document()` constructor: "return a new document that is
+    // an XML document" -- simulated the same way createDocument() is.
+    const bareDoc = new Document();
+    checks.push(bareDoc instanceof XMLDocument);
+    checks.push(bareDoc.createCDATASection('xyz').data === 'xyz');
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/dom-implementation-create.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "DOMImplementation.createDocumentType()/createDocument() and "
+        "Document.createProcessingInstruction()/createCDATASection() should follow the DOM spec "
+        "(Name/QName validation, XMLDocument container, HTML-document NotSupportedError gate)");
+}
+
 void test_create_comment_nodes_are_not_visible_text()
 {
     pagecore::Page page;
@@ -13164,6 +13286,7 @@ int main()
         test_text_decoder_encoding_support();
         test_node_move_before();
         test_range_content_methods();
+        test_dom_implementation_create_methods();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
         test_wpt_completion_callback_registration_waits_for_harness_initialization();

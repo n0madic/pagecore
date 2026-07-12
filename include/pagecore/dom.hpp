@@ -101,6 +101,18 @@ public:
     NodeId create_element(std::string_view tag_name);
     NodeId create_text_node(std::string_view text);
     NodeId create_comment(std::string_view text);
+    // Returns 0 (an invalid NodeId) if `data` contains "?>" -- the DOM spec's
+    // InvalidCharacterError condition, left for the JS binding to translate.
+    NodeId create_processing_instruction(std::string_view target, std::string_view data);
+    // Returns 0 if `text` contains "]]>".
+    NodeId create_cdata_section(std::string_view text);
+    // Returns 0 if `name` fails Lexbor's doctype name check (whitespace, NUL,
+    // '>'); the JS binding validates the stricter XML Name/QName production
+    // itself before calling this, so that path should not normally trigger.
+    NodeId create_document_type(std::string_view name, std::string_view public_id, std::string_view system_id);
+
+    std::string doctype_public_id(NodeId id) const;
+    std::string doctype_system_id(NodeId id) const;
 
     // Creates a real lexbor element (tag "pc-shadowroot") as a child of `host`,
     // tagged with the internal data-pc-shadow-root/data-pc-shadow-host markers
