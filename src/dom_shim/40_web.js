@@ -129,27 +129,27 @@
 
           setStartBefore(node) {
             if (!node.parentNode) throw new DOMException('Node has no parent.', 'InvalidNodeTypeError');
-            this.setStart(node.parentNode, node.parentNode.childNodes.indexOf(node));
+            this.setStart(node.parentNode, [...node.parentNode.childNodes].indexOf(node));
           }
 
           setStartAfter(node) {
             if (!node.parentNode) throw new DOMException('Node has no parent.', 'InvalidNodeTypeError');
-            this.setStart(node.parentNode, node.parentNode.childNodes.indexOf(node) + 1);
+            this.setStart(node.parentNode, [...node.parentNode.childNodes].indexOf(node) + 1);
           }
 
           setEndBefore(node) {
             if (!node.parentNode) throw new DOMException('Node has no parent.', 'InvalidNodeTypeError');
-            this.setEnd(node.parentNode, node.parentNode.childNodes.indexOf(node));
+            this.setEnd(node.parentNode, [...node.parentNode.childNodes].indexOf(node));
           }
 
           setEndAfter(node) {
             if (!node.parentNode) throw new DOMException('Node has no parent.', 'InvalidNodeTypeError');
-            this.setEnd(node.parentNode, node.parentNode.childNodes.indexOf(node) + 1);
+            this.setEnd(node.parentNode, [...node.parentNode.childNodes].indexOf(node) + 1);
           }
 
           selectNode(node) {
             if (!node.parentNode) throw new DOMException('Node has no parent.', 'InvalidNodeTypeError');
-            const index = node.parentNode.childNodes.indexOf(node);
+            const index = [...node.parentNode.childNodes].indexOf(node);
             this._startContainer = node.parentNode;
             this._startOffset = index;
             this._endContainer = node.parentNode;
@@ -1159,7 +1159,7 @@
           serializeToString(node) {
             if (!node) return '';
             if (node.nodeType === 9) return node.documentElement ? node.documentElement.outerHTML : '';
-            if (node.nodeType === 11) return node.childNodes.map((child) => this.serializeToString(child)).join('');
+            if (node.nodeType === 11) return [...node.childNodes].map((child) => this.serializeToString(child)).join('');
             if (node.nodeType === 3) return node.data;
             return node.outerHTML || node.innerHTML || '';
           }

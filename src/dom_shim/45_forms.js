@@ -64,7 +64,8 @@
       }
 
       function selectedOptions(select) {
-        const options = select.options || [];
+        // select.options is an HTMLCollection, which has no Array methods.
+        const options = select.options ? [...select.options] : [];
         const selected = options.filter((option) => option instanceof HTMLOptionElement && option.selected && !option.disabled);
         if (selected.length > 0) return selected;
         const first = options.find((option) => option instanceof HTMLOptionElement && !option.disabled);

@@ -356,6 +356,135 @@
         }
       }
 
+        // NodeList and HTMLCollection used to be plain Arrays, which could not be
+        // live and had no stable identity. Both are now facades over a read
+        // function that recomputes on every access, so a list handed out before a
+        // mutation reflects that mutation afterwards, and `el.childNodes ===
+        // el.childNodes` holds because the facade is memoized per node.
+        //
+        // The read function lives in a WeakMap keyed by the *proxy* rather than in
+        // a field or a private slot. Keying by the proxy is what gives the brand
+        // check its teeth: `Object.create(list).length` runs the getter with a
+        // receiver that is not the proxy, finds nothing in the map, and throws —
+        // which is what the spec (and WPT) require. A `#private` field cannot be
+        // used here at all, because reading one through a Proxy throws.
+        const collectionReaders = new WeakMap();
+        const collectionIndex = /^(?:0|[1-9]\d*)$/;
+
+        function collectionItems(collection) {
+          const read = collectionReaders.get(collection);
+          if (!read) throw new TypeError('Illegal invocation');
+          return read();
+        }
+
+        class NodeList {
+          get length() { return collectionItems(this).length; }
+
+          item(index) {
+            const items = collectionItems(this);
+            const offset = Number(index) >>> 0;
+            return offset < items.length ? items[offset] : null;
+          }
+
+          forEach(callback, thisArg) {
+            const items = collectionItems(this);
+            for (let index = 0; index < items.length; index++) {
+              callback.call(thisArg, items[index], index, this);
+            }
+          }
+
+          keys() { return collectionItems(this).keys(); }
+          values() { return collectionItems(this).values(); }
+          entries() { return collectionItems(this).entries(); }
+          [Symbol.iterator]() { return collectionItems(this)[Symbol.iterator](); }
+          get [Symbol.toStringTag]() { return 'NodeList'; }
+        }
+
+        class HTMLCollection {
+          get length() { return collectionItems(this).length; }
+
+          item(index) {
+            const items = collectionItems(this);
+            const offset = Number(index) >>> 0;
+            return offset < items.length ? items[offset] : null;
+          }
+
+          namedItem(name) {
+            const key = String(name);
+            // The empty string is never a supported property name, so it must not
+            // match an element that happens to carry name="" or id="".
+            if (key === '') return null;
+            for (const element of collectionItems(this)) {
+              if (element.getAttribute('id') === key) return element;
+            }
+            for (const element of collectionItems(this)) {
+              if (NAMED_CONTENT_TAGS.has(element.localName) && element.getAttribute('name') === key) return element;
+            }
+            return null;
+          }
+
+          [Symbol.iterator]() { return collectionItems(this)[Symbol.iterator](); }
+          get [Symbol.toStringTag]() { return 'HTMLCollection'; }
+        }
+
+        // Only these elements expose themselves by their name attribute; for
+        // everything else `name` is just an ordinary attribute.
+        const NAMED_CONTENT_TAGS = new Set(['a', 'applet', 'area', 'embed', 'form', 'frameset', 'iframe', 'img', 'object']);
+
+        function liveCollection(Interface, read) {
+          const proxy = new Proxy(new Interface(), {
+            get(target, property, receiver) {
+              if (typeof property === 'string') {
+                if (collectionIndex.test(property)) {
+                  const items = read();
+                  const offset = Number(property);
+                  return offset < items.length ? items[offset] : undefined;
+                }
+                // Named access must not shadow length/item/namedItem: HTMLCollection
+                // is not [LegacyOverrideBuiltIns], so anything already reachable on
+                // the interface wins over an element's id or name.
+                if (Interface === HTMLCollection && !(property in target)) {
+                  const named = receiver.namedItem(property);
+                  if (named) return named;
+                }
+              }
+              return Reflect.get(target, property, receiver);
+            },
+            has(target, property) {
+              if (typeof property === 'string' && collectionIndex.test(property)) {
+                return Number(property) < read().length;
+              }
+              return Reflect.has(target, property);
+            },
+            ownKeys(target) {
+              const items = read();
+              const keys = [];
+              for (let index = 0; index < items.length; index++) keys.push(String(index));
+              for (const key of Reflect.ownKeys(target)) {
+                if (!keys.includes(key)) keys.push(key);
+              }
+              return keys;
+            },
+            getOwnPropertyDescriptor(target, property) {
+              if (typeof property === 'string' && collectionIndex.test(property)) {
+                const items = read();
+                const offset = Number(property);
+                if (offset >= items.length) return undefined;
+                return { value: items[offset], writable: false, enumerable: true, configurable: true };
+              }
+              return Reflect.getOwnPropertyDescriptor(target, property);
+            }
+          });
+          collectionReaders.set(proxy, read);
+          return proxy;
+        }
+
+        // querySelectorAll returns a *static* NodeList: it is a snapshot, so the
+        // read function closes over the array it was built from.
+        function staticNodeList(items) {
+          const snapshot = [...items];
+          return liveCollection(NodeList, () => snapshot);
+        }
 
         class Node extends EventTarget {
           constructor(id) {
@@ -380,7 +509,9 @@
             return parent instanceof Element ? parent : null;
           }
           get ownerDocument() { return this instanceof Document ? null : document; }
-          get childNodes() { return liveChildNodeList(this).slice(); }
+          // Memoized so identity is stable (`el.childNodes === el.childNodes`);
+          // liveChildNodeList() is re-read on every access, so the list is live.
+          get childNodes() { return memo(this, '__childNodesList', () => liveCollection(NodeList, () => liveChildNodeList(this))); }
           get firstChild() { const nodes = liveChildNodeList(this); return nodes[0] || null; }
           get lastChild() {
             const nodes = liveChildNodeList(this);
@@ -428,14 +559,17 @@
               return;
             }
 
-            const removedNodes = this.childNodes;
+            // Snapshots, not the live childNodes: a MutationRecord must describe the
+            // tree as it was at the mutation, and childNodes now keeps changing
+            // underneath it.
+            const removedNodes = [...this.childNodes];
             bridge.setTextContent(this._liveId(), text);
             syncMutationCache();
             if (ctx.suppressMutationRecords === 0) {
               ctx.queueMutation({
                 type: 'childList',
                 target: this,
-                addedNodes: text === '' ? [] : this.childNodes,
+                addedNodes: text === '' ? [] : [...this.childNodes],
                 removedNodes,
                 previousSibling: null,
                 nextSibling: null,
@@ -654,7 +788,7 @@
             const branchSelf = fromRootSelf[depth];
             const branchOther = fromRootOther[depth];
             if (!commonAncestor || !branchSelf || !branchOther) return FOLLOWING;
-            const siblings = commonAncestor.childNodes;
+            const siblings = [...commonAncestor.childNodes];
             const indexSelf = siblings.findIndex((node) => node.__id === branchSelf.__id);
             const indexOther = siblings.findIndex((node) => node.__id === branchOther.__id);
             return indexSelf < indexOther ? FOLLOWING : PRECEDING;
@@ -1447,7 +1581,9 @@
 
         function listedFormControls(root) {
           if (!root || typeof root.querySelectorAll !== 'function') return [];
-          return root.querySelectorAll('button,input,select,textarea');
+          // An Array, not the NodeList: form.elements decorates this with
+          // item/namedItem and its callers use Array methods on it.
+          return [...root.querySelectorAll('button,input,select,textarea')];
         }
 
         function isDocumentFragment(value) {
@@ -2941,7 +3077,7 @@
           get classList() { return memo(this, '__classList', () => new DOMTokenList(this, 'class')); }
           get attributes() { return memo(this, '__attributes', () => namedNodeMap(this)); }
           get dataset() { return memo(this, '__dataset', () => datasetFor(this)); }
-          get children() { return liveChildElementList(this).slice(); }
+          get children() { return memo(this, '__childrenList', () => liveCollection(HTMLCollection, () => liveChildElementList(this))); }
           get firstElementChild() { const children = liveChildElementList(this); return children[0] || null; }
           get lastElementChild() {
             const children = liveChildElementList(this);
@@ -3082,11 +3218,18 @@
           }
 
           querySelector(selector) { return querySelectorCompat(this, selector); }
-          querySelectorAll(selector) { return querySelectorAllCompat(this, selector); }
-          getElementsByTagName(tagName) { return this.querySelectorAll(String(tagName)); }
+          // Static per spec: a snapshot, not a live view.
+          querySelectorAll(selector) { return staticNodeList(querySelectorAllCompat(this, selector)); }
+
+          // getElementsBy* are live, so they re-run the query on every access.
+          getElementsByTagName(tagName) {
+            const name = String(tagName);
+            return liveCollection(HTMLCollection, () => querySelectorAllCompat(this, name));
+          }
+
           getElementsByClassName(classNames) {
             const selector = String(classNames).trim().split(/\s+/).filter(Boolean).map((name) => `.${name}`).join('');
-            return selector ? this.querySelectorAll(selector) : [];
+            return liveCollection(HTMLCollection, () => (selector ? querySelectorAllCompat(this, selector) : []));
           }
           matches(selector) {
             const text = String(selector);
@@ -3099,7 +3242,7 @@
               });
             } catch (_error) {
               const parent = this.parentNode || document;
-              return parent.querySelectorAll(text).some((node) => node.__id === this.__id);
+              return [...parent.querySelectorAll(text)].some((node) => node.__id === this.__id);
             }
           }
           closest(selector) {
@@ -3624,11 +3767,11 @@
           set text(value) { this.textContent = String(value ?? ''); }
         }
         class HTMLSelectElement extends HTMLFormControlElement {
-          get options() { return this.querySelectorAll('option'); }
+          get options() { return liveCollection(HTMLCollection, () => querySelectorAllCompat(this, 'option')); }
           get value() {
             // Read live selectedness (the IDL flag), not the "selected" content
             // attribute, so a script-set option.selected is reflected here.
-            const options = this.options;
+            const options = [...this.options];
             const selected = options.find((option) => option.selected) || options[0];
             return selected ? selected.value : '';
           }
@@ -3639,11 +3782,11 @@
             }
           }
           get selectedIndex() {
-            return this.options.findIndex((option) => option.selected);
+            return [...this.options].findIndex((option) => option.selected);
           }
           set selectedIndex(value) {
             const index = Number(value);
-            this.options.forEach((option, optionIndex) => { option.selected = optionIndex === index; });
+            [...this.options].forEach((option, optionIndex) => { option.selected = optionIndex === index; });
           }
         }
         class HTMLSlotElement extends HTMLElement {
@@ -3985,11 +4128,18 @@
           createDocumentFragment() { return new DocumentFragment(); }
           getElementById(id) { return wrapNode(bridge.getElementById(String(id))); }
           querySelector(selector) { return querySelectorCompat(this, selector); }
-          querySelectorAll(selector) { return querySelectorAllCompat(this, selector); }
-          getElementsByTagName(tagName) { return this.querySelectorAll(String(tagName)); }
+          // Static per spec: a snapshot, not a live view.
+          querySelectorAll(selector) { return staticNodeList(querySelectorAllCompat(this, selector)); }
+
+          // getElementsBy* are live, so they re-run the query on every access.
+          getElementsByTagName(tagName) {
+            const name = String(tagName);
+            return liveCollection(HTMLCollection, () => querySelectorAllCompat(this, name));
+          }
+
           getElementsByClassName(classNames) {
             const selector = String(classNames).trim().split(/\s+/).filter(Boolean).map((name) => `.${name}`).join('');
-            return selector ? this.querySelectorAll(selector) : [];
+            return liveCollection(HTMLCollection, () => (selector ? querySelectorAllCompat(this, selector) : []));
           }
           getElementsByName(name) { return this.querySelectorAll(`[name="${String(name).replace(/"/g, '\\"')}"]`); }
           createEvent(type) {
@@ -4113,22 +4263,32 @@
           }
 
           querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
-          querySelectorAll(selector) {
+
+          // The document-level queries must also consider documentElement itself,
+          // which an Element-rooted query never returns.
+          _matchesInDocument(selector) {
             const root = this.documentElement;
-            const results = root.querySelectorAll(selector);
+            if (!root) return [];
+            const results = [...root.querySelectorAll(selector)];
             return root.matches(selector) ? [root, ...results] : results;
           }
+
+          querySelectorAll(selector) { return staticNodeList(this._matchesInDocument(selector)); }
+
           getElementsByTagName(tagName) {
             const name = String(tagName).toLowerCase();
-            if (name === '*') return [this.documentElement, ...this.documentElement.querySelectorAll('*')];
-            const results = this.documentElement.getElementsByTagName(name);
-            return this.documentElement.localName === name ? [this.documentElement, ...results] : results;
+            return liveCollection(HTMLCollection, () => this._matchesInDocument(name === '*' ? '*' : name));
           }
+
           getElementsByClassName(classNames) {
             const selector = String(classNames).trim().split(/\s+/).filter(Boolean).map((name) => `.${name}`).join('');
-            return selector ? this.querySelectorAll(selector) : [];
+            return liveCollection(HTMLCollection, () => (selector ? this._matchesInDocument(selector) : []));
           }
-          getElementsByName(name) { return this.querySelectorAll(`[name="${String(name).replace(/"/g, '\\"')}"]`); }
+
+          getElementsByName(name) {
+            const selector = `[name="${String(name).replace(/"/g, '\\"')}"]`;
+            return liveCollection(NodeList, () => this._matchesInDocument(selector));
+          }
         }
 
         // PageCore has a single, HTML-parsed document, so Document and
@@ -4341,6 +4501,8 @@
         CharacterData,
         Text,
         Comment,
+        NodeList,
+        HTMLCollection,
         DOMStringMap,
         XMLDocument,
         Attr,

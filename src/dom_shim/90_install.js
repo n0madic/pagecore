@@ -53,6 +53,8 @@
         CharacterData,
         Text,
         Comment,
+        NodeList,
+        HTMLCollection,
         DOMStringMap,
         XMLDocument,
         Attr,
@@ -251,6 +253,8 @@
         global.CharacterData = CharacterData;
         global.Text = Text;
         global.Comment = Comment;
+        global.NodeList = NodeList;
+        global.HTMLCollection = HTMLCollection;
         global.Attr = Attr;
         global.Element = Element;
         global.HTMLElement = HTMLElement;

@@ -843,7 +843,8 @@ void test_tree_operations_and_clone()
     c.remove();
 
     list.setAttribute('data-returned', old.id);
-    list.setAttribute('data-order', list.children.map((node) => node.textContent).join(''));
+    // children is an HTMLCollection, so it has no Array methods.
+    list.setAttribute('data-order', [...list.children].map((node) => node.textContent).join(''));
     list.setAttribute('data-contains', String(list.contains(clone)));
     list.setAttribute('data-connected', String(clone.isConnected));
   </script>
@@ -2088,6 +2089,70 @@ void test_character_data_interface()
     require(
         page.outer_html("body[data-ok='ok']").has_value(),
         "CharacterData should own the data mutation API and treat a numeric constructor argument as data");
+}
+
+void test_live_collections()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="host"><span id="one" class="c">a</span></div>
+  <script>
+    const checks = [];
+    const host = document.getElementById('host');
+
+    // Identity is stable, so a list captured before a mutation is the same object.
+    const nodes = host.childNodes;
+    const kids = host.children;
+    checks.push(nodes === host.childNodes);
+    checks.push(kids === host.children);
+    checks.push(nodes instanceof NodeList);
+    checks.push(kids instanceof HTMLCollection);
+
+    // ...and it is live: the captured list sees a later append.
+    checks.push(nodes.length === 1);
+    const added = document.createElement('span');
+    added.id = 'two';
+    added.className = 'c';
+    host.appendChild(added);
+    checks.push(nodes.length === 2);
+    checks.push(kids[1] === added);
+    checks.push(nodes.item(2) === null);
+    checks.push(!(2 in nodes));
+
+    // getElementsBy* are live; querySelectorAll is a static snapshot.
+    const live = document.getElementsByClassName('c');
+    const snapshot = document.querySelectorAll('.c');
+    checks.push(live.length === 2 && snapshot.length === 2);
+    const third = document.createElement('span');
+    third.className = 'c';
+    host.appendChild(third);
+    checks.push(live.length === 3);
+    checks.push(snapshot.length === 2);
+
+    // HTMLCollection exposes named access by id, but must not let an element
+    // named "length" shadow the real length getter.
+    checks.push(kids.namedItem('two') === added);
+    checks.push(kids['one'] === document.getElementById('one'));
+    checks.push(typeof kids.length === 'number');
+
+    // Collections are iterable but carry no Array methods, exactly as in a browser.
+    checks.push(typeof nodes.map === 'undefined');
+    checks.push([...kids].length === 3);
+
+    // Brand check: the getter must reject a receiver that is not a real collection.
+    let threw = false;
+    try { Object.create(kids).length; } catch (error) { threw = error instanceof TypeError; }
+    checks.push(threw);
+
+    document.body.setAttribute('data-ok', checks.every(Boolean) ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/collections.html");
+
+    require(
+        page.outer_html("body[data-ok='ok']").has_value(),
+        "childNodes/children/getElementsBy* should be live collections with stable identity");
 }
 
 void test_dom_interface_globals()
@@ -7689,14 +7754,16 @@ void test_described_traversal_wraps_children_correctly()
         "<html><body><div id=\"host\">a<span class=\"s\">b</span><!--c--><p>d</p></div></body></html>");
 
     // childNodes goes through the batched describe path: text, element, comment, element.
+    // It is a NodeList, so it is iterable but has no Array methods.
     require(page.eval(
                 "(() => { const k = document.getElementById('host').childNodes;"
-                " return k.length + ':' + k.map(n => n.nodeType).join(','); })()") == "4:3,1,8,1",
+                " return k.length + ':' + [...k].map(n => n.nodeType).join(','); })()") == "4:3,1,8,1",
             "childNodes returns every child with the correct node types in order");
 
     // children must surface only the element children, with correct tags.
+    // It is an HTMLCollection, so it has no Array methods.
     require(page.eval(
-                "document.getElementById('host').children.map(e => e.tagName).join(',')") == "SPAN,P",
+                "[...document.getElementById('host').children].map(e => e.tagName).join(',')") == "SPAN,P",
             "children returns only element nodes with correct tag names");
 
     // A freshly created + appended element exercises describeNode for a new node:
@@ -12506,6 +12573,7 @@ int main()
         test_document_write_escaped_script_text_remains_text();
         test_comment_nodes_wrap_for_sibling_traversal();
         test_character_data_interface();
+        test_live_collections();
         test_dom_interface_globals();
         test_create_comment_nodes_are_not_visible_text();
         test_event_options_bubbling_and_wpt_driver_shim();
