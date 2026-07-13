@@ -1555,11 +1555,14 @@ struct Page::Impl {
     // Hit-test read. Reuses has_current_layout()/ensure_layout() exactly like
     // element_geometry(), but deliberately skips its per-node caching and
     // deadline-backstop machinery (remember_geometry, note_geometry_forced_layout):
-    // there is no natural per-point cache key, and a point query isn't expected to
-    // run every animation frame the way per-element geometry reads are. If bounded
-    // mode is already active, forcing a fresh layout for a point query isn't
-    // warranted -> empty, matching the DOM spec's own tolerance for "no element at
-    // this point" being a legitimate result.
+    // there is no natural per-point cache key to serve an approximate answer from.
+    // Unlike per-element geometry reads (which JS grid libraries poll every
+    // frame), a point query is a rare, one-off call, so geometry_bounded_mode's
+    // runaway-cost protection doesn't apply here: this always forces a fresh
+    // layout on a stale cache, even once bounded mode is active elsewhere. Without
+    // this, elementFromPoint/elementsFromPoint would permanently return empty for
+    // any element added after the page's unrelated geometry-read budget tripped
+    // once, for the rest of the document's lifetime.
     std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only)
     {
         const bool full_layout_hit = has_current_layout(last_render_options, false, LayoutResourceMode::Full);
@@ -1574,14 +1577,10 @@ struct Page::Impl {
             return ids;
         }
 
-        if (!geometry_bounded_mode) {
-            auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
-            auto ids = engine.elements_at_point(x, y, topmost_only);
-            trace.set_count(ids.size());
-            return ids;
-        }
-
-        return {};
+        auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+        auto ids = engine.elements_at_point(x, y, topmost_only);
+        trace.set_count(ids.size());
+        return ids;
     }
 };
 

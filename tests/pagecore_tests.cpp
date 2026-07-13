@@ -12113,6 +12113,17 @@ public:
             pagecore::Rect{0.0f, 0.0f, width, 10.0f},
         };
     }
+    // Encodes the layout-call count into the returned id (like element_geometry()
+    // encodes it into width) so a test can tell an exact hit test (post-fix, forced
+    // fresh layout) apart from a stale/empty one without needing a real coordinate
+    // model.
+    std::vector<pagecore::NodeId> elements_at_point(float, float, bool) override
+    {
+        if (!laid_out_) {
+            return {};
+        }
+        return { static_cast<pagecore::NodeId>(*layout_calls_) };
+    }
 
 private:
     std::shared_ptr<int> layout_calls_;
@@ -12653,6 +12664,43 @@ void test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layo
             && event.styled_document_cache_reason == "preflight_heavy_structural:empty";
     });
     require(!saw_preflight_event, "geometry reads must not preflight heavy structural mutations to zero geometry");
+}
+
+// Regression for a CI-only flake in the WPT testdriver-actions corpus: once
+// geometry_bounded_mode trips (from unrelated getBoundingClientRect() reads
+// elsewhere on the page), elements_at_point() must still hit-test an element
+// added afterward instead of silently returning empty forever, because
+// elementFromPoint/elementsFromPoint back document.elementFromPoint(), which
+// WebDriver Actions-style click synthesis depends on to resolve pointerDown/
+// pointerUp targets.
+void test_elements_at_point_forces_exact_hit_test_after_bounded_mode_trips()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='a'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId body = page.document().body();
+    const pagecore::NodeId a = page.document().query_selector(root, "#a");
+    require(body != pagecore::kInvalidNodeId && a != pagecore::kInvalidNodeId, "expected fixture");
+
+    auto first = page.element_geometry(a);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(a, "style", "display:block");
+    auto second = page.element_geometry(a);
+    require(second && second->border_box.width == 20.0f, "second geometry read should still be exact");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    const pagecore::NodeId b = page.document().create_element("div");
+    page.document().append_child(body, b);
+
+    const auto ids = page.elements_at_point(0.0f, 0.0f, true);
+    require(*factory->layout_calls == 3,
+            "a hit test against a stale layout must force one fresh layout even once bounded mode is active");
+    require(!ids.empty() && ids.front() == 3,
+            "a hit test after bounded mode trips must still find an element added afterward, not silently report nothing");
 }
 
 void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
@@ -14525,6 +14573,7 @@ int main()
         test_element_geometry_bounded_mode_drops_disconnected_stale_geometry();
         test_element_geometry_after_heavy_append_child_runs_first_exact_layout();
         test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout();
+        test_elements_at_point_forces_exact_hit_test_after_bounded_mode_trips();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
         test_computed_style_property_bounded_mode_keeps_stylesheet_display();
         test_computed_style_property_bounded_mode_resolves_element_created_after_trip();
