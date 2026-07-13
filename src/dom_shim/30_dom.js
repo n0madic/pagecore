@@ -3216,6 +3216,20 @@
           text = text.replace(/(?:\.|\.\\:)[A-Za-z0-9_:-]+/g, '');
 
           const tag = text.trim();
+          // Anything still starting with `:` here is a pseudo-class this fast
+          // matcher doesn't recognize -- `:where`/`:not`/`:target`/`:dir` and
+          // the stateful-pseudo allowlist above are already stripped/handled,
+          // so this is neither of those. Falling through to the tag-name
+          // check below would silently answer "never matches" instead of the
+          // real answer. jQuery/Sizzle's `:visible`/`:hidden` (its own
+          // extensions, not real CSS) rely on exactly the same contract real
+          // browsers give it: try `element.matches()`, catch the SyntaxError
+          // it throws for an unrecognized selector, and fall back to its own
+          // JS matcher. Throwing here lets matches()'s existing catch block
+          // do that fall-back (to querySelectorAll, which lexbor correctly
+          // rejects), instead of matches() confidently returning a wrong
+          // `false` that Sizzle then trusts as a genuine native answer.
+          if (tag.startsWith(':')) throw new DOMException(`Unsupported pseudo-class: ${tag}`, 'SyntaxError');
           if (tag && tag !== '*' && tag.toLowerCase() !== element.localName) return false;
           return true;
         }
@@ -3508,6 +3522,16 @@
         const offsetParentCache = new WeakMap();
         function resolveOffsetParent(element, version) {
           if (!(element instanceof HTMLElement) || !isNodeWrapper(element)) return null;
+          // Per the CSSOM View offsetParent algorithm, the root element and the
+          // body element always return null, never themselves. Without this,
+          // an element with no positioned ancestor falls through to the
+          // `document.body` fallback below, and when the element being
+          // queried IS document.body, that fallback made offsetParent return
+          // itself. Code that walks the offsetParent chain until it hits null
+          // (jQuery's `.position()`, Popper.js/Floating UI, ...) then loops
+          // forever: `offsetParent = offsetParent.offsetParent || root` never
+          // changes once it reaches body.
+          if (isDocumentElement(element) || element === document.body) return null;
           if (!element.isConnected || element.hidden || computedDisplayForVersion(element, version) === 'none') return null;
           for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
             const position = computedStylePropertyForVersion(ancestor, 'position', version);

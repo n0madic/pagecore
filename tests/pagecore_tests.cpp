@@ -4054,6 +4054,54 @@ void test_target_pseudo_class_selector_fallback()
         ":target selector fallback should match the location hash element");
 }
 
+// Regression test: Element.prototype.matches() must throw a SyntaxError for a
+// selector it cannot parse/support, exactly like querySelectorAll() already
+// does for the same selector string -- not silently return false. jQuery
+// 4.0.0's Sizzle-derived selector engine relies on precisely this contract
+// for its own `:visible`/`:hidden` extensions (not real CSS): it tries
+// `element.matches(selector)` first, and only falls back to its own JS
+// implementation (`jQuery.expr.pseudos.visible`) when that call throws.
+// Before this fix, PageCore's fast JS selector matcher silently treated an
+// unrecognized `:pseudo` token as a bogus tag name and returned `false`
+// without throwing, so Sizzle trusted the (wrong) native "false" answer and
+// never fell back -- `$(elem).is(':visible')` always reported `false`, even
+// for genuinely visible elements.
+void test_matches_throws_syntax_error_for_unrecognized_pseudo_class()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="visible">content</div>
+  <div id="hidden" style="display:none"></div>
+  <script>
+    function nameOf(fn) { try { fn(); return 'no throw'; } catch (e) { return e.name; } }
+
+    const throwsForVisible = nameOf(() => document.getElementById('visible').matches(':visible')) === 'SyntaxError';
+    const throwsForUnknown = nameOf(() => document.getElementById('visible').matches(':totallyMadeUpPseudo')) === 'SyntaxError';
+
+    // The exact jQuery 4.0.0 Sizzle pattern: try native matches(), fall back
+    // to a JS implementation on catch.
+    function isVisible(elem) {
+      try { return elem.matches(':visible'); }
+      catch (e) { return !!(elem.offsetWidth || elem.offsetHeight || elem.getClientRects().length); }
+    }
+
+    const visibleOk = isVisible(document.getElementById('visible')) === true;
+    const hiddenOk = isVisible(document.getElementById('hidden')) === false;
+
+    document.body.setAttribute('data-matches-fallback',
+      throwsForVisible && throwsForUnknown && visibleOk && hiddenOk ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-matches-fallback='ok']").has_value(),
+        "matches() should throw SyntaxError for unrecognized pseudo-classes so "
+        "Sizzle-style native-then-fallback selector engines (e.g. jQuery's "
+        ":visible/:hidden) work correctly instead of trusting a wrong native false");
+}
+
 // Regression test for a litehtml selector-list parsing gap (see
 // cmake/patches/0001-litehtml-external-tree-build.patch, css_selector.cpp):
 // litehtml's top-level style-rule selector list is strict, so a single
@@ -11527,6 +11575,48 @@ void test_geometry_offset_parent_cache_invalidates_after_style_mutation()
         "offsetParent cache should invalidate after a style mutation changes the positioned ancestor");
 }
 
+// Regression test: document.body.offsetParent and
+// document.documentElement.offsetParent must be null, per the CSSOM View
+// offsetParent algorithm -- never themselves. Real jQuery 4.0.0's
+// .fn.position() walks the offsetParent chain with
+// `offsetParent = offsetParent.offsetParent || documentElement` until it
+// reaches documentElement; before this fix, an element with no positioned
+// ancestor resolved offsetParent as document.body, and body.offsetParent
+// resolved right back to document.body itself (self-reference), so that walk
+// never terminated -- .position() on an perfectly ordinary element hung until
+// the per-script execution deadline killed it with "InternalError:
+// interrupted".
+void test_offset_parent_of_body_and_root_is_null()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="target" style="width:10px;height:10px;"></div>
+  <script>
+    const bodyOk = document.body.offsetParent === null;
+    const rootOk = document.documentElement.offsetParent === null;
+
+    // The exact jQuery .position() offsetParent walk: must terminate.
+    let offsetParent = document.getElementById('target').offsetParent || document.documentElement;
+    let steps = 0;
+    while (offsetParent && offsetParent !== document.documentElement && steps < 100) {
+      offsetParent = offsetParent.offsetParent || document.documentElement;
+      steps++;
+    }
+    const walkTerminated = steps < 100;
+
+    document.body.setAttribute('data-offset-parent-null-check',
+      bodyOk && rootOk && walkTerminated ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML", "https://example.test/index.html");
+
+    require(
+        page.outer_html("body[data-offset-parent-null-check='ok']").has_value(),
+        "document.body/documentElement.offsetParent must be null, and the "
+        "offsetParent walk jQuery's .position() performs must terminate");
+}
+
 // window.innerWidth/innerHeight/devicePixelRatio (and screen.*) used to be
 // flat values fixed at install() time; they must now reflect whatever
 // viewport the page was most recently rendered with.
@@ -14053,6 +14143,7 @@ int main()
         test_text_encoder_decoder_utf8_shims();
         test_escaped_colon_class_selector_fallback();
         test_target_pseudo_class_selector_fallback();
+        test_matches_throws_syntax_error_for_unrecognized_pseudo_class();
         test_host_pseudo_class_does_not_invalidate_root_selector_list();
         test_request_response_fetch_object_shims();
         test_xhr_and_fetch_load_through_resource_loader();
@@ -14261,6 +14352,7 @@ int main()
         test_geometry_offset_top_left_relative_to_offset_parent();
         test_geometry_offset_parent_finds_nearest_positioned_ancestor();
         test_geometry_offset_parent_cache_invalidates_after_style_mutation();
+        test_offset_parent_of_body_and_root_is_null();
         test_window_viewport_reflects_last_render_options();
         test_geometry_apis_return_zero_for_display_none();
         test_perf_trace_records_render_geometry_and_png_phases();
