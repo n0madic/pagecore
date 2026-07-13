@@ -423,6 +423,72 @@
           }
         }
 
+        const eventHandlerIDLState = new WeakMap();
+        const eventHandlerAttrCache = new WeakMap();
+
+        function eventHandlerIDLSlot(target) {
+          let slot = eventHandlerIDLState.get(target);
+          if (!slot) {
+            slot = new Map();
+            eventHandlerIDLState.set(target, slot);
+          }
+          return slot;
+        }
+
+        function compileEventHandlerSource(source) {
+          try {
+            return new Function('event', String(source));
+          } catch (_compileError) {
+            return null;
+          }
+        }
+
+        // Content-attribute handlers (`<button onclick="...">`) compile lazily
+        // on first read and are recompiled only when the attribute text actually
+        // changes, since dispatch reads `target['on' + type]` on every node in
+        // the propagation path for every event.
+        function compiledAttributeEventHandler(target, name, source) {
+          let cache = eventHandlerAttrCache.get(target);
+          if (!cache) {
+            cache = new Map();
+            eventHandlerAttrCache.set(target, cache);
+          }
+          const cached = cache.get(name);
+          if (cached && cached.source === source) return cached.fn;
+          const fn = compileEventHandlerSource(source);
+          cache.set(name, { source, fn });
+          return fn;
+        }
+
+        // Defines the `onclick`/`oninput`/... IDL attributes from the
+        // GlobalEventHandlers/WindowEventHandlers mixins as always-present
+        // accessor properties, backed by either a directly assigned function or
+        // a lazily compiled `on*` content attribute. Without this, `'onclick' in
+        // element` reads false and `setAttribute('onclick', '...')` never
+        // becomes callable -- exactly what libraries like React's
+        // ChangeEventPlugin feature-detect (`'oninput' in document`, then a
+        // setAttribute + typeof probe) to decide whether native input events
+        // can be trusted, so its absence silently pushed React onto a
+        // legacy-browser fallback path instead of listening for real DOM events.
+        function installEventHandlerIDLAttributes(prototype, names, resolveAttributeSource) {
+          for (const name of names) {
+            const type = name.slice(2);
+            ObjectDefineProperty(prototype, name, {
+              configurable: true,
+              enumerable: true,
+              get() {
+                const slot = eventHandlerIDLSlot(this);
+                if (slot.has(type)) return slot.get(type);
+                const source = resolveAttributeSource ? resolveAttributeSource(this, name) : null;
+                return source == null ? null : compiledAttributeEventHandler(this, name, source);
+              },
+              set(value) {
+                eventHandlerIDLSlot(this).set(type, value);
+              }
+            });
+          }
+        }
+
         class Window extends EventTarget {
           constructor() {
             super();
@@ -448,6 +514,21 @@
           return windowDispatchEvent.apply(windowEventTarget(this), args);
         });
         defineValue(Window.prototype, Symbol.toStringTag, 'Window');
+
+        const WINDOW_EVENT_HANDLER_NAMES = [
+          'onabort', 'onafterprint', 'onbeforeprint', 'onbeforeunload', 'onblur',
+          'oncanplay', 'oncanplaythrough', 'onchange', 'onclick', 'onclose',
+          'oncontextmenu', 'ondblclick', 'ondrag', 'ondragend', 'ondragenter',
+          'ondragleave', 'ondragover', 'ondragstart', 'ondrop', 'onerror',
+          'onfocus', 'onhashchange', 'oninput', 'oninvalid', 'onkeydown',
+          'onkeypress', 'onkeyup', 'onlanguagechange', 'onload', 'onmessage',
+          'onmessageerror', 'onmousedown', 'onmousemove', 'onmouseout',
+          'onmouseover', 'onmouseup', 'onoffline', 'ononline', 'onpagehide',
+          'onpageshow', 'onpopstate', 'onrejectionhandled', 'onreset',
+          'onresize', 'onscroll', 'onstorage', 'onsubmit', 'onunhandledrejection',
+          'onunload', 'onwheel'
+        ];
+        installEventHandlerIDLAttributes(Window.prototype, WINDOW_EVENT_HANDLER_NAMES, null);
 
         function installWindowIdentity(target) {
           if (Object.getPrototypeOf(target) !== Window.prototype) {
@@ -730,6 +811,7 @@
         EventTarget,
         Window,
         installWindowIdentity,
+        installEventHandlerIDLAttributes,
         MessagePort,
         MessageChannel,
         AbortSignal,

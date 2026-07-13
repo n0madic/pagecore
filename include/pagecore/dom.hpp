@@ -123,6 +123,13 @@ public:
     // enforce the one-shadow-root-per-host rule.
     NodeId attach_shadow_root(NodeId host);
 
+    // Returns the NodeId of a <template> element's content DocumentFragment
+    // (lxb_html_template_element_t::content), which lexbor's own HTML parser
+    // already populates per the "template contents" algorithm -- the
+    // fragment's children live there, never as the <template> element's own
+    // children. Returns kInvalidNodeId if `host` is not a template element.
+    NodeId template_content(NodeId host);
+
     int node_type(NodeId id) const;
     std::string node_name(NodeId id) const;
     std::string tag_name(NodeId id) const;

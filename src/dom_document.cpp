@@ -10,6 +10,7 @@
 #include <lexbor/dom/interfaces/node.h>
 #include <lexbor/dom/interfaces/text.h>
 #include <lexbor/html/interfaces/element.h>
+#include <lexbor/html/interfaces/template_element.h>
 #include <lexbor/html/serialize.h>
 
 #include <cctype>
@@ -1259,6 +1260,16 @@ NodeId DomDocument::attach_shadow_root(NodeId host)
     append_child(host, container);
     impl_->has_shadow_roots = true;
     return container;
+}
+
+NodeId DomDocument::template_content(NodeId host)
+{
+    auto* node = impl_->require_node(host);
+    if (!is_html_tag(node, LXB_TAG_TEMPLATE)) {
+        return kInvalidNodeId;
+    }
+    auto* fragment = lxb_html_interface_template(node)->content;
+    return impl_->id_for(lxb_dom_interface_node(fragment));
 }
 
 int DomDocument::node_type(NodeId id) const

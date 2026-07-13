@@ -47,6 +47,7 @@
         FocusEvent,
         HashChangeEvent,
         installWindowIdentity,
+        installEventHandlerIDLAttributes,
         connectCustomElementTree,
         notifyCustomElementAttributeChanged,
         invokeCustomElementConnected
@@ -1739,6 +1740,9 @@
           get firstChild() { return this.childNodes[0] || null; }
           get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
           get children() { return this.childNodes.filter((node) => node instanceof Element); }
+          get firstElementChild() { return this.children[0] || null; }
+          get lastElementChild() { const children = this.children; return children[children.length - 1] || null; }
+          get childElementCount() { return this.children.length; }
           get textContent() { return this.childNodes.map((node) => node.textContent || '').join(''); }
           set textContent(value) {
             this.childNodes.length = 0;
@@ -3806,6 +3810,22 @@
             return children[children.length - 1] || null;
           }
           get childElementCount() { return liveChildElementList(this).length; }
+          // Same element-parented vs. fragment-parented split as previousSibling/
+          // nextSibling above, filtered to Element siblings only.
+          get previousElementSibling() {
+            const parent = this.parentNode;
+            if (!parent) return null;
+            const elements = this.__fragmentParent ? parent.children : liveChildElementList(parent);
+            const index = elements.findIndex((node) => node === this || node.__id === this.__id);
+            return index > 0 ? elements[index - 1] : null;
+          }
+          get nextElementSibling() {
+            const parent = this.parentNode;
+            if (!parent) return null;
+            const elements = this.__fragmentParent ? parent.children : liveChildElementList(parent);
+            const index = elements.findIndex((node) => node === this || node.__id === this.__id);
+            return index >= 0 && index + 1 < elements.length ? elements[index + 1] : null;
+          }
           get innerHTML() { return bridge.innerHTML(this._liveId()); }
           set innerHTML(value) {
             afterMutation(bridge.setInnerHTML(this._liveId(), String(value ?? '')), {
@@ -4192,6 +4212,26 @@
             setElementScroll(this, this.scrollLeft + (Number(left) || 0), this.scrollTop + (Number(top) || 0));
           }
         }
+
+        const ELEMENT_EVENT_HANDLER_NAMES = [
+          'onabort', 'onauxclick', 'onblur', 'oncancel', 'oncanplay',
+          'oncanplaythrough', 'onchange', 'onclick', 'onclose', 'oncontextmenu',
+          'oncopy', 'oncuechange', 'oncut', 'ondblclick', 'ondrag', 'ondragend',
+          'ondragenter', 'ondragleave', 'ondragover', 'ondragstart', 'ondrop',
+          'ondurationchange', 'onemptied', 'onended', 'onerror', 'onfocus',
+          'onformdata', 'oninput', 'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup',
+          'onload', 'onloadeddata', 'onloadedmetadata', 'onloadstart', 'onmousedown',
+          'onmouseenter', 'onmouseleave', 'onmousemove', 'onmouseout', 'onmouseover',
+          'onmouseup', 'onpaste', 'onpause', 'onplay', 'onplaying', 'onprogress',
+          'onratechange', 'onreset', 'onresize', 'onscroll', 'onseeked', 'onseeking',
+          'onselect', 'onslotchange', 'onstalled', 'onsubmit', 'onsuspend',
+          'ontimeupdate', 'ontoggle', 'onvolumechange', 'onwaiting', 'onwheel',
+          'onpointerdown', 'onpointerup', 'onpointermove', 'onpointerover',
+          'onpointerout', 'onpointerenter', 'onpointerleave', 'onpointercancel',
+          'ontransitionend', 'onanimationend', 'onanimationstart', 'onanimationiteration'
+        ];
+        installEventHandlerIDLAttributes(Element.prototype, ELEMENT_EVENT_HANDLER_NAMES,
+          (element, name) => element.getAttribute(name));
 
         // A thin wrapper over the real shadow-container element attach_shadow_root()
         // creates: __id is the container's NodeId, so every Element method
@@ -4824,7 +4864,28 @@
         class HTMLTableRowElement extends HTMLElement {}
         class HTMLTableSectionElement extends HTMLElement {}
         class HTMLTemplateElement extends HTMLElement {
-          get content() { return memo(this, '__templateContent', () => new DocumentFragment()); }
+          // lexbor's HTML parser already routes a parsed <template>'s children
+          // into a separate native content DocumentFragment (never the
+          // element's own childNodes) per the "template contents" algorithm.
+          // DocumentFragment itself is JS-only (no bridge id -- see its class
+          // comment), so this moves the real, already-parsed children out of
+          // the native fragment into a plain DocumentFragment the same way a
+          // script would: one appendChild() per child, which naturally detaches
+          // each one from its native parent via the existing live-node adoption
+          // path. A template built via document.createElement (nothing parsed
+          // into it yet) just moves zero children, matching prior behavior.
+          get content() {
+            return memo(this, '__templateContent', () => {
+              const fragment = new DocumentFragment();
+              const contentId = bridge.templateContent(this._liveId());
+              if (contentId) {
+                for (const child of wrapDescribedList(bridge.childNodesDescribed(contentId))) {
+                  fragment.appendChild(child);
+                }
+              }
+              return fragment;
+            });
+          }
         }
         class HTMLTextAreaElement extends HTMLFormControlElement {
           // The raw value is tracked separately from the child text (the default
@@ -5384,6 +5445,18 @@
             markScriptStarted(id == null ? null : wrapNode(id));
           }
         }
+
+        const DOCUMENT_EVENT_HANDLER_NAMES = [
+          'onabort', 'onblur', 'oncanplay', 'oncanplaythrough', 'onchange', 'onclick',
+          'onclose', 'oncontextmenu', 'oncopy', 'oncut', 'ondblclick', 'ondrag',
+          'ondragend', 'ondragenter', 'ondragleave', 'ondragover', 'ondragstart',
+          'ondrop', 'onerror', 'onfocus', 'oninput', 'oninvalid', 'onkeydown',
+          'onkeypress', 'onkeyup', 'onload', 'onmousedown', 'onmousemove',
+          'onmouseout', 'onmouseover', 'onmouseup', 'onpaste', 'onreadystatechange',
+          'onreset', 'onresize', 'onscroll', 'onselectionchange', 'onsubmit',
+          'onvisibilitychange', 'onwheel'
+        ];
+        installEventHandlerIDLAttributes(Document.prototype, DOCUMENT_EVENT_HANDLER_NAMES, null);
 
         class DetachedHTMLDocument extends EventTarget {
           constructor(title = '') {

@@ -3850,6 +3850,53 @@ void test_create_element_ns_and_template_content_clone()
         "createElementNS and template.content.cloneNode should preserve SVG wrappers");
 }
 
+// Regression test: a <template> element parsed from HTML markup (as opposed
+// to built up via document.createElement + manual appendChild, already
+// covered by test_create_element_ns_and_template_content_clone) always
+// returned an empty .content, because lexbor stores the parsed children in a
+// separate native content fragment that the JS shim never read. Template-based
+// libraries (Alpine.js x-for/x-if, native Web Components, lit-html) all clone
+// a parsed <template>'s content, so this silently produced nothing to clone.
+void test_template_content_reflects_parsed_markup()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <template id="t"><li class="item" data-n="1">a</li><li class="item" data-n="2">b</li></template>
+  <ul id="list"></ul>
+  <script>
+    const t = document.getElementById('t');
+    const list = document.getElementById('list');
+
+    const hasNoLightDomChildren = t.childNodes.length === 0;
+    const contentIsFragment = t.content instanceof DocumentFragment;
+    const contentHasParsedChildren = t.content.children.length === 2
+      && t.content.children[0].textContent === 'a'
+      && t.content.children[1].textContent === 'b';
+    const firstElementChildWorks = t.content.firstElementChild
+      && t.content.firstElementChild.textContent === 'a';
+
+    // The real-world pattern (Alpine x-for, Web Components): clone content
+    // repeatedly and insert; the template's own content must stay intact.
+    for (let i = 0; i < 3; i++) list.appendChild(t.content.cloneNode(true));
+    const clonedThreeTimes = list.children.length === 6;
+    const templateStillIntact = t.content.children.length === 2;
+
+    document.body.setAttribute('data-template-parsed',
+      hasNoLightDomChildren && contentIsFragment && contentHasParsedChildren &&
+      firstElementChildWorks && clonedThreeTimes && templateStillIntact
+        ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-template-parsed='ok']").has_value(),
+        "HTMLTemplateElement.content must expose the children lexbor already parsed into "
+        "the template's native content fragment, repeatedly cloneable, instead of "
+        "always being an empty DocumentFragment");
+}
+
 void test_global_event_listener_aliases_bind_to_window()
 {
     pagecore::Page page;
@@ -4100,6 +4147,66 @@ void test_matches_throws_syntax_error_for_unrecognized_pseudo_class()
         "matches() should throw SyntaxError for unrecognized pseudo-classes so "
         "Sizzle-style native-then-fallback selector engines (e.g. jQuery's "
         ":visible/:hidden) work correctly instead of trusting a wrong native false");
+}
+
+// Regression test for GlobalEventHandlers IDL attributes (onclick, oninput,
+// ...) being entirely absent as accessor properties: 'onclick' in element
+// read false and setAttribute('onclick', '...') never became callable, so
+// React's ChangeEventPlugin feature-detection (isEventSupported('input'):
+// checks 'oninput' in document, then setAttribute + typeof as a fallback)
+// concluded the engine was a legacy browser and skipped listening for real
+// 'input' events -- controlled <input> onChange never fired.
+void test_global_event_handler_idl_attributes()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <button id="btn" onclick="window.__clickedFromMarkup = true;">click me</button>
+  <script>
+    const probe = document.createElement('div');
+    const hasOnclickBeforeAssign = 'onclick' in probe;
+
+    // React's exact isEventSupported() feature-detection pattern.
+    function isEventSupported(eventNameSuffix) {
+      const name = 'on' + eventNameSuffix;
+      let isSupported = name in document;
+      if (!isSupported) {
+        const el = document.createElement('div');
+        el.setAttribute(name, 'return;');
+        isSupported = typeof el[name] === 'function';
+      }
+      return isSupported;
+    }
+    const inputEventDetected = isEventSupported('input');
+
+    // Direct IDL assignment still dispatches (existing dynamic-lookup path).
+    let directFired = false;
+    probe.onclick = () => { directFired = true; };
+    probe.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+    // A content attribute parsed from markup compiles and fires.
+    document.getElementById('btn').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    const markupFired = window.__clickedFromMarkup === true;
+
+    // A content attribute set via setAttribute() after creation also compiles and fires.
+    window.__attrCallback = () => { window.__attrFired = true; };
+    const span = document.createElement('span');
+    span.setAttribute('oninput', 'window.__attrCallback();');
+    span.dispatchEvent(new Event('input', { bubbles: true }));
+
+    document.body.setAttribute('data-global-handlers',
+      hasOnclickBeforeAssign && inputEventDetected && directFired && markupFired && window.__attrFired
+        ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-global-handlers='ok']").has_value(),
+        "onclick/oninput/... must be always-present IDL accessor properties backed by "
+        "either a direct assignment or a compiled on* content attribute, matching "
+        "GlobalEventHandlers, so native-event feature detection (e.g. React's "
+        "ChangeEventPlugin) does not fall back to a legacy-browser event strategy");
 }
 
 // Regression test for a litehtml selector-list parsing gap (see
@@ -9045,6 +9152,52 @@ void test_child_node_list_cache_reflects_mutations()
 
     require(page.eval("document.body.getAttribute('data-r')") == "2,2,3,true",
             "childNodes cache reflects mutations, isolates the returned copy, and keeps fast paths consistent");
+}
+
+// Regression test: Element.nextElementSibling/previousElementSibling were
+// entirely unimplemented ('nextElementSibling' in element read false). Any
+// hand-rolled tree walker using the standard `for (let n = el.firstElementChild;
+// n; n = n.nextElementSibling)` idiom -- e.g. Alpine.js's directive scanner --
+// silently processed only the first child at every level and dropped every
+// later sibling, with no thrown error to reveal why.
+void test_next_and_previous_element_sibling()
+{
+    pagecore::Page page;
+    page.load_html(R"HTML(
+<html><body>
+  <div id="parent">text-a<p id="a">1</p><!--c--><p id="b">2</p>text-b<p id="c">3</p></div>
+  <script>
+    const a = document.getElementById('a');
+    const b = document.getElementById('b');
+    const c = document.getElementById('c');
+
+    const hasProps = 'nextElementSibling' in a && 'previousElementSibling' in a;
+    const aNextIsB = a.nextElementSibling === b;
+    const bNextIsC = b.nextElementSibling === c;
+    const cNextIsNull = c.nextElementSibling === null;
+    const cPrevIsB = c.previousElementSibling === b;
+    const bPrevIsA = b.previousElementSibling === a;
+    const aPrevIsNull = a.previousElementSibling === null;
+
+    // The exact idiom a hand-rolled tree walker (e.g. Alpine.js) uses.
+    let names = [];
+    for (let n = document.getElementById('parent').firstElementChild; n; n = n.nextElementSibling) {
+      names.push(n.id);
+    }
+    const walkedAll = names.join(',') === 'a,b,c';
+
+    document.body.setAttribute('data-sibling',
+      hasProps && aNextIsB && bNextIsC && cNextIsNull && cPrevIsB && bPrevIsA && aPrevIsNull && walkedAll
+        ? 'ok' : 'bad');
+  </script>
+</body></html>
+)HTML");
+
+    require(
+        page.outer_html("body[data-sibling='ok']").has_value(),
+        "nextElementSibling/previousElementSibling must skip text/comment nodes and walk "
+        "only Element siblings, so the standard firstElementChild+nextElementSibling tree-walk "
+        "idiom visits every sibling instead of silently stopping after the first");
 }
 
 void test_eval_api()
@@ -14135,6 +14288,7 @@ int main()
         test_inline_module_uses_document_url_for_relative_imports();
         test_html_element_specific_constructors();
         test_create_element_ns_and_template_content_clone();
+        test_template_content_reflects_parsed_markup();
         test_global_event_listener_aliases_bind_to_window();
         test_document_domain_and_cookie_jar();
         test_document_location_aliases_window_location();
@@ -14144,6 +14298,7 @@ int main()
         test_escaped_colon_class_selector_fallback();
         test_target_pseudo_class_selector_fallback();
         test_matches_throws_syntax_error_for_unrecognized_pseudo_class();
+        test_global_event_handler_idl_attributes();
         test_host_pseudo_class_does_not_invalidate_root_selector_list();
         test_request_response_fetch_object_shims();
         test_xhr_and_fetch_load_through_resource_loader();
@@ -14279,6 +14434,7 @@ int main()
         test_query_selector_all_excludes_context_node_from_results();
         test_described_traversal_wraps_children_correctly();
         test_child_node_list_cache_reflects_mutations();
+        test_next_and_previous_element_sibling();
         test_eval_api();
         test_dom_methods_report_as_native();
         test_scope_selector_support();
