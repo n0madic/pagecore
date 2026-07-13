@@ -12744,6 +12744,59 @@ void test_exact_element_geometry_forces_exact_layout_after_bounded_mode_trips()
             "exact_element_geometry() must return the real geometry for a node added after bounded mode trips");
 }
 
+// Regression for the CI-only WPT testdriver-actions flake as the page actually
+// hits it -- end to end through the shim, not just the C++ primitive above.
+// Covers both halves: test_driver_internal.click() must resolve its target's
+// center from exact geometry (bridge.exactElementGeometry, not the bounded-null
+// getBoundingClientRect() that put the synthesized click at (0,0)), and the JS
+// per-layout-version geometry cache must not pin that bounded null -- the exact
+// read forces a fresh layout without bumping the layout mutation version, so a
+// pinned null would keep getBoundingClientRect() reporting (0,0,0,0) afterwards.
+void test_wpt_driver_click_uses_exact_geometry_after_bounded_mode_trips()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    // SlowGeometryEngine encodes the layout-call count into the geometry it returns
+    // (width == 10 * layout_calls), so the widths below name the layout each read saw.
+    page.load_html(R"HTML(<html><body style="margin:0">
+  <div id="a"></div>
+  <script>
+    const a = document.getElementById('a');
+    // Two exact reads across a mutation exceed the geometry budget and trip
+    // native geometry_bounded_mode, exactly as unrelated page script would.
+    window.__firstWidth = a.getBoundingClientRect().width;
+    a.setAttribute('style', 'display:block');
+    window.__secondWidth = a.getBoundingClientRect().width;
+
+    // A fresh Actions()-style target, never measured before bounded mode tripped.
+    const b = document.createElement('div');
+    document.body.appendChild(b);
+    b.addEventListener('click', (event) => { window.__clickX = event.clientX; });
+    window.__boundedWidth = b.getBoundingClientRect().width;
+
+    test_driver_internal = {};
+    test_driver_internal.click(b).then(() => {
+      window.__widthAfterClick = b.getBoundingClientRect().width;
+      window.__done = true;
+    });
+  </script>
+</body></html>)HTML", "https://example.test/index.html");
+
+    require(page.eval("String(window.__firstWidth)") == "10" && page.eval("String(window.__secondWidth)") == "20",
+            "the two getBoundingClientRect() reads should be exact and trip bounded mode");
+    require(page.eval("String(window.__boundedWidth)") == "0",
+            "sanity check: getBoundingClientRect() stays bounded-null for a node added after bounded mode trips");
+    require(page.eval("String(window.__done)") == "true", "test_driver_internal.click() promise should resolve");
+    require(page.eval("String(window.__clickX)") == "15",
+            "test_driver_internal.click() must click the target's real center (exact width 30 -> x 15), not (0,0), "
+            "once an unrelated geometry read has tripped bounded mode");
+    require(page.eval("String(window.__widthAfterClick)") == "30",
+            "the JS geometry cache must not pin the bounded null: once the exact read forced a fresh layout, "
+            "getBoundingClientRect() must see the real box again");
+}
+
 void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
 {
     std::vector<pagecore::PerfEvent> events;
@@ -14616,6 +14669,7 @@ int main()
         test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout();
         test_elements_at_point_forces_exact_hit_test_after_bounded_mode_trips();
         test_exact_element_geometry_forces_exact_layout_after_bounded_mode_trips();
+        test_wpt_driver_click_uses_exact_geometry_after_bounded_mode_trips();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
         test_computed_style_property_bounded_mode_keeps_stylesheet_display();
         test_computed_style_property_bounded_mode_resolves_element_created_after_trip();

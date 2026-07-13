@@ -757,6 +757,27 @@ struct Page::Impl {
         return adjusted;
     }
 
+    // The layout a synchronous read must measure against: the current one when it is
+    // still valid for last_render_options, otherwise one forced right now. Shared by
+    // every geometry/hit-test read (element_geometry(), exact_element_geometry(),
+    // elements_at_point()); each layers its own caching and bounded-mode policy on
+    // top. `forced_layout_us` receives the forced layout's cost and stays empty when
+    // a current layout served the read, which is also what tells callers whether they
+    // owe the geometry budget anything for it.
+    LayoutEngine& layout_for_read(std::optional<long long>& forced_layout_us)
+    {
+        if (has_current_layout(last_render_options, false, LayoutResourceMode::Full)
+            || has_current_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly)) {
+            return *styled_document;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+        forced_layout_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        return engine;
+    }
+
     bool should_snapshot_geometry_after_forced_layout(long long elapsed_us) const
     {
         const long long normalized_elapsed = std::max<long long>(0, elapsed_us);
@@ -1502,36 +1523,27 @@ struct Page::Impl {
             return std::nullopt;
         }
 
-        const std::string node_key = std::to_string(node);
-
-        // A layout for the current version exists -> exact geometry from it.
-        if (full_layout_hit || stylesheets_layout_hit) {
+        // Exact geometry from the current layout, or -- before bounded mode trips --
+        // from one forced right now. The forced layout runs even when the styled
+        // document is expensive: the first such layout snapshots EVERY element's
+        // geometry (see should_snapshot_geometry_after_forced_layout), seeding the
+        // cache before note_geometry_forced_layout() trips bounded mode. Without this,
+        // an expensive page (e.g. one with large stylesheets) would enter bounded mode
+        // before any element was ever measured, and JS grid libraries (Isotope/Masonry)
+        // that read every item's geometry during load would see only nulls and collapse
+        // the whole grid to (0,0).
+        if (full_layout_hit || stylesheets_layout_hit || !geometry_bounded_mode) {
+            std::optional<long long> forced_layout_us;
+            auto& engine = layout_for_read(forced_layout_us);
             auto geometry = adjust_absolute_percentage_width_geometry(
-                *styled_document, node, styled_document->element_geometry(node_key));
-            remember_geometry(node, geometry);
-            return geometry;
-        }
-
-        // Not yet in bounded mode -> force one exact layout. This runs even when the
-        // styled document is expensive: the first such layout snapshots EVERY
-        // element's geometry (see should_snapshot_geometry_after_forced_layout),
-        // seeding the cache before note_geometry_forced_layout() trips bounded mode.
-        // Without this, an expensive page (e.g. one with large stylesheets) would
-        // enter bounded mode before any element was ever measured, and JS grid
-        // libraries (Isotope/Masonry) that read every item's geometry during load
-        // would see only nulls and collapse the whole grid to (0,0).
-        if (!geometry_bounded_mode) {
-            const auto t0 = std::chrono::steady_clock::now();
-            auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
-            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0).count();
-            auto geometry = adjust_absolute_percentage_width_geometry(
-                engine, node, engine.element_geometry(node_key));
-            if (should_snapshot_geometry_after_forced_layout(elapsed_us)) {
+                engine, node, engine.element_geometry(std::to_string(node)));
+            if (forced_layout_us && should_snapshot_geometry_after_forced_layout(*forced_layout_us)) {
                 snapshot_layout_geometry(engine);
             }
             remember_geometry(node, geometry);
-            note_geometry_forced_layout(elapsed_us);
+            if (forced_layout_us) {
+                note_geometry_forced_layout(*forced_layout_us);
+            }
             return geometry;
         }
 
@@ -1556,34 +1568,45 @@ struct Page::Impl {
     // WebDriver-exact geometry read, not exposed to page scripts: real WebDriver's
     // Get Element Rect always reflects the current DOM, so unlike element_geometry()
     // -- which JS grid libraries (Isotope/Masonry/jQuery) poll every frame, and
-    // which geometry_bounded_mode exists to protect against -- this always forces a
-    // fresh layout on a stale cache, deliberately skipping the per-node caching and
+    // which geometry_bounded_mode exists to protect against -- this takes
+    // layout_for_read()'s answer as-is, skipping the per-node caching and
     // deadline-backstop machinery (remember_geometry, note_geometry_forced_layout)
-    // that bounds page-script-visible reads. Intended for the WPT testdriver vendor
-    // shim's Actions-based click synthesis, which otherwise could resolve a
-    // never-before-measured element's position as bounded-mode's (0,0,0,0) once
-    // some unrelated geometry read elsewhere on the page had already tripped it.
+    // that bounds page-script-visible reads. A stale cache therefore always forces a
+    // fresh layout here. Intended for the WPT testdriver vendor shim's Actions-based
+    // click synthesis, which otherwise could resolve a never-before-measured element's
+    // position as bounded-mode's (0,0,0,0) once some unrelated geometry read elsewhere
+    // on the page had already tripped it.
     std::optional<ElementGeometry> exact_element_geometry(NodeId node)
     {
+        const StyledDocumentCacheKey key = styled_document_cache_key(
+            last_render_options, /*absolute_percent_corrected=*/false, LayoutResourceMode::StylesheetsOnly);
+        const bool full_layout_hit = has_current_layout(last_render_options, false, LayoutResourceMode::Full);
+        PerfScope trace(perf_trace_for(last_render_options), PerfPhase::Geometry, "exact_element_geometry", 1);
+        trace.event().node_id = node;
+        trace.event().mutation_version = document.mutation_version();
+        trace.event().layout_mutation_version = document.layout_mutation_version();
+        trace.event().styled_document_cache_reason = full_layout_hit ? "valid" : styled_document_cache_reason(key);
         if (!document.is_connected(node)) {
+            trace.set_count(0);
             return std::nullopt;
         }
-        const std::string node_key = std::to_string(node);
-        const bool full_layout_hit = has_current_layout(last_render_options, false, LayoutResourceMode::Full);
-        const bool stylesheets_layout_hit = has_current_layout(
-            last_render_options, false, LayoutResourceMode::StylesheetsOnly);
-        if (full_layout_hit || stylesheets_layout_hit) {
-            return adjust_absolute_percentage_width_geometry(
-                *styled_document, node, styled_document->element_geometry(node_key));
-        }
-        auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
-        return adjust_absolute_percentage_width_geometry(engine, node, engine.element_geometry(node_key));
+
+        std::optional<long long> forced_layout_us;
+        auto& engine = layout_for_read(forced_layout_us);
+        auto geometry = adjust_absolute_percentage_width_geometry(
+            engine, node, engine.element_geometry(std::to_string(node)));
+        // The forced layout this read can trigger is unbounded by design (no
+        // note_geometry_forced_layout()), so make it visible to perf tracing rather
+        // than letting it hide inside an untraced call.
+        trace.event().styled_document_cache_hit = !forced_layout_us.has_value();
+        trace.set_count(geometry ? 1 : 0);
+        return geometry;
     }
 
-    // Hit-test read. Reuses has_current_layout()/ensure_layout() exactly like
-    // element_geometry(), but deliberately skips its per-node caching and
-    // deadline-backstop machinery (remember_geometry, note_geometry_forced_layout):
-    // there is no natural per-point cache key to serve an approximate answer from.
+    // Hit-test read. Measures against layout_for_read() exactly like element_geometry(),
+    // but deliberately skips its per-node caching and deadline-backstop machinery
+    // (remember_geometry, note_geometry_forced_layout): there is no natural per-point
+    // cache key to serve an approximate answer from.
     // Unlike per-element geometry reads (which JS grid libraries poll every
     // frame), a point query is a rare, one-off call, so geometry_bounded_mode's
     // runaway-cost protection doesn't apply here: this always forces a fresh
@@ -1593,20 +1616,12 @@ struct Page::Impl {
     // once, for the rest of the document's lifetime.
     std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only)
     {
-        const bool full_layout_hit = has_current_layout(last_render_options, false, LayoutResourceMode::Full);
-        const bool stylesheets_layout_hit = has_current_layout(
-            last_render_options, false, LayoutResourceMode::StylesheetsOnly);
-
         PerfScope trace(perf_trace_for(last_render_options), PerfPhase::Geometry, "elements_at_point", 1);
 
-        if (full_layout_hit || stylesheets_layout_hit) {
-            auto ids = styled_document->elements_at_point(x, y, topmost_only);
-            trace.set_count(ids.size());
-            return ids;
-        }
-
-        auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+        std::optional<long long> forced_layout_us;
+        auto& engine = layout_for_read(forced_layout_us);
         auto ids = engine.elements_at_point(x, y, topmost_only);
+        trace.event().styled_document_cache_hit = !forced_layout_us.has_value();
         trace.set_count(ids.size());
         return ids;
     }

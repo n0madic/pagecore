@@ -3414,15 +3414,25 @@
         // by the bridge layout mutation version — same invalidation pattern as
         // traversalCache/liveChildNodeList. Returns null for elements that
         // don't participate in layout (display:none, or layout() hasn't run).
+        //
+        // A null is never cached, only non-null geometry is. The bridge also answers
+        // null for an element native geometry_bounded_mode has never measured (see
+        // Page::element_geometry), and that answer stops being null the moment
+        // anything forces a fresh layout — a render, an elementFromPoint() hit test,
+        // the testdriver shim's exact-geometry read — none of which bump the layout
+        // mutation version. Pinning the null per version would keep
+        // getBoundingClientRect()/offsetTop/scrollWidth reporting 0 for the rest of
+        // that version even though the exact box is available again. Re-asking is
+        // cheap: with a current layout the bridge call is a lookup, and in bounded
+        // mode native answers without forcing a layout.
         const elementGeometryCache = new WeakMap();
         function elementGeometryForVersion(element, version) {
           if (!(element instanceof Element)) return null;
-          let entry = elementGeometryCache.get(element);
-          if (entry === undefined || entry.version !== version) {
-            entry = { version, geometry: bridge.elementGeometry(element.__id) };
-            elementGeometryCache.set(element, entry);
-          }
-          return entry.geometry;
+          const entry = elementGeometryCache.get(element);
+          if (entry !== undefined && entry.version === version) return entry.geometry;
+          const geometry = bridge.elementGeometry(element.__id);
+          if (geometry) elementGeometryCache.set(element, { version, geometry });
+          return geometry;
         }
 
         function elementGeometry(element) {
@@ -3461,7 +3471,9 @@
           }
 
           const entry = { version, width, height };
-          scrollExtentCache.set(element, entry);
+          // Same rule as elementGeometryCache: an extent computed without the
+          // element's own geometry is a bounded-mode artifact, not a measurement.
+          if (geometry) scrollExtentCache.set(element, entry);
           return entry;
         }
 
@@ -3555,23 +3567,26 @@
           return entry.parent;
         }
 
+        // Like elementGeometryCache, a null geometry is never cached: it can be
+        // bounded mode's transient "not measured yet" answer, which a later forced
+        // layout in the same version turns into a real box.
         const offsetGeometryCache = new WeakMap();
         function offsetGeometry(element) {
           if (!(element instanceof Element)) {
             return { geometry: null, parentGeometry: null };
           }
           const version = layoutMutationVersion();
-          let entry = offsetGeometryCache.get(element);
-          if (entry === undefined || entry.version !== version) {
-            const geometry = elementGeometryForVersion(element, version);
-            const parent = geometry ? offsetParentFor(element, version) : null;
-            entry = {
-              version,
-              geometry,
-              parentGeometry: parent ? elementGeometryForVersion(parent, version) : null
-            };
-            offsetGeometryCache.set(element, entry);
-          }
+          const cached = offsetGeometryCache.get(element);
+          if (cached !== undefined && cached.version === version) return cached;
+
+          const geometry = elementGeometryForVersion(element, version);
+          const parent = geometry ? offsetParentFor(element, version) : null;
+          const entry = {
+            version,
+            geometry,
+            parentGeometry: parent ? elementGeometryForVersion(parent, version) : null
+          };
+          if (geometry) offsetGeometryCache.set(element, entry);
           return entry;
         }
 

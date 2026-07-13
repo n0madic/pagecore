@@ -2420,9 +2420,10 @@
 
           // Resolves a WebDriver Actions `pointerMove` tick's (x, y, origin) to a
           // document-space point. `origin` is the real in-process Element object
-          // (no wire serialization, unlike real WebDriver) -- resolved via the
-          // same getBoundingClientRect()-based in-view-center math test_driver.js
-          // itself uses for click(). "viewport"/"pointer" origins fall back to
+          // (no wire serialization, unlike real WebDriver) -- resolved through
+          // centerPointOf(), i.e. the same in-view-center point test_driver.js
+          // computes for click(), but read from exact geometry rather than
+          // getBoundingClientRect(). "viewport"/"pointer" origins fall back to
           // raw x, y: no scroll model and no real multi-tick pointer tracking
           // make a truer "pointer" origin meaningless here, and no in-scope file
           // uses either.
