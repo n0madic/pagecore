@@ -118,10 +118,17 @@ public:
     std::optional<ComputedStyle> computed_style(NodeId node) const;
     std::optional<std::string> computed_style_property(NodeId node, std::string_view property) const;
     std::optional<ElementGeometry> element_geometry(NodeId node) const;
+    // Same contract as element_geometry(), but always forces a fresh layout on a
+    // stale cache instead of falling back to geometry_bounded_mode's approximate
+    // (or, for a never-before-measured node, null) last-known value. Not exposed
+    // to page scripts: intended for WebDriver-simulation call sites (e.g. the WPT
+    // testdriver vendor shim) that need real WebDriver's always-exact Get Element
+    // Rect semantics regardless of unrelated geometry reads elsewhere on the page.
+    std::optional<ElementGeometry> exact_element_geometry(NodeId node) const;
     // Hit-tests the last layout at (x, y), viewport-relative pixels. Returns
-    // NodeIds in front-to-back paint order (topmost first); empty if nothing
-    // was hit, if layout is bounded-mode stale (no fresh layout is forced for a
-    // point query), or if the engine doesn't support hit-testing.
+    // NodeIds in front-to-back paint order (topmost first); empty if nothing was
+    // hit or if the engine doesn't support hit-testing. Always forces a fresh
+    // layout on a stale cache, regardless of geometry_bounded_mode.
     // topmost_only == true stops after the first hit.
     std::vector<NodeId> elements_at_point(float x, float y, bool topmost_only) const;
 

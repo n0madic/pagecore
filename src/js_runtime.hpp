@@ -124,6 +124,13 @@ public:
     void set_element_geometry_resolver(ElementGeometryResolver resolver);
     std::optional<ElementGeometry> element_geometry(NodeId node);
 
+    // Injected by Page::Impl so the WPT testdriver vendor shim can resolve a
+    // WebDriver Actions target's position with real WebDriver's always-exact Get
+    // Element Rect semantics, bypassing element_geometry()'s geometry_bounded_mode
+    // approximation. Not exposed to page scripts.
+    void set_exact_element_geometry_resolver(ElementGeometryResolver resolver);
+    std::optional<ElementGeometry> exact_element_geometry(NodeId node);
+
     // Injected by Page::Impl so document.elementFromPoint()/elementsFromPoint()
     // can hit-test litehtml's render tree without JsRuntime depending on Page
     // directly.
@@ -208,6 +215,7 @@ private:
     ComputedStyleResolver computed_style_resolver_;
     ComputedStylePropertyResolver computed_style_property_resolver_;
     ElementGeometryResolver element_geometry_resolver_;
+    ElementGeometryResolver exact_element_geometry_resolver_;
     ElementsAtPointResolver elements_at_point_resolver_;
     ViewportResolver viewport_resolver_;
     std::unordered_map<std::string, DomBridgePerfAggregate> dom_bridge_perf_;

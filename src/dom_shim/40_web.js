@@ -15,7 +15,7 @@
     name: 'web',
     deps: ['core', 'events', 'dom'],
     install(ctx, api) {
-      const { global, host } = ctx;
+      const { global, host, bridge } = ctx;
       const {
         defineValue,
         assertNode,
@@ -2307,10 +2307,20 @@
           // Actions()) -- not full WebDriver semantics: no HTML activation
           // behavior (checkbox toggle, form submit, link navigation), no
           // key/wheel/none action sources, no WebDriver special-key codepoints.
+          // Uses bridge.exactElementGeometry() rather than element.getBoundingClientRect():
+          // real WebDriver's Get Element Rect always reflects the current DOM, but
+          // getBoundingClientRect() can fall back to a stale-or-null approximation
+          // once geometry_bounded_mode trips from unrelated reads elsewhere on the
+          // page (see Page::element_geometry), which would resolve a freshly added
+          // Actions() target to (0,0) instead of its real position.
           function centerPointOf(element) {
-            if (!element || typeof element.getBoundingClientRect !== 'function') return { x: 0, y: 0 };
-            const rect = element.getBoundingClientRect();
-            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+            if (!element || typeof element.__id !== 'number') return { x: 0, y: 0 };
+            const geometry = bridge.exactElementGeometry(element.__id);
+            if (!geometry) return { x: 0, y: 0 };
+            return {
+              x: geometry.borderX + geometry.borderWidth / 2,
+              y: geometry.borderY + geometry.borderHeight / 2
+            };
           }
 
           function pointFromCoords(coords) {

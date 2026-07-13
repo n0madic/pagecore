@@ -12703,6 +12703,47 @@ void test_elements_at_point_forces_exact_hit_test_after_bounded_mode_trips()
             "a hit test after bounded mode trips must still find an element added afterward, not silently report nothing");
 }
 
+// Regression for the same CI-only flake: element_geometry() deliberately stays
+// bounded-null for a node added after geometry_bounded_mode trips (see
+// test_element_geometry_bounded_mode_caps_uncached_exact_layouts), which made a
+// WPT Actions() target resolve to (0,0,0,0). exact_element_geometry() is the
+// WebDriver-simulation-only escape hatch (used by the testdriver vendor shim
+// instead of getBoundingClientRect()) that must always force one exact layout
+// instead, matching real WebDriver's always-exact Get Element Rect semantics.
+void test_exact_element_geometry_forces_exact_layout_after_bounded_mode_trips()
+{
+    auto factory = std::make_shared<SlowGeometryFactory>();
+
+    pagecore::Page page;
+    page.set_layout_engine_factory(factory);
+    page.load_html("<html><body><div id='a'></div></body></html>", "https://example.test/");
+
+    const pagecore::NodeId root = page.document().document_node();
+    const pagecore::NodeId body = page.document().body();
+    const pagecore::NodeId a = page.document().query_selector(root, "#a");
+    require(body != pagecore::kInvalidNodeId && a != pagecore::kInvalidNodeId, "expected fixture");
+
+    auto first = page.element_geometry(a);
+    require(first && first->border_box.width == 10.0f, "first geometry read should be exact");
+    page.document().set_attribute(a, "style", "display:block");
+    auto second = page.element_geometry(a);
+    require(second && second->border_box.width == 20.0f, "second geometry read should still be exact");
+    require(*factory->layout_calls == 2, "expected bounded mode to be active after two slow layouts");
+
+    const pagecore::NodeId b = page.document().create_element("div");
+    page.document().append_child(body, b);
+
+    auto bounded = page.element_geometry(b);
+    require(!bounded, "sanity check: element_geometry() still returns bounded-null for a brand-new node");
+    require(*factory->layout_calls == 2, "element_geometry() must not force another layout once bounded");
+
+    auto exact = page.exact_element_geometry(b);
+    require(*factory->layout_calls == 3,
+            "exact_element_geometry() must force one fresh layout even once bounded mode is active");
+    require(exact && exact->border_box.width == 30.0f,
+            "exact_element_geometry() must return the real geometry for a node added after bounded mode trips");
+}
+
 void test_computed_style_property_bounded_mode_returns_inline_without_rebuild()
 {
     std::vector<pagecore::PerfEvent> events;
@@ -14574,6 +14615,7 @@ int main()
         test_element_geometry_after_heavy_append_child_runs_first_exact_layout();
         test_element_geometry_after_heavy_structural_mutation_runs_first_exact_layout();
         test_elements_at_point_forces_exact_hit_test_after_bounded_mode_trips();
+        test_exact_element_geometry_forces_exact_layout_after_bounded_mode_trips();
         test_computed_style_property_bounded_mode_returns_inline_without_rebuild();
         test_computed_style_property_bounded_mode_keeps_stylesheet_display();
         test_computed_style_property_bounded_mode_resolves_element_created_after_trip();

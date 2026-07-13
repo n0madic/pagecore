@@ -958,6 +958,28 @@ JSValue bridge_element_geometry(JSContext* ctx, JSValue, int argc, JSValue* argv
     });
 }
 
+JSValue bridge_exact_element_geometry(JSContext* ctx, JSValue, int argc, JSValue* argv)
+{
+    return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
+        if (argc < 1) throw std::runtime_error("exactElementGeometry requires a node id");
+        auto geometry = js.exact_element_geometry(to_node_id(ctx, argv[0]));
+        if (!geometry) {
+            return JS_NULL;
+        }
+
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "borderX", JS_NewFloat64(ctx, geometry->border_box.x));
+        JS_SetPropertyStr(ctx, result, "borderY", JS_NewFloat64(ctx, geometry->border_box.y));
+        JS_SetPropertyStr(ctx, result, "borderWidth", JS_NewFloat64(ctx, geometry->border_box.width));
+        JS_SetPropertyStr(ctx, result, "borderHeight", JS_NewFloat64(ctx, geometry->border_box.height));
+        JS_SetPropertyStr(ctx, result, "paddingX", JS_NewFloat64(ctx, geometry->padding_box.x));
+        JS_SetPropertyStr(ctx, result, "paddingY", JS_NewFloat64(ctx, geometry->padding_box.y));
+        JS_SetPropertyStr(ctx, result, "paddingWidth", JS_NewFloat64(ctx, geometry->padding_box.width));
+        JS_SetPropertyStr(ctx, result, "paddingHeight", JS_NewFloat64(ctx, geometry->padding_box.height));
+        return result;
+    });
+}
+
 JSValue bridge_elements_at_point(JSContext* ctx, JSValue, int argc, JSValue* argv)
 {
     return bridge_call(ctx, [ctx, argc, argv](JsRuntime& js) {
@@ -1736,6 +1758,7 @@ void JsRuntime::install()
     set_function(context_, dom, "computedStyle", bridge_computed_style, 1);
     set_function(context_, dom, "computedStyleProperty", bridge_computed_style_property, 2);
     set_function(context_, dom, "elementGeometry", bridge_element_geometry, 1);
+    set_function(context_, dom, "exactElementGeometry", bridge_exact_element_geometry, 1);
     set_function(context_, dom, "elementsAtPoint", bridge_elements_at_point, 3);
     set_function(context_, dom, "viewport", bridge_viewport, 0);
     set_function(context_, dom, "getAttribute", bridge_get_attribute, 2);
@@ -2243,6 +2266,19 @@ std::optional<ElementGeometry> JsRuntime::element_geometry(NodeId node)
         return std::nullopt;
     }
     return element_geometry_resolver_(node);
+}
+
+void JsRuntime::set_exact_element_geometry_resolver(ElementGeometryResolver resolver)
+{
+    exact_element_geometry_resolver_ = std::move(resolver);
+}
+
+std::optional<ElementGeometry> JsRuntime::exact_element_geometry(NodeId node)
+{
+    if (!exact_element_geometry_resolver_) {
+        return std::nullopt;
+    }
+    return exact_element_geometry_resolver_(node);
 }
 
 void JsRuntime::set_elements_at_point_resolver(ElementsAtPointResolver resolver)

@@ -227,6 +227,7 @@ struct Page::Impl {
             js->set_computed_style_property_resolver(
                 [this](NodeId node, std::string_view property) { return computed_style_property(node, property); });
             js->set_element_geometry_resolver([this](NodeId node) { return element_geometry(node); });
+            js->set_exact_element_geometry_resolver([this](NodeId node) { return exact_element_geometry(node); });
             js->set_elements_at_point_resolver(
                 [this](float x, float y, bool topmost_only) { return elements_at_point(x, y, topmost_only); });
             js->set_viewport_resolver([this] { return last_render_options.viewport; });
@@ -1552,6 +1553,33 @@ struct Page::Impl {
         return found->second.geometry;
     }
 
+    // WebDriver-exact geometry read, not exposed to page scripts: real WebDriver's
+    // Get Element Rect always reflects the current DOM, so unlike element_geometry()
+    // -- which JS grid libraries (Isotope/Masonry/jQuery) poll every frame, and
+    // which geometry_bounded_mode exists to protect against -- this always forces a
+    // fresh layout on a stale cache, deliberately skipping the per-node caching and
+    // deadline-backstop machinery (remember_geometry, note_geometry_forced_layout)
+    // that bounds page-script-visible reads. Intended for the WPT testdriver vendor
+    // shim's Actions-based click synthesis, which otherwise could resolve a
+    // never-before-measured element's position as bounded-mode's (0,0,0,0) once
+    // some unrelated geometry read elsewhere on the page had already tripped it.
+    std::optional<ElementGeometry> exact_element_geometry(NodeId node)
+    {
+        if (!document.is_connected(node)) {
+            return std::nullopt;
+        }
+        const std::string node_key = std::to_string(node);
+        const bool full_layout_hit = has_current_layout(last_render_options, false, LayoutResourceMode::Full);
+        const bool stylesheets_layout_hit = has_current_layout(
+            last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+        if (full_layout_hit || stylesheets_layout_hit) {
+            return adjust_absolute_percentage_width_geometry(
+                *styled_document, node, styled_document->element_geometry(node_key));
+        }
+        auto& engine = ensure_layout(last_render_options, false, LayoutResourceMode::StylesheetsOnly);
+        return adjust_absolute_percentage_width_geometry(engine, node, engine.element_geometry(node_key));
+    }
+
     // Hit-test read. Reuses has_current_layout()/ensure_layout() exactly like
     // element_geometry(), but deliberately skips its per-node caching and
     // deadline-backstop machinery (remember_geometry, note_geometry_forced_layout):
@@ -1745,6 +1773,11 @@ std::optional<std::string> Page::computed_style_property(NodeId node, std::strin
 std::optional<ElementGeometry> Page::element_geometry(NodeId node) const
 {
     return impl_->element_geometry(node);
+}
+
+std::optional<ElementGeometry> Page::exact_element_geometry(NodeId node) const
+{
+    return impl_->exact_element_geometry(node);
 }
 
 std::vector<NodeId> Page::elements_at_point(float x, float y, bool topmost_only) const
